@@ -751,9 +751,18 @@ class CredentialPool:
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
+            normalized_error = _normalize_error_context(error_context)
+            reason_bits = []
+            if normalized_error.get("reason"):
+                reason_bits.append(str(normalized_error["reason"]))
+            if normalized_error.get("message"):
+                reason_bits.append(str(normalized_error["message"]))
+            reason_suffix = f" reason={' | '.join(reason_bits)}" if reason_bits else ""
             logger.info(
-                "credential pool: marking %s exhausted (status=%s), rotating",
-                _label, status_code,
+                "credential pool: marking %s exhausted (status=%s%s), rotating",
+                _label,
+                status_code,
+                reason_suffix,
             )
             self._mark_exhausted(entry, status_code, error_context)
             self._current_id = None
