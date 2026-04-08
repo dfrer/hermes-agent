@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
+    get_routed_execution_plan,
     get_routing_decision,
     has_route_lock,
     pre_tool_call_block_reason,
@@ -36,6 +39,42 @@ def test_allows_file_mutation_after_routing_decision():
         blocked = pre_tool_call_block_reason("write_file", {"path": "demo.py"}, task_id)
         assert blocked is not None
         assert "native `write_file`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_routed_exec_before_routing_decision():
+    task_id = "task-routing-routed-exec-block"
+    activate_for_task(task_id, session_id="session-routed-exec-block", skills=["routing-layer"])
+    try:
+        blocked = pre_tool_call_block_reason(
+            "routed_exec",
+            {"task": "Apply the fix", "workdir": "/home/hunter/societies"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "emit a routing decision line" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_routed_exec_after_routing_decision():
+    task_id = "task-routing-routed-exec-allow"
+    activate_for_task(task_id, session_id="session-routed-exec-allow", skills=["routing-layer"])
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-routed-exec-allow",
+        )
+        assert (
+            pre_tool_call_block_reason(
+                "routed_exec",
+                {"task": "Apply the fix", "workdir": "/home/hunter/societies"},
+                task_id,
+            )
+            is None
+        )
     finally:
         deactivate_for_task(task_id)
 
@@ -179,18 +218,15 @@ def test_blocks_routed_codex_exec_with_powershell_cd_and_andand():
             "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
             session_id="session-6",
         )
-        from agent.routing_guard import rewrite_routed_tool_args
-
-        rewritten = rewrite_routed_tool_args(
+        blocked = pre_tool_call_block_reason(
             "terminal",
             {
                 "command": "cd ~/societies && codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' 'Implement the fix'",
             },
             task_id,
         )
-        assert rewritten["command"].startswith("codex exec --skip-git-repo-check -C /home/hunter/societies")
-        assert "cd ~/societies" not in rewritten["command"]
-        assert pre_tool_call_block_reason("terminal", rewritten, task_id) is None
+        assert blocked is not None
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -204,25 +240,21 @@ def test_blocks_long_inline_routed_codex_prompt_without_stdin():
             "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
             session_id="session-7",
         )
-        long_prompt = "A" * 1400
-        from agent.routing_guard import rewrite_routed_tool_args
-
-        rewritten = rewrite_routed_tool_args(
+        blocked = pre_tool_call_block_reason(
             "terminal",
             {
-                "command": f"codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' '{long_prompt}'",
+                "command": f"codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' '{'A' * 1400}'",
             },
             task_id,
         )
-        assert "| codex exec --skip-git-repo-check -C /home/hunter/societies" in rewritten["command"]
-        assert rewritten["command"].rstrip().endswith(" -")
-        assert pre_tool_call_block_reason("terminal", rewritten, task_id) is None
+        assert blocked is not None
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 
 
-def test_allows_routed_codex_prompt_via_stdin():
-    task_id = "task-routing-codex-stdin-allow"
+def test_blocks_routed_codex_prompt_via_terminal_even_when_stdin_shaped():
+    task_id = "task-routing-codex-stdin-block"
     activate_for_task(task_id, session_id="session-8", skills=["routing-layer"])
     try:
         record_routing_decision(
@@ -230,14 +262,15 @@ def test_allows_routed_codex_prompt_via_stdin():
             "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
             session_id="session-8",
         )
-        allowed = pre_tool_call_block_reason(
+        blocked = pre_tool_call_block_reason(
             "terminal",
             {
                 "command": "@'\nImplement the fix\n'@ | codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' -",
             },
             task_id,
         )
-        assert allowed is None
+        assert blocked is not None
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -343,25 +376,9 @@ def test_tier_3b_reclassified_to_codex_backup_requires_codex_route():
             "RECLASSIFY: TIER: 3B | MODEL: Codex CLI (gpt-5.4-mini) | REASON: primary route failed; using backup | CONFIDENCE: high",
             session_id="session-3b-reclassified-backup",
         )
-        assert (
-            pre_tool_call_block_reason(
-                "terminal",
-                {
-                    "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-                },
-                task_id,
-            )
-            is None
-        )
-        blocked = pre_tool_call_block_reason(
-            "terminal",
-            {
-                "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
-            },
-            task_id,
-        )
-        assert blocked is not None
-        assert "active Tier 3B route is `Codex CLI (gpt-5.4-mini)`" in blocked
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
+        ]
     finally:
         deactivate_for_task(task_id)
 
@@ -375,46 +392,37 @@ def test_tier_3b_requires_primary_before_codex_backup():
             "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
             session_id="session-3b-primary",
         )
-        blocked = pre_tool_call_block_reason(
-            "terminal",
-            {
-                "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-            },
-            task_id,
-        )
-        assert blocked is not None
-        assert "Tier 3B backup" in blocked
-
-        assert (
-            pre_tool_call_block_reason(
-                "terminal",
-                {
-                    "command": "hermes chat -m glm-5.1 --provider zai -q \"Apply the fix\" -t terminal,file -Q",
-                },
-                task_id,
-            )
-            is None
-        )
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
+        ]
 
         record_tool_result(
             task_id,
-            "terminal",
+            "routed_exec",
             {
-                "command": "hermes chat -m glm-5.1 --provider zai -q \"Apply the fix\" -t terminal,file -Q",
+                "task": "Apply the fix",
+                "workdir": "/home/hunter/societies",
             },
-            '{"output":"","exit_code":1,"error":null}',
+            json.dumps(
+                {
+                    "attempts": [
+                        {
+                            "kind": "hermes_glm_zai",
+                            "executor": "Hermes CLI (glm-5.1 via zai)",
+                            "output": "provider failed",
+                            "exit_code": 1,
+                            "failed": True,
+                            "failure_kind": "transport_failure",
+                        }
+                    ]
+                }
+            ),
         )
 
-        assert (
-            pre_tool_call_block_reason(
-                "terminal",
-                {
-                    "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-                },
-                task_id,
-            )
-            is None
-        )
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
+        ]
     finally:
         deactivate_for_task(task_id)
 
@@ -430,23 +438,29 @@ def test_tier_3b_backup_unlocks_when_primary_failure_only_appears_in_output():
         )
         record_tool_result(
             task_id,
-            "terminal",
+            "routed_exec",
             {
-                "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
+                "task": "Apply the fix",
+                "workdir": "/home/hunter/societies",
             },
-            '{"output":"HTTP 429: Insufficient balance or no resource package. Please recharge.","exit_code":0,"error":null}',
-        )
-
-        assert (
-            pre_tool_call_block_reason(
-                "terminal",
+            json.dumps(
                 {
-                    "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-                },
-                task_id,
-            )
-            is None
+                    "attempts": [
+                        {
+                            "kind": "hermes_glm_zai",
+                            "executor": "Hermes CLI (glm-5.1 via zai)",
+                            "output": "HTTP 429: Insufficient balance or no resource package. Please recharge.",
+                            "exit_code": 0,
+                            "failed": True,
+                            "failure_kind": "quota_exhausted",
+                        }
+                    ]
+                }
+            ),
         )
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
+        ]
     finally:
         deactivate_for_task(task_id)
 
@@ -460,20 +474,15 @@ def test_rewrites_routed_hermes_glm_command_to_coding_endpoint():
             "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
             session_id="session-hermes-zai-endpoint",
         )
-        from agent.routing_guard import rewrite_routed_tool_args
-
-        rewritten = rewrite_routed_tool_args(
+        blocked = pre_tool_call_block_reason(
             "terminal",
             {
                 "command": 'cd /home/hunter/societies && hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
             },
             task_id,
         )
-        assert (
-            rewritten["command"]
-            == 'cd /home/hunter/societies && GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4 hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q'
-        )
-        assert pre_tool_call_block_reason("terminal", rewritten, task_id) is None
+        assert blocked is not None
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -495,7 +504,7 @@ def test_blocks_routed_hermes_output_truncation_pipe():
             task_id,
         )
         assert blocked is not None
-        assert "mask the true exit status" in blocked
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -517,7 +526,7 @@ def test_blocks_routed_codex_cat_substitution_prompt_shape():
             task_id,
         )
         assert blocked is not None
-        assert "$(cat file)" in blocked
+        assert "use `routed_exec`" in blocked
     finally:
         deactivate_for_task(task_id)
 

@@ -138,6 +138,7 @@ def _discover_tools():
     _modules = [
         "tools.web_tools",
         "tools.terminal_tool",
+        "tools.routed_exec_tool",
         "tools.file_tools",
         "tools.vision_tools",
         "tools.mixture_of_agents_tool",

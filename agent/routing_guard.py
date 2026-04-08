@@ -279,6 +279,47 @@ def get_routing_decision(task_id: str) -> Optional[dict[str, str]]:
         return dict(decision)
 
 
+def get_route_attempts(task_id: str) -> dict[str, Any]:
+    if not task_id:
+        return _initial_route_attempts()
+    with _task_state_lock:
+        _purge_expired()
+        attempts = _task_state.get(task_id, {}).get("route_attempts")
+        if not isinstance(attempts, dict):
+            return _initial_route_attempts()
+        merged = _initial_route_attempts()
+        merged.update(attempts)
+        return merged
+
+
+def get_routed_execution_plan(task_id: str) -> list[dict[str, str]]:
+    decision = get_routing_decision(task_id)
+    if not decision:
+        return []
+
+    tier = str(decision.get("tier", "")).upper()
+    model = _normalize_route_model(str(decision.get("model", "")))
+    attempts = get_route_attempts(task_id)
+
+    if tier == "3A":
+        return [{"kind": "codex_gpt54", "label": "Codex CLI (gpt-5.4)"}]
+
+    if tier == "3C":
+        return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
+
+    if tier == "3B":
+        if model == _normalize_route_model("Codex CLI (gpt-5.4-mini)"):
+            return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
+        if attempts.get("3b_primary_failed"):
+            return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
+        return [
+            {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
+        ]
+
+    return []
+
+
 def _normalize_route_model(model: str) -> str:
     return " ".join((model or "").strip().lower().split())
 
@@ -492,11 +533,52 @@ def _is_explicitly_permitted_git_terminal_command(command: str, task_id: str) ->
 
 def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], result: Any) -> None:
     if (
-        tool_name != "terminal"
+        tool_name not in {"terminal", "routed_exec"}
         or not task_id
         or not isinstance(args, dict)
         or not is_active_for_task(task_id)
     ):
+        return
+
+    if tool_name == "routed_exec":
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return
+        attempt_entries = payload.get("attempts")
+        if not isinstance(attempt_entries, list):
+            return
+        with _task_state_lock:
+            _purge_expired()
+            state = _task_state.get(task_id)
+            if not state:
+                return
+            attempts = state.setdefault("route_attempts", _initial_route_attempts())
+            for entry in attempt_entries:
+                if not isinstance(entry, dict):
+                    continue
+                route_kind = str(entry.get("kind", "") or "")
+                if not route_kind:
+                    continue
+                output = str(entry.get("output", "") or "")
+                failure_kind = str(entry.get("failure_kind") or "") or _classify_routed_failure_kind(output)
+                failed = bool(entry.get("failed"))
+                if not failed:
+                    exit_code = entry.get("exit_code", 0)
+                    try:
+                        failed = int(exit_code or 0) != 0 or bool(_ROUTED_FAILURE_OUTPUT_RE.search(output))
+                    except Exception:
+                        failed = True
+                attempts["last_attempt_kind"] = route_kind
+                attempts["last_attempt_failed"] = failed
+                attempts["last_attempt_failure_kind"] = failure_kind if failed else None
+                if route_kind == "hermes_glm_zai":
+                    attempts["3b_primary_attempted"] = True
+                    attempts["3b_primary_failed"] = failed
+                    attempts["3b_primary_failure_kind"] = failure_kind if failed else None
+            state["updated_at"] = time.time()
         return
 
     route_kind = _classify_routed_terminal_command(str(args.get("command", "") or ""))
@@ -789,6 +871,19 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             "emit a routing decision line before mutating files."
         )
 
+    if tool_name == "routed_exec":
+        if not routing_task:
+            return (
+                "Routing guard blocked `routed_exec`: this tool is reserved for routing-layer controlled "
+                "coding tasks."
+            )
+        if routed:
+            return None
+        return (
+            f"Routing guard blocked `routed_exec` for task {task_id}: "
+            "emit a routing decision line before starting routed execution."
+        )
+
     if tool_name == "terminal":
         command = ""
         if isinstance(args, dict):
@@ -800,17 +895,12 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             if _is_explicitly_permitted_git_terminal_command(command, task_id):
                 return None
             route_kind = _classify_routed_terminal_command(command)
-            route_issue = _validate_terminal_route_command(command, task_id)
-            if route_issue:
-                return route_issue
             if route_kind is not None:
-                routed_hermes_issue = _validate_routed_hermes_terminal_command(command)
-                if routed_hermes_issue:
-                    return routed_hermes_issue
-                routed_codex_issue = _validate_routed_codex_terminal_command(command)
-                if routed_codex_issue:
-                    return routed_codex_issue
-                return None
+                return (
+                    f"Routing guard blocked routed model execution through `terminal` for task {task_id}: "
+                    "use `routed_exec` for routed Codex/Hermes execution. "
+                    "`terminal` remains available only for read-only inspection and explicitly permitted git actions."
+                )
             if _is_read_only_terminal_command(command):
                 return None
             return (

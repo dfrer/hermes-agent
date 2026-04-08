@@ -1,7 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -117,8 +117,8 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "native `write_file`" in result["error"]
 
-    def test_routed_codex_terminal_command_is_rewritten_before_dispatch(self):
-        task_id = "guarded-task-codex-rewrite"
+    def test_routed_exec_dispatches_codex_for_tier_3a(self, tmp_path):
+        task_id = "guarded-task-codex-routed-exec"
         activate_for_task(task_id, session_id="session-guard-3", skills=["routing-layer"])
         record_routing_decision(
             task_id,
@@ -126,28 +126,36 @@ class TestHandleFunctionCall:
             session_id="session-guard-3",
         )
         with (
-            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="codex"),
             patch("hermes_cli.plugins.invoke_hook"),
         ):
             try:
-                result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": "cd ~/societies && codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' '" + ("A" * 1400) + "'",
-                    },
-                    task_id=task_id,
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
                 )
             finally:
                 deactivate_for_task(task_id)
 
-        assert result == '{"ok":true}'
-        dispatched_args = mock_dispatch.call_args[0][1]
-        assert dispatched_args["command"].startswith("@'")
-        assert "| codex exec --skip-git-repo-check -C /home/hunter/societies" in dispatched_args["command"]
-        assert dispatched_args["command"].rstrip().endswith(" -")
+        assert result["success"] is True
+        assert result["attempts"][0]["kind"] == "codex_gpt54"
+        command = mock_run.call_args.args[0]
+        assert command[:3] == ["codex", "exec", "--skip-git-repo-check"]
+        assert command[-1] == "-"
+        assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
 
-    def test_routed_hermes_terminal_command_is_rewritten_to_coding_endpoint(self):
-        task_id = "guarded-task-hermes-rewrite"
+    def test_routed_exec_dispatches_hermes_primary_for_tier_3b(self, tmp_path):
+        task_id = "guarded-task-hermes-routed-exec"
         activate_for_task(task_id, session_id="session-guard-hermes", skills=["routing-layer"])
         record_routing_decision(
             task_id,
@@ -155,26 +163,33 @@ class TestHandleFunctionCall:
             session_id="session-guard-hermes",
         )
         with (
-            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
             patch("hermes_cli.plugins.invoke_hook"),
         ):
             try:
-                result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": 'cd /home/hunter/societies && hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
-                    },
-                    task_id=task_id,
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
                 )
             finally:
                 deactivate_for_task(task_id)
 
-        assert result == '{"ok":true}'
-        dispatched_args = mock_dispatch.call_args[0][1]
-        assert (
-            dispatched_args["command"]
-            == 'cd /home/hunter/societies && GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4 hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q'
-        )
+        assert result["success"] is True
+        assert result["attempts"][0]["kind"] == "hermes_glm_zai"
+        command = mock_run.call_args.args[0]
+        env = mock_run.call_args.kwargs["env"]
+        assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
+        assert env["GLM_BASE_URL"] == "https://api.z.ai/api/coding/paas/v4"
 
     def test_routing_guard_blocks_native_terminal_mutation_after_route_lock(self):
         task_id = "guarded-task-native-terminal-after-route"
@@ -200,12 +215,12 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "native `terminal` execution" in result["error"]
 
-    def test_tier_3b_backup_is_blocked_until_primary_failure(self):
-        task_id = "guarded-task-3b-primary"
+    def test_routed_model_terminal_invocation_is_blocked_in_favor_of_routed_exec(self):
+        task_id = "guarded-task-terminal-routed-block"
         activate_for_task(task_id, session_id="session-guard-4", skills=["routing-layer"])
         record_routing_decision(
             task_id,
-            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
             session_id="session-guard-4",
         )
         try:
@@ -213,7 +228,7 @@ class TestHandleFunctionCall:
                 handle_function_call(
                     "terminal",
                     {
-                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
+                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
                     },
                     task_id=task_id,
                 )
@@ -222,7 +237,7 @@ class TestHandleFunctionCall:
             deactivate_for_task(task_id)
 
         assert "error" in result
-        assert "Tier 3B backup" in result["error"]
+        assert "use `routed_exec`" in result["error"]
 
     def test_conflicting_route_without_reclassify_blocks_follow_on_tool_calls(self):
         task_id = "guarded-task-route-drift"
@@ -283,7 +298,7 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "invalid routing decision" in result["error"]
 
-    def test_failed_tier_3b_primary_allows_codex_backup(self):
+    def test_routed_exec_falls_back_to_codex_after_primary_failure(self, tmp_path):
         task_id = "guarded-task-3b-fallback"
         activate_for_task(task_id, session_id="session-guard-5", skills=["routing-layer"])
         record_routing_decision(
@@ -293,37 +308,37 @@ class TestHandleFunctionCall:
         )
         with (
             patch(
-                "model_tools.registry.dispatch",
+                "tools.routed_exec_tool.subprocess.run",
                 side_effect=[
-                    '{"output":"provider failed","exit_code":1,"error":null}',
-                    '{"ok":true}',
+                    MagicMock(returncode=1, stdout="provider failed", stderr=""),
+                    MagicMock(returncode=0, stdout="backup ok", stderr=""),
                 ],
-            ) as mock_dispatch,
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
             patch("hermes_cli.plugins.invoke_hook"),
         ):
             try:
-                primary_result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
-                    },
-                    task_id=task_id,
-                )
-                backup_result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-                    },
-                    task_id=task_id,
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
                 )
             finally:
                 deactivate_for_task(task_id)
 
-        assert json.loads(primary_result)["exit_code"] == 1
-        assert backup_result == '{"ok":true}'
-        assert mock_dispatch.call_count == 2
+        assert result["success"] is True
+        assert len(result["attempts"]) == 2
+        assert result["attempts"][0]["kind"] == "hermes_glm_zai"
+        assert result["attempts"][0]["failed"] is True
+        assert result["attempts"][1]["kind"] == "codex_gpt54mini"
+        assert mock_run.call_count == 2
 
-    def test_output_indicated_tier_3b_primary_failure_allows_codex_backup(self):
+    def test_routed_exec_sticks_to_codex_backup_after_primary_failure(self, tmp_path):
         task_id = "guarded-task-3b-output-fallback"
         activate_for_task(task_id, session_id="session-guard-5b", skills=["routing-layer"])
         record_routing_decision(
@@ -333,35 +348,46 @@ class TestHandleFunctionCall:
         )
         with (
             patch(
-                "model_tools.registry.dispatch",
+                "tools.routed_exec_tool.subprocess.run",
                 side_effect=[
-                    '{"output":"429 rate limited after retries","exit_code":0,"error":null}',
-                    '{"ok":true}',
+                    MagicMock(returncode=0, stdout="HTTP 429: Insufficient balance or no resource package. Please recharge.", stderr=""),
+                    MagicMock(returncode=0, stdout="backup ok", stderr=""),
+                    MagicMock(returncode=0, stdout="backup reused", stderr=""),
                 ],
-            ) as mock_dispatch,
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
             patch("hermes_cli.plugins.invoke_hook"),
         ):
             try:
-                primary_result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
-                    },
-                    task_id=task_id,
+                first_result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
                 )
-                backup_result = handle_function_call(
-                    "terminal",
-                    {
-                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
-                    },
-                    task_id=task_id,
+                second_result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Run verification",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
                 )
             finally:
                 deactivate_for_task(task_id)
 
-        assert json.loads(primary_result)["exit_code"] == 0
-        assert backup_result == '{"ok":true}'
-        assert mock_dispatch.call_count == 2
+        assert first_result["success"] is True
+        assert len(first_result["attempts"]) == 2
+        assert second_result["success"] is True
+        assert len(second_result["attempts"]) == 1
+        assert second_result["attempts"][0]["kind"] == "codex_gpt54mini"
+        assert mock_run.call_count == 3
 
     def test_git_commit_requires_explicit_user_permission(self):
         task_id = "guarded-task-git"
