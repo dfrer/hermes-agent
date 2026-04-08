@@ -4,6 +4,7 @@ import pytest
 
 from toolsets import (
     TOOLSETS,
+    ensure_skill_required_toolsets,
     get_toolset,
     resolve_toolset,
     resolve_multiple_toolsets,
@@ -28,6 +29,20 @@ class TestGetToolset:
 
     def test_unknown_returns_none(self):
         assert get_toolset("nonexistent") is None
+
+
+class TestEnsureSkillRequiredToolsets:
+    def test_adds_routing_toolset_when_routing_skill_active(self):
+        toolsets = ensure_skill_required_toolsets(["hermes-cli"], skills=["routing-layer"])
+        assert toolsets == ["hermes-cli", "routing"]
+
+    def test_preserves_all_alias_when_routing_skill_active(self):
+        toolsets = ensure_skill_required_toolsets(["all"], skills=["routing-layer"])
+        assert toolsets == ["all"]
+
+    def test_leaves_toolsets_unchanged_without_routing_skill(self):
+        toolsets = ensure_skill_required_toolsets(["hermes-cli"], skills=["other-skill"])
+        assert toolsets == ["hermes-cli"]
 
 
 class TestResolveToolset:

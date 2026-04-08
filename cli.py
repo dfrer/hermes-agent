@@ -566,7 +566,7 @@ from model_tools import get_tool_definitions, get_toolset_for_tool
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import build_welcome_banner
 from hermes_cli.commands import SlashCommandCompleter, SlashCommandAutoSuggest
-from toolsets import get_all_toolsets, get_toolset_info, validate_toolset
+from toolsets import get_all_toolsets, get_toolset_info, validate_toolset, ensure_skill_required_toolsets
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 from cron import get_job
@@ -8511,6 +8511,7 @@ def main(
     for skill_name in [*default_skills, *parsed_skills]:
         if skill_name not in combined_skills:
             combined_skills.append(skill_name)
+    toolsets_list = ensure_skill_required_toolsets(toolsets_list, skills=combined_skills)
 
     # Create CLI instance
     cli = HermesCLI(

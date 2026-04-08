@@ -381,6 +381,31 @@ TOOLSETS = {
 }
 
 
+def ensure_skill_required_toolsets(
+    toolsets: Optional[List[str]],
+    *,
+    skills: Optional[List[str]] = None,
+) -> Optional[List[str]]:
+    """Augment explicit toolsets with any required by active skills.
+
+    Today the routing-layer skill depends on the dedicated `routing` toolset so
+    `routed_exec` is always exposed whenever strict routing is active.
+    """
+    active_skills = {str(skill).strip() for skill in (skills or []) if str(skill).strip()}
+    if "routing-layer" not in active_skills:
+        return toolsets
+
+    if toolsets is None:
+        return None
+
+    normalized = [str(toolset).strip() for toolset in toolsets if str(toolset).strip()]
+    if "all" in normalized or "*" in normalized:
+        return normalized
+    if "routing" not in normalized:
+        normalized.append("routing")
+    return normalized
+
+
 
 def get_toolset(name: str) -> Optional[Dict[str, Any]]:
     """

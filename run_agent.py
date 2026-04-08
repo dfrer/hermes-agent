@@ -910,8 +910,15 @@ class AIAgent:
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
         # Get available tools with filtering
+        from toolsets import ensure_skill_required_toolsets
+
+        effective_enabled_toolsets = ensure_skill_required_toolsets(
+            enabled_toolsets,
+            skills=self.preloaded_skills,
+        )
+
         self.tools = get_tool_definitions(
-            enabled_toolsets=enabled_toolsets,
+            enabled_toolsets=effective_enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
@@ -920,13 +927,23 @@ class AIAgent:
         self.valid_tool_names = set()
         if self.tools:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
+            if "routing-layer" in self.preloaded_skills and "routed_exec" not in self.valid_tool_names:
+                extra_tools = get_tool_definitions(enabled_toolsets=["routing"], quiet_mode=True)
+                if extra_tools:
+                    existing = {tool["function"]["name"] for tool in self.tools}
+                    for tool in extra_tools:
+                        name = tool["function"]["name"]
+                        if name not in existing:
+                            self.tools.append(tool)
+                            self.valid_tool_names.add(name)
+                            existing.add(name)
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
                 
                 # Show filtering info if applied
-                if enabled_toolsets:
-                    print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
+                if effective_enabled_toolsets:
+                    print(f"   ✅ Enabled toolsets: {', '.join(effective_enabled_toolsets)}")
                 if disabled_toolsets:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
