@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from agent.routing_guard import activate_for_task, deactivate_for_task, record_routing_decision
+from agent.routing_guard import (
+    activate_for_task,
+    deactivate_for_task,
+    get_verification_attempts,
+    record_routing_decision,
+)
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
@@ -214,6 +219,42 @@ class TestHandleFunctionCall:
 
         assert "error" in result
         assert "native `terminal` execution" in result["error"]
+
+    def test_verification_terminal_dispatches_and_records_attempt_after_route_lock(self):
+        task_id = "guarded-task-terminal-verification-after-route"
+        activate_for_task(task_id, session_id="session-terminal-verification-after-route", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-terminal-verification-after-route",
+        )
+        with (
+            patch(
+                "model_tools.registry.dispatch",
+                return_value='{"output":"2 passed","exit_code":0,"error":null}',
+            ) as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "terminal",
+                        {
+                            "command": "timeout 90 python -m pytest tests/test_demo.py -q",
+                        },
+                        task_id=task_id,
+                    )
+                )
+                attempts = get_verification_attempts(task_id)
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["exit_code"] == 0
+        assert mock_dispatch.call_count == 1
+        assert len(attempts) == 1
+        assert attempts[0]["kind"] == "python -m pytest"
+        assert attempts[0]["success"] is True
+        assert attempts[0]["output_excerpt"] == "2 passed"
 
     def test_routed_model_terminal_invocation_is_blocked_in_favor_of_routed_exec(self):
         task_id = "guarded-task-terminal-routed-block"

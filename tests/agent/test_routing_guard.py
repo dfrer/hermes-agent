@@ -7,6 +7,7 @@ from agent.routing_guard import (
     deactivate_for_task,
     get_routed_execution_plan,
     get_routing_decision,
+    get_verification_attempts,
     has_route_lock,
     pre_tool_call_block_reason,
     record_tool_result,
@@ -205,6 +206,52 @@ def test_allows_read_only_terminal_inspection_after_routing_decision():
             )
             is None
         )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_local_verification_terminal_after_routing_decision():
+    task_id = "task-routing-terminal-verification-after-route"
+    activate_for_task(task_id, session_id="session-terminal-verification-after-route", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-terminal-verification-after-route",
+        )
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {"command": "timeout 90 python -m pytest tests/test_demo.py -q"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_records_local_verification_attempts():
+    task_id = "task-routing-terminal-verification-record"
+    activate_for_task(task_id, session_id="session-terminal-verification-record", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small fix | CONFIDENCE: high",
+            session_id="session-terminal-verification-record",
+        )
+        record_tool_result(
+            task_id,
+            "terminal",
+            {"command": "timeout 120 dotnet test tests/Societies.Core.Tests/Societies.Core.Tests.csproj --filter PrototypePersistence"},
+            json.dumps({"output": "Passed!", "exit_code": 0, "error": None}),
+        )
+        attempts = get_verification_attempts(task_id)
+        assert len(attempts) == 1
+        assert attempts[0]["kind"] == "dotnet test"
+        assert attempts[0]["success"] is True
+        assert attempts[0]["exit_code"] == 0
+        assert attempts[0]["output_excerpt"] == "Passed!"
     finally:
         deactivate_for_task(task_id)
 

@@ -18,6 +18,7 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _MARKDOWN_LINE_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+\.\s+)?")
 _MARKDOWN_WRAP_RE = re.compile(r"^(?:\*\*|__|`+)+|(?:\*\*|__|`+)+$")
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+_SHELL_CHAIN_RE = re.compile(r"\s*(?:&&|;)\s*")
 _SAFE_REDIRECTION_RE = re.compile(r"\b\d>&\d\b")
 _UNSAFE_REDIRECTION_RE = re.compile(r"(^|[\s(])(?:\d*>>|\d*>)(?!&)")
 _ROUTED_CODEX_WITH_CD_RE = re.compile(
@@ -56,6 +57,9 @@ _GIT_BRANCH_REQUEST_RE = re.compile(
 _GIT_MUTATION_REQUEST_RE = re.compile(
     r"(?i)\b(?:git\s+checkout|git\s+restore|git\s+reset|git\s+clean|discard|revert|restore|reset|clean\s+up\s+unrelated\s+changes)\b"
 )
+_LEADING_ENV_ASSIGNMENTS_RE = re.compile(r"^(?:[a-z_][a-z0-9_]*=\S+\s+)+", re.IGNORECASE)
+_TIMEOUT_PREFIX_RE = re.compile(r"^timeout\s+\d+\s+", re.IGNORECASE)
+_VERIFICATION_OUTPUT_PIPE_RE = re.compile(r"(?i)\|\s*(?:tail|head|select-object)\b")
 
 _READ_ONLY_TERMINAL_PREFIXES = (
     "cd",
@@ -88,6 +92,54 @@ _READ_ONLY_TERMINAL_PREFIXES = (
     "get-childitem",
     "get-content",
     "select-string",
+)
+
+_VERIFICATION_TERMINAL_PREFIXES = (
+    "pytest",
+    "python -m pytest",
+    "python -m unittest",
+    "dotnet test",
+    "dotnet build",
+    "dotnet msbuild",
+    "cargo test",
+    "cargo check",
+    "cargo build",
+    "go test",
+    "go build",
+    "npm test",
+    "npm run test",
+    "npm run lint",
+    "npm run build",
+    "pnpm test",
+    "pnpm lint",
+    "pnpm build",
+    "pnpm run test",
+    "pnpm run lint",
+    "pnpm run build",
+    "yarn test",
+    "yarn lint",
+    "yarn build",
+    "npx vitest",
+    "vitest",
+    "ruff check",
+    "mypy",
+    "eslint",
+    "tsc",
+    "make test",
+    "make lint",
+    "make build",
+    "just test",
+    "just lint",
+    "just build",
+)
+
+_VERIFICATION_MUTATION_EXCEPTIONS = frozenset(
+    {
+        "dotnet build",
+        "dotnet test",
+        "pytest",
+        "python ",
+    }
 )
 
 _TERMINAL_MUTATION_MARKERS = (
@@ -192,6 +244,7 @@ def _new_task_state(*, session_id: str = "", skills: Optional[list[str]] = None,
         "decision_line": None,
         "decision_error": None,
         "route_attempts": _initial_route_attempts(),
+        "verification_attempts": [],
         "git_permissions": _derive_git_permissions(user_message),
         "updated_at": time.time(),
     }
@@ -318,6 +371,17 @@ def get_routed_execution_plan(task_id: str) -> list[dict[str, str]]:
         ]
 
     return []
+
+
+def get_verification_attempts(task_id: str) -> list[dict[str, Any]]:
+    if not task_id:
+        return []
+    with _task_state_lock:
+        _purge_expired()
+        attempts = _task_state.get(task_id, {}).get("verification_attempts")
+        if not isinstance(attempts, list):
+            return []
+        return [dict(item) for item in attempts if isinstance(item, dict)]
 
 
 def _normalize_route_model(model: str) -> str:
@@ -581,19 +645,26 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
             state["updated_at"] = time.time()
         return
 
-    route_kind = _classify_routed_terminal_command(str(args.get("command", "") or ""))
-    if route_kind is None:
+    command = str(args.get("command", "") or "")
+    route_kind = _classify_routed_terminal_command(command)
+    verification_kind = None if route_kind is not None else _classify_verification_command(command)
+    if route_kind is None and verification_kind is None:
         return
 
     failed = True
     failure_kind = None
+    output = ""
+    error_text = ""
+    exit_code = 1
     try:
         payload = json.loads(result) if isinstance(result, str) else result
         output = str(payload.get("output", "") or "")
+        error_text = str(payload.get("error", "") or "")
+        exit_code = int(payload.get("exit_code", 1) or 0)
         failure_kind = _classify_routed_failure_kind(output)
         failed = (
-            bool(payload.get("error"))
-            or int(payload.get("exit_code", 1) or 0) != 0
+            bool(error_text)
+            or exit_code != 0
             or bool(_ROUTED_FAILURE_OUTPUT_RE.search(output))
         )
     except Exception:
@@ -603,6 +674,22 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
         _purge_expired()
         state = _task_state.get(task_id)
         if not state:
+            return
+        if verification_kind is not None:
+            attempts = state.setdefault("verification_attempts", [])
+            attempts.append(
+                {
+                    "kind": verification_kind,
+                    "command": command,
+                    "success": not failed,
+                    "exit_code": exit_code,
+                    "error": error_text or None,
+                    "output_excerpt": output[:500] if output else "",
+                }
+            )
+            if len(attempts) > 20:
+                del attempts[:-20]
+            state["updated_at"] = time.time()
             return
         attempts = state.setdefault("route_attempts", _initial_route_attempts())
         attempts["last_attempt_kind"] = route_kind
@@ -638,6 +725,70 @@ def _is_read_only_terminal_command(command: str) -> bool:
             return False
 
     return True
+
+
+def _normalize_verification_segment(segment: str) -> str:
+    normalized = " ".join((segment or "").strip().lower().split())
+    if not normalized:
+        return normalized
+    previous = None
+    while normalized and previous != normalized:
+        previous = normalized
+        normalized = _LEADING_ENV_ASSIGNMENTS_RE.sub("", normalized)
+        normalized = _TIMEOUT_PREFIX_RE.sub("", normalized)
+        normalized = normalized.removeprefix("env ").strip()
+    return normalized
+
+
+def _classify_verification_command(command: str) -> Optional[str]:
+    raw = (command or "").strip()
+    if not raw:
+        return None
+
+    normalized = " ".join(raw.lower().split())
+    normalized = _SAFE_REDIRECTION_RE.sub("", normalized)
+
+    if _UNSAFE_REDIRECTION_RE.search(normalized):
+        return None
+    if _VERIFICATION_OUTPUT_PIPE_RE.search(normalized):
+        return None
+    if "| codex exec" in normalized or "| hermes chat" in normalized:
+        return None
+    if _classify_routed_terminal_command(normalized) is not None:
+        return None
+
+    parts = [part.strip() for part in _SHELL_CHAIN_RE.split(normalized) if part.strip()]
+    if not parts:
+        return None
+
+    matched_prefix: Optional[str] = None
+    for part in parts:
+        if _is_read_only_terminal_command(part):
+            continue
+        if any(
+            marker in part
+            for marker in _TERMINAL_MUTATION_MARKERS
+            if marker not in _VERIFICATION_MUTATION_EXCEPTIONS
+        ):
+            return None
+        verification = _normalize_verification_segment(part)
+        matched = next(
+            (
+                prefix
+                for prefix in _VERIFICATION_TERMINAL_PREFIXES
+                if verification == prefix or verification.startswith(f"{prefix} ")
+            ),
+            None,
+        )
+        if matched is None:
+            return None
+        matched_prefix = matched
+
+    return matched_prefix
+
+
+def _is_verification_terminal_command(command: str) -> bool:
+    return _classify_verification_command(command) is not None
 
 
 def _validate_routed_codex_terminal_command(command: str) -> Optional[str]:
@@ -857,7 +1008,7 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
     routing_task = is_routing_enforced_task(task_id)
     decision_error = _get_decision_error(task_id)
 
-    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task"}:
+    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec"}:
         return decision_error
 
     if tool_name in {"patch", "write_file"}:
@@ -901,12 +1052,14 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                     "use `routed_exec` for routed Codex/Hermes execution. "
                     "`terminal` remains available only for read-only inspection and explicitly permitted git actions."
                 )
+            if _is_verification_terminal_command(command):
+                return None
             if _is_read_only_terminal_command(command):
                 return None
             return (
                 f"Routing guard blocked native `terminal` execution for task {task_id}: "
                 "after a routing decision, non-read-only shell work must stay on the routed model path. "
-                "Only routed model invocations and read-only inspection commands are allowed."
+                "Only routed model execution via `routed_exec`, approved verification commands, and read-only inspection commands are allowed."
             )
         if routed:
             return None

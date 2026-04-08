@@ -242,6 +242,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Do not silently change from `3A` to `3B`/`3C` or vice versa during ordinary investigation.\n"
     "- After emitting the routing decision, use the structured `routed_exec` tool for routed Codex/Hermes execution. Do not build raw `codex exec` or `hermes chat` shell commands yourself.\n"
     "- For Tier `3B`, `routed_exec` must try `Hermes CLI (glm-5.1 via zai)` first and use the Codex backup only after the Hermes primary actually fails.\n"
+    "- After route lock, use `terminal` only for approved local verification commands (tests/build/lint/artifact checks), read-only inspection, or explicitly permitted git actions.\n"
+    "- Do not invent fake route labels such as `MODEL: local execution` for verification; verification is a local lane within the active routed task.\n"
     "</routing_discipline>\n"
     "\n"
     "<git_authority>\n"
