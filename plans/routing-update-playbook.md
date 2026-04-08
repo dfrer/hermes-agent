@@ -90,3 +90,28 @@ This checkout is configured for safer recurring upstream merges:
 
 The routing system is still specialized enough that upstream changes touching tool dispatch, the agent loop, or prompt assembly can break it.
 Treat the routing contract suite as mandatory before accepting an upstream update.
+
+## Out-Of-Repo Routing Backup
+
+You can export the routing stack outside the Hermes repo at any time:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\export-routing-backup.ps1
+```
+
+By default this writes to:
+
+```text
+~/.hermes/routing-backups/<timestamp>/
+```
+
+Each backup includes:
+
+- a git bundle of the current branch
+- a patch of commits relative to `origin/main`
+- a commit list
+- copied `SOUL.md`
+- copied `skills/routing-layer/SKILL.md`
+- restore instructions
+
+Use this before large upstream merges or before any risky routing refactor.

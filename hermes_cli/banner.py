@@ -147,12 +147,19 @@ def check_for_updates() -> Optional[int]:
     if not (repo_dir / ".git").exists():
         return None
 
+    current_head = _git_short_hash(repo_dir, "HEAD")
+
     # Read cache
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+            cached_head = cached.get("head")
+            if (
+                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+                and cached_head
+                and cached_head == current_head
+            ):
                 return cached.get("behind")
     except Exception:
         pass
@@ -183,7 +190,7 @@ def check_for_updates() -> Optional[int]:
 
     # Write cache
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
+        cache_file.write_text(json.dumps({"ts": now, "behind": behind, "head": current_head}))
     except Exception:
         pass
 
