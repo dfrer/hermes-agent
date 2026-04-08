@@ -218,6 +218,48 @@ def test_allows_chained_read_only_terminal_inspection():
         deactivate_for_task(task_id)
 
 
+def test_allows_read_only_terminal_with_quoted_pipe_pattern():
+    task_id = "task-routing-terminal-quoted-pipe"
+    activate_for_task(task_id, session_id="session-3c", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {
+                    "command": 'cd ~/societies && find . -name "*.cs" | grep -E "(Extended|characterize|runner|report)" | grep -v obj/ | grep -v .godot/'
+                },
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_read_only_terminal_with_null_redirection():
+    task_id = "task-routing-terminal-null-redirection"
+    activate_for_task(task_id, session_id="session-3d", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {"command": "cd ~/societies && ls -la characterize/ tests/PathSegmentLogisticsRunner/ 2>/dev/null"},
+                task_id,
+            )
+            is None
+        )
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {"command": "cd ~/societies && ls *.md 2>/dev/null"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_blocks_implementation_oriented_delegate_before_routing():
     task_id = "task-routing-delegate"
     activate_for_task(task_id, session_id="session-4", skills=["routing-layer"])

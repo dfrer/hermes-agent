@@ -19,7 +19,7 @@ _MARKDOWN_LINE_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+\.\s+)?")
 _MARKDOWN_WRAP_RE = re.compile(r"^(?:\*\*|__|`+)+|(?:\*\*|__|`+)+$")
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 _SHELL_CHAIN_RE = re.compile(r"\s*(?:&&|;)\s*")
-_SAFE_REDIRECTION_RE = re.compile(r"\b\d>&\d\b")
+_SAFE_REDIRECTION_RE = re.compile(r"\b\d>&\d\b|(^|[\s(])(?:\d*>|>)(?:\s*)(?:/dev/null|nul)\b", re.IGNORECASE)
 _UNSAFE_REDIRECTION_RE = re.compile(r"(^|[\s(])(?:\d*>>|\d*>)(?!&)")
 _ROUTED_CODEX_WITH_CD_RE = re.compile(
     r"(?is)^\s*(?:cd|set-location|pushd)\b.*?(?:&&|;|\|\|)\s*codex\s+exec\b"
@@ -271,6 +271,48 @@ def _initial_route_attempts() -> dict[str, Any]:
         "last_attempt_failed": False,
         "last_attempt_failure_kind": None,
     }
+
+
+def _split_shell_segments(command: str, separators: tuple[str, ...]) -> list[str]:
+    if not command:
+        return []
+    ordered = sorted(separators, key=len, reverse=True)
+    parts: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == "'" and not in_double:
+            in_single = not in_single
+            current.append(char)
+            i += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            current.append(char)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            matched = False
+            for separator in ordered:
+                if command.startswith(separator, i):
+                    part = "".join(current).strip()
+                    if part:
+                        parts.append(part)
+                    current = []
+                    i += len(separator)
+                    matched = True
+                    break
+            if matched:
+                continue
+        current.append(char)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def _derive_git_permissions(user_message: str) -> dict[str, bool]:
@@ -880,11 +922,11 @@ def _is_read_only_terminal_command(command: str) -> bool:
     if not normalized:
         return True
 
-    normalized = _SAFE_REDIRECTION_RE.sub("", normalized)
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
     if _UNSAFE_REDIRECTION_RE.search(normalized):
         return False
 
-    commands = [part.strip() for part in _SHELL_SPLIT_RE.split(normalized) if part.strip()]
+    commands = _split_shell_segments(normalized, ("&&", "||", ";", "|"))
     if not commands:
         return True
 
@@ -919,7 +961,7 @@ def _classify_verification_command(command: str) -> Optional[str]:
         return None
 
     normalized = " ".join(raw.lower().split())
-    normalized = _SAFE_REDIRECTION_RE.sub("", normalized)
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
 
     if _UNSAFE_REDIRECTION_RE.search(normalized):
         return None
@@ -930,7 +972,7 @@ def _classify_verification_command(command: str) -> Optional[str]:
     if _classify_routed_terminal_command(normalized) is not None:
         return None
 
-    parts = [part.strip() for part in _SHELL_CHAIN_RE.split(normalized) if part.strip()]
+    parts = _split_shell_segments(normalized, ("&&", ";"))
     if not parts:
         return None
 
