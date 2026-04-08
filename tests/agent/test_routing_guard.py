@@ -95,6 +95,69 @@ def test_records_markdown_wrapped_routing_decision():
         deactivate_for_task(task_id)
 
 
+def test_records_explicit_route_path_for_long_context():
+    task_id = "task-routing-path-long-context"
+    activate_for_task(task_id, session_id="session-path-long-context", skills=["routing-layer"])
+    try:
+        recorded = record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: long-context | MODEL: Hermes CLI (xiaomi/mimo-v2-pro via nous) | REASON: huge repo/documentation scan | CONFIDENCE: high",
+            session_id="session-path-long-context",
+        )
+        assert recorded is True
+        decision = get_routing_decision(task_id)
+        assert decision is not None
+        assert decision["path"] == "long-context"
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "hermes_nous_mimo_v2_pro", "label": "Hermes CLI (xiaomi/mimo-v2-pro via nous)"},
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
+        ]
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_records_quick_edit_route_for_minimax_primary():
+    task_id = "task-routing-path-quick-edit"
+    activate_for_task(task_id, session_id="session-path-quick-edit", skills=["routing-layer"])
+    try:
+        recorded = record_routing_decision(
+            task_id,
+            "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: straightforward token-heavy edits | CONFIDENCE: high",
+            session_id="session-path-quick-edit",
+        )
+        assert recorded is True
+        decision = get_routing_decision(task_id)
+        assert decision is not None
+        assert decision["path"] == "quick-edit"
+        assert get_routed_execution_plan(task_id) == [
+            {"kind": "hermes_minimax_m27", "label": "Hermes CLI (MiniMax-M2.7 via minimax)"},
+            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
+        ]
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_model_path_mismatch_for_long_context_route():
+    task_id = "task-routing-path-mismatch"
+    activate_for_task(task_id, session_id="session-path-mismatch", skills=["routing-layer"])
+    try:
+        recorded = record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: long-context | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: mismatched model/path | CONFIDENCE: high",
+            session_id="session-path-mismatch",
+        )
+        assert recorded is False
+        blocked = pre_tool_call_block_reason(
+            "routed_exec",
+            {"task": "Do the work", "workdir": "/home/hunter/societies"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "does not match the allowed models for path `long-context`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_allows_read_only_terminal_but_blocks_mutating_terminal():
     task_id = "task-routing-terminal"
     activate_for_task(task_id, session_id="session-3", skills=["routing-layer"])

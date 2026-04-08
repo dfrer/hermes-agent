@@ -103,6 +103,10 @@ def _command_preview(kind: str, workdir: str) -> str:
             "GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4 "
             "hermes chat -m glm-5.1 --provider zai -q <prompt> -t terminal,file -Q"
         )
+    if kind == "hermes_minimax_m27":
+        return "hermes chat -m MiniMax-M2.7 --provider minimax -q <prompt> -t terminal,file -Q"
+    if kind == "hermes_nous_mimo_v2_pro":
+        return "hermes chat -m xiaomi/mimo-v2-pro --provider nous -q <prompt> -t terminal,file -Q"
     return kind
 
 
@@ -193,16 +197,27 @@ def _run_codex(*, executable: str, model: str, workdir: str, host_cwd: str, prom
         }
 
 
-def _run_hermes(*, executable: str, host_cwd: str, prompt: str, timeout: int) -> dict[str, Any]:
+def _run_hermes(
+    *,
+    executable: str,
+    host_cwd: str,
+    prompt: str,
+    timeout: int,
+    kind: str,
+    model: str,
+    provider: str,
+    env_overrides: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     env = os.environ.copy()
-    env["GLM_BASE_URL"] = _ZAI_CODING_BASE_URL
+    if env_overrides:
+        env.update(env_overrides)
     command = [
         executable,
         "chat",
         "-m",
-        "glm-5.1",
+        model,
         "--provider",
-        "zai",
+        provider,
         "-q",
         prompt,
         "-t",
@@ -222,9 +237,13 @@ def _run_hermes(*, executable: str, host_cwd: str, prompt: str, timeout: int) ->
         failure_kind = _classify_routed_failure_kind(output)
         failed = bool(result.returncode != 0 or failure_kind)
         return {
-            "kind": "hermes_glm_zai",
-            "executor": "Hermes CLI (glm-5.1 via zai)",
-            "command_preview": _command_preview("hermes_glm_zai", host_cwd),
+            "kind": kind,
+            "executor": {
+                "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
+                "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
+                "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
+            }.get(kind, f"Hermes CLI ({model} via {provider})"),
+            "command_preview": _command_preview(kind, host_cwd),
             "output": output,
             "exit_code": int(result.returncode),
             "failed": failed,
@@ -234,9 +253,13 @@ def _run_hermes(*, executable: str, host_cwd: str, prompt: str, timeout: int) ->
     except subprocess.TimeoutExpired as exc:
         output = _truncate_output(_combine_output(exc.stdout or "", exc.stderr or ""))
         return {
-            "kind": "hermes_glm_zai",
-            "executor": "Hermes CLI (glm-5.1 via zai)",
-            "command_preview": _command_preview("hermes_glm_zai", host_cwd),
+            "kind": kind,
+            "executor": {
+                "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
+                "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
+                "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
+            }.get(kind, f"Hermes CLI ({model} via {provider})"),
+            "command_preview": _command_preview(kind, host_cwd),
             "output": output,
             "exit_code": 124,
             "failed": True,
@@ -245,9 +268,13 @@ def _run_hermes(*, executable: str, host_cwd: str, prompt: str, timeout: int) ->
         }
     except FileNotFoundError:
         return {
-            "kind": "hermes_glm_zai",
-            "executor": "Hermes CLI (glm-5.1 via zai)",
-            "command_preview": _command_preview("hermes_glm_zai", host_cwd),
+            "kind": kind,
+            "executor": {
+                "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
+                "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
+                "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
+            }.get(kind, f"Hermes CLI ({model} via {provider})"),
+            "command_preview": _command_preview(kind, host_cwd),
             "output": "",
             "exit_code": -1,
             "failed": True,
@@ -257,9 +284,13 @@ def _run_hermes(*, executable: str, host_cwd: str, prompt: str, timeout: int) ->
         }
     except Exception as exc:
         return {
-            "kind": "hermes_glm_zai",
-            "executor": "Hermes CLI (glm-5.1 via zai)",
-            "command_preview": _command_preview("hermes_glm_zai", host_cwd),
+            "kind": kind,
+            "executor": {
+                "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
+                "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
+                "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
+            }.get(kind, f"Hermes CLI ({model} via {provider})"),
+            "command_preview": _command_preview(kind, host_cwd),
             "output": "",
             "exit_code": -1,
             "failed": True,
@@ -303,6 +334,30 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
                 host_cwd=host_cwd,
                 prompt=prompt,
                 timeout=effective_timeout,
+                kind="hermes_glm_zai",
+                model="glm-5.1",
+                provider="zai",
+                env_overrides={"GLM_BASE_URL": _ZAI_CODING_BASE_URL},
+            )
+        elif kind == "hermes_minimax_m27":
+            attempt = _run_hermes(
+                executable=hermes_executable or "hermes",
+                host_cwd=host_cwd,
+                prompt=prompt,
+                timeout=effective_timeout,
+                kind="hermes_minimax_m27",
+                model="MiniMax-M2.7",
+                provider="minimax",
+            )
+        elif kind == "hermes_nous_mimo_v2_pro":
+            attempt = _run_hermes(
+                executable=hermes_executable or "hermes",
+                host_cwd=host_cwd,
+                prompt=prompt,
+                timeout=effective_timeout,
+                kind="hermes_nous_mimo_v2_pro",
+                model="xiaomi/mimo-v2-pro",
+                provider="nous",
             )
         elif kind == "codex_gpt54":
             attempt = _run_codex(
@@ -345,6 +400,7 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
         {
             "success": success,
             "tier": decision.get("tier"),
+            "route_path": decision.get("path"),
             "route_model": decision.get("model"),
             "workdir": workdir,
             "attempts": attempts,
@@ -373,12 +429,12 @@ def check_routed_exec_requirements() -> bool:
 
 ROUTED_EXEC_SCHEMA = {
     "name": "routed_exec",
-    "description": (
-        "Execute the active routing-layer coding task through the structured routed executor. "
-        "Use this after emitting the routing decision line for any routed Codex/Hermes work. "
-        "Do not construct raw `codex exec` or `hermes chat` terminal commands yourself; this tool "
-        "selects the correct executor and handles the defined 3B fallback chain."
-    ),
+        "description": (
+            "Execute the active routing-layer coding task through the structured routed executor. "
+            "Use this after emitting the routing decision line for any routed Codex/Hermes work. "
+            "Do not construct raw `codex exec` or `hermes chat` terminal commands yourself; this tool "
+            "selects the correct executor for the active route archetype and handles the defined fallback chain."
+        ),
     "parameters": {
         "type": "object",
         "properties": {

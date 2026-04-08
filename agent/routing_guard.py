@@ -11,7 +11,7 @@ DEFAULT_ROUTING_SKILL = "routing-layer"
 
 _TASK_STATE_TTL_SECONDS = 2 * 60 * 60
 _ROUTING_DECISION_RE = re.compile(
-    r"(?im)^\s*(?:RECLASSIFY:\s*)?TIER:\s*(?P<tier>3A|3B|3C)\b\s*\|\s*MODEL:\s*(?P<model>[^|]+?)\s*\|\s*REASON:\s*(?P<reason>[^|]+?)\s*\|\s*CONFIDENCE:\s*(?P<confidence>high|medium|low)\s*$"
+    r"(?im)^\s*(?:RECLASSIFY:\s*)?TIER:\s*(?P<tier>3A|3B|3C)\b\s*(?:\|\s*PATH:\s*(?P<path>[a-z0-9-]+)\s*)?\|\s*MODEL:\s*(?P<model>[^|]+?)\s*\|\s*REASON:\s*(?P<reason>[^|]+?)\s*\|\s*CONFIDENCE:\s*(?P<confidence>high|medium|low)\s*$"
 )
 _RECLASSIFY_MARKER_RE = re.compile(r"(?i)\b(?:reclassify|reclassification|route change|route reclassification|escalate|downgrade)\b")
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -31,6 +31,10 @@ _LONG_CODEX_INLINE_PROMPT_CHARS = 1200
 _HERMES_CHAT_RE = re.compile(r"(?i)\bhermes\s+chat\b")
 _HERMES_GLM_MODEL_RE = re.compile(r"(?i)(?:^|\s)-m\s+glm-5\.1\b")
 _HERMES_ZAI_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+zai\b")
+_HERMES_MINIMAX_MODEL_RE = re.compile(r"(?i)(?:^|\s)-m\s+minimax-m2\.7\b")
+_HERMES_MINIMAX_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+minimax\b")
+_HERMES_MIMO_MODEL_RE = re.compile(r"(?i)(?:^|\s)-m\s+(?:xiaomi/)?mimo-v2-pro\b")
+_HERMES_NOUS_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+nous\b")
 _HERMES_GLM_BASE_URL_RE = re.compile(r"(?i)\bGLM_BASE_URL=(?P<value>\S+)")
 _CODEX_EXEC_RE = re.compile(r"(?i)\bcodex\s+exec\b")
 _CODEX_GPT54_MINI_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4-mini\b")
@@ -203,10 +207,52 @@ _ROUTED_QUOTA_EXHAUSTED_RE = re.compile(
 _ROUTED_FAILURE_OUTPUT_RE = re.compile(
     r"(?is)\b(?:429|rate[- ]limit(?:ed)?|too many requests|insufficient balance|no resource package|resource package|quota exhausted|credits? exhausted|please recharge|remoteprotocolerror|provider dropped|transport failure|http failure|auth failure|authentication failure|model not found|write failure|patch rejection|failed to execute|timed out|timeout)\b"
 )
+_ROUTE_MATRIX: dict[str, dict[str, dict[str, Any]]] = {
+    "3A": {
+        "high-risk": {
+            "primary": {"kind": "codex_gpt54", "label": "Codex CLI (gpt-5.4)"},
+            "fallbacks": [],
+        }
+    },
+    "3B": {
+        "marathon": {
+            "primary": {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
+            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
+        },
+        "long-context": {
+            "primary": {"kind": "hermes_nous_mimo_v2_pro", "label": "Hermes CLI (xiaomi/mimo-v2-pro via nous)"},
+            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
+        },
+    },
+    "3C": {
+        "quick-edit": {
+            "primary": {"kind": "hermes_minimax_m27", "label": "Hermes CLI (MiniMax-M2.7 via minimax)"},
+            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
+        }
+    },
+}
+
+_PRIMARY_MODEL_PATH_BY_TIER: dict[str, dict[str, str]] = {}
+for _tier_key, _paths in _ROUTE_MATRIX.items():
+    _PRIMARY_MODEL_PATH_BY_TIER[_tier_key] = {}
+    for _path_key, _profile in _paths.items():
+        _PRIMARY_MODEL_PATH_BY_TIER[_tier_key][" ".join(_profile["primary"]["label"].strip().lower().split())] = _path_key
+
 _ALLOWED_ROUTE_MODELS = {
-    "3A": ("Codex CLI (gpt-5.4)",),
-    "3B": ("Hermes CLI (glm-5.1 via zai)", "Codex CLI (gpt-5.4-mini)"),
-    "3C": ("Codex CLI (gpt-5.4-mini)",),
+    tier: tuple(
+        dict.fromkeys(
+            target["label"]
+            for profile in paths.values()
+            for target in [profile["primary"], *profile.get("fallbacks", [])]
+        )
+    )
+    for tier, paths in _ROUTE_MATRIX.items()
+}
+
+_DEFAULT_ROUTE_PATHS = {
+    "3A": "high-risk",
+    "3B": "marathon",
+    "3C": "quick-edit",
 }
 
 _task_state_lock = threading.Lock()
@@ -215,6 +261,9 @@ _task_state: dict[str, dict[str, Any]] = {}
 
 def _initial_route_attempts() -> dict[str, Any]:
     return {
+        "primary_attempted": False,
+        "primary_failed": False,
+        "primary_failure_kind": None,
         "3b_primary_attempted": False,
         "3b_primary_failed": False,
         "3b_primary_failure_kind": None,
@@ -352,25 +401,24 @@ def get_routed_execution_plan(task_id: str) -> list[dict[str, str]]:
 
     tier = str(decision.get("tier", "")).upper()
     model = _normalize_route_model(str(decision.get("model", "")))
+    path = _normalize_route_path(str(decision.get("path", "") or ""))
     attempts = get_route_attempts(task_id)
+    profile = _get_route_profile(tier, path, model)
+    if not profile:
+        return []
 
-    if tier == "3A":
-        return [{"kind": "codex_gpt54", "label": "Codex CLI (gpt-5.4)"}]
+    primary = dict(profile["primary"])
+    fallbacks = [dict(item) for item in profile.get("fallbacks", [])]
+    if model == _normalize_route_model(primary["label"]):
+        if attempts.get("primary_failed"):
+            return fallbacks
+        return [primary, *fallbacks]
 
-    if tier == "3C":
-        return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
+    for fallback in fallbacks:
+        if model == _normalize_route_model(fallback["label"]):
+            return [fallback]
 
-    if tier == "3B":
-        if model == _normalize_route_model("Codex CLI (gpt-5.4-mini)"):
-            return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
-        if attempts.get("3b_primary_failed"):
-            return [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}]
-        return [
-            {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
-            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
-        ]
-
-    return []
+    return [primary, *fallbacks]
 
 
 def get_verification_attempts(task_id: str) -> list[dict[str, Any]]:
@@ -388,12 +436,43 @@ def _normalize_route_model(model: str) -> str:
     return " ".join((model or "").strip().lower().split())
 
 
+def _normalize_route_path(path: str) -> str:
+    return "-".join((path or "").strip().lower().split())
+
+
+def _infer_route_path(tier: str, normalized_model: str) -> str:
+    inferred = _PRIMARY_MODEL_PATH_BY_TIER.get((tier or "").upper(), {}).get(normalized_model)
+    if inferred:
+        return inferred
+    return _DEFAULT_ROUTE_PATHS.get(tier, "")
+
+
+def _get_route_profile(tier: str, path: str, normalized_model: str = "") -> Optional[dict[str, Any]]:
+    normalized_tier = (tier or "").upper()
+    normalized_path = _normalize_route_path(path)
+    if not normalized_path:
+        normalized_path = _infer_route_path(normalized_tier, normalized_model)
+    return _ROUTE_MATRIX.get(normalized_tier, {}).get(normalized_path)
+
+
 def _format_route_label(tier: str, model: str) -> str:
     return f"TIER: {tier} | MODEL: {model}"
 
 
+def _format_route_label_with_path(tier: str, path: str, model: str) -> str:
+    normalized_path = _normalize_route_path(path)
+    if normalized_path:
+        return f"TIER: {tier} | PATH: {normalized_path} | MODEL: {model}"
+    return _format_route_label(tier, model)
+
+
 def _format_allowed_route_models(tier: str) -> str:
     labels = _ALLOWED_ROUTE_MODELS.get((tier or "").upper(), ())
+    return ", ".join(f"`{label}`" for label in labels)
+
+
+def _format_allowed_route_paths(tier: str) -> str:
+    labels = tuple(_ROUTE_MATRIX.get((tier or "").upper(), {}).keys())
     return ", ".join(f"`{label}`" for label in labels)
 
 
@@ -420,6 +499,7 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
         return False
     decision = {
         "tier": match.group("tier").upper(),
+        "path": _normalize_route_path(match.group("path") or ""),
         "model": match.group("model").strip(),
         "reason": match.group("reason").strip(),
         "confidence": match.group("confidence").lower(),
@@ -432,6 +512,26 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
             task_id,
             _new_task_state(session_id=session_id),
         )
+        current = state.get("decision")
+        if not decision["path"]:
+            if (
+                isinstance(current, dict)
+                and str(current.get("tier", "")).upper() == decision["tier"]
+                and current.get("path")
+            ):
+                decision["path"] = _normalize_route_path(str(current.get("path", "")))
+            else:
+                decision["path"] = _infer_route_path(decision["tier"], normalized_model)
+        if decision["path"] not in _ROUTE_MATRIX.get(decision["tier"], {}):
+            _set_decision_error(
+                state,
+                (
+                    f"Routing guard blocked invalid routing path for task {task_id}: "
+                    f"`{decision['path']}` is not allowed for {decision['tier']}. "
+                    f"Allowed paths for {decision['tier']} are: {_format_allowed_route_paths(decision['tier'])}."
+                ),
+            )
+            return False
         allowed_models = _ALLOWED_ROUTE_MODELS.get(decision["tier"], ())
         if normalized_model not in {_normalize_route_model(label) for label in allowed_models}:
             _set_decision_error(
@@ -443,17 +543,41 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
                 ),
             )
             return False
-        current = state.get("decision")
+        profile = _get_route_profile(decision["tier"], decision["path"], normalized_model)
+        if not profile:
+            _set_decision_error(
+                state,
+                (
+                    f"Routing guard blocked invalid routing decision for task {task_id}: "
+                    f"`{_format_route_label_with_path(decision['tier'], decision['path'], decision['model'])}` "
+                    "does not map to a known route profile."
+                ),
+            )
+            return False
+        profile_models = {
+            _normalize_route_model(profile["primary"]["label"]),
+            *(_normalize_route_model(item["label"]) for item in profile.get("fallbacks", [])),
+        }
+        if normalized_model not in profile_models:
+            _set_decision_error(
+                state,
+                (
+                    f"Routing guard blocked invalid routing decision for task {task_id}: "
+                    f"`{_format_route_label_with_path(decision['tier'], decision['path'], decision['model'])}` "
+                    f"does not match the allowed models for path `{decision['path']}`."
+                ),
+            )
+            return False
         if isinstance(current, dict):
-            current_key = (current.get("tier"), current.get("model"))
-            new_key = (decision["tier"], decision["model"])
+            current_key = (current.get("tier"), current.get("path"), current.get("model"))
+            new_key = (decision["tier"], decision["path"], decision["model"])
             if current_key != new_key and not _RECLASSIFY_MARKER_RE.search(clean):
                 _set_decision_error(
                     state,
                     (
                         f"Routing guard blocked route drift for task {task_id}: current route is "
-                        f"`{_format_route_label(str(current.get('tier', '')), str(current.get('model', '')))}` "
-                        f"but the latest assistant output attempted `{_format_route_label(decision['tier'], decision['model'])}` "
+                        f"`{_format_route_label_with_path(str(current.get('tier', '')), str(current.get('path', '')), str(current.get('model', '')))}` "
+                        f"but the latest assistant output attempted `{_format_route_label_with_path(decision['tier'], decision['path'], decision['model'])}` "
                         "without `RECLASSIFY:`. Emit an explicit `RECLASSIFY:` line or stay on the current route."
                     ),
                 )
@@ -476,6 +600,10 @@ def _classify_routed_terminal_command(command: str) -> Optional[str]:
     if _HERMES_CHAT_RE.search(normalized):
         if _HERMES_GLM_MODEL_RE.search(normalized) and _HERMES_ZAI_PROVIDER_RE.search(normalized):
             return "hermes_glm_zai"
+        if _HERMES_MINIMAX_MODEL_RE.search(normalized) and _HERMES_MINIMAX_PROVIDER_RE.search(normalized):
+            return "hermes_minimax_m27"
+        if _HERMES_MIMO_MODEL_RE.search(normalized) and _HERMES_NOUS_PROVIDER_RE.search(normalized):
+            return "hermes_nous_mimo_v2_pro"
         return "hermes_chat_other"
     if _CODEX_EXEC_RE.search(normalized):
         if _CODEX_GPT54_MINI_RE.search(normalized):
@@ -495,54 +623,42 @@ def _validate_terminal_route_command(command: str, task_id: str) -> Optional[str
         return None
 
     tier = decision.get("tier")
-    decision_model = _normalize_route_model(str(decision.get("model", "")))
+    path = _normalize_route_path(str(decision.get("path", "") or ""))
     with _task_state_lock:
         _purge_expired()
         attempts = dict(_task_state.get(task_id, {}).get("route_attempts") or {})
-
-    if tier == "3A":
-        if route_kind != "codex_gpt54":
-            return (
-                "Routing guard blocked routed model mismatch: Tier 3A must execute through "
-                "`Codex CLI (gpt-5.4)` unless you explicitly reclassify the route."
-            )
+    profile = _get_route_profile(str(tier or ""), path, _normalize_route_model(str(decision.get("model", ""))))
+    if not profile:
         return None
 
-    if tier == "3B":
-        if decision_model == _normalize_route_model("Codex CLI (gpt-5.4-mini)"):
-            if route_kind != "codex_gpt54mini":
-                return (
-                    "Routing guard blocked routed model mismatch: the active Tier 3B route is "
-                    "`Codex CLI (gpt-5.4-mini)`. Emit `RECLASSIFY:` if you intend to switch routes again."
-                )
-            return None
+    primary_kind = str(profile["primary"]["kind"])
+    fallback_kinds = [str(item["kind"]) for item in profile.get("fallbacks", [])]
+    decision_model = _normalize_route_model(str(decision.get("model", "")))
 
-        if route_kind == "hermes_glm_zai":
+    if decision_model == _normalize_route_model(profile["primary"]["label"]):
+        if route_kind == primary_kind:
             return None
-        if route_kind == "codex_gpt54mini":
-            if not attempts.get("3b_primary_failed"):
+        if route_kind in fallback_kinds:
+            if not attempts.get("primary_failed"):
                 return (
-                    "Routing guard blocked Tier 3B backup: attempt the primary route "
-                    "`Hermes CLI (glm-5.1 via zai)` first and fall back to Codex only after that "
-                    "primary attempt fails."
+                    f"Routing guard blocked {decision.get('tier')} backup on path `{path}`: attempt the primary route "
+                    f"`{profile['primary']['label']}` first and fall back only after that primary attempt fails."
                 )
             return None
-        if route_kind == "codex_gpt54":
-            return (
-                "Routing guard blocked routed model mismatch: Tier 3B backup is "
-                "`Codex CLI (gpt-5.4-mini)`, not `gpt-5.4`."
-            )
         return (
-            "Routing guard blocked routed model mismatch: Tier 3B primary must be "
-            "`Hermes CLI (glm-5.1 via zai)`."
+            f"Routing guard blocked routed model mismatch: active path `{path}` must execute through "
+            f"`{profile['primary']['label']}` or its defined fallback chain."
         )
 
-    if tier == "3C":
-        if route_kind != "codex_gpt54mini":
-            return (
-                "Routing guard blocked routed model mismatch: Tier 3C must execute through "
-                "`Codex CLI (gpt-5.4-mini)` unless you explicitly reclassify the route."
-            )
+    for fallback in profile.get("fallbacks", []):
+        if decision_model == _normalize_route_model(fallback["label"]):
+            if route_kind != fallback["kind"]:
+                return (
+                    f"Routing guard blocked routed model mismatch: the active route is "
+                    f"`{fallback['label']}` on path `{path}`. Emit `RECLASSIFY:` if you intend to switch routes again."
+                )
+            return None
+
     return None
 
 
@@ -620,6 +736,13 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
             if not state:
                 return
             attempts = state.setdefault("route_attempts", _initial_route_attempts())
+            decision = state.get("decision") if isinstance(state.get("decision"), dict) else {}
+            profile = _get_route_profile(
+                str(decision.get("tier", "")),
+                str(decision.get("path", "")),
+                _normalize_route_model(str(decision.get("model", ""))),
+            )
+            primary_kind = str(profile["primary"]["kind"]) if profile else ""
             for entry in attempt_entries:
                 if not isinstance(entry, dict):
                     continue
@@ -638,6 +761,10 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
                 attempts["last_attempt_kind"] = route_kind
                 attempts["last_attempt_failed"] = failed
                 attempts["last_attempt_failure_kind"] = failure_kind if failed else None
+                if route_kind == primary_kind:
+                    attempts["primary_attempted"] = True
+                    attempts["primary_failed"] = failed
+                    attempts["primary_failure_kind"] = failure_kind if failed else None
                 if route_kind == "hermes_glm_zai":
                     attempts["3b_primary_attempted"] = True
                     attempts["3b_primary_failed"] = failed
@@ -675,6 +802,13 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
         state = _task_state.get(task_id)
         if not state:
             return
+        decision = state.get("decision") if isinstance(state.get("decision"), dict) else {}
+        profile = _get_route_profile(
+            str(decision.get("tier", "")),
+            str(decision.get("path", "")),
+            _normalize_route_model(str(decision.get("model", ""))),
+        )
+        primary_kind = str(profile["primary"]["kind"]) if profile else ""
         if verification_kind is not None:
             attempts = state.setdefault("verification_attempts", [])
             attempts.append(
@@ -695,6 +829,10 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
         attempts["last_attempt_kind"] = route_kind
         attempts["last_attempt_failed"] = failed
         attempts["last_attempt_failure_kind"] = failure_kind if failed else None
+        if route_kind == primary_kind:
+            attempts["primary_attempted"] = True
+            attempts["primary_failed"] = failed
+            attempts["primary_failure_kind"] = failure_kind if failed else None
         if route_kind == "hermes_glm_zai":
             attempts["3b_primary_attempted"] = True
             attempts["3b_primary_failed"] = failed
@@ -1050,7 +1188,8 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                 return (
                     f"Routing guard blocked routed model execution through `terminal` for task {task_id}: "
                     "use `routed_exec` for routed Codex/Hermes execution. "
-                    "`terminal` remains available only for read-only inspection and explicitly permitted git actions."
+                    "`terminal` remains available only for approved verification commands, read-only inspection, "
+                    "and explicitly permitted git actions."
                 )
             if _is_verification_terminal_command(command):
                 return None

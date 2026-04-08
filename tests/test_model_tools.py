@@ -196,6 +196,78 @@ class TestHandleFunctionCall:
         assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
         assert env["GLM_BASE_URL"] == "https://api.z.ai/api/coding/paas/v4"
 
+    def test_routed_exec_dispatches_minimax_primary_for_quick_edit(self, tmp_path):
+        task_id = "guarded-task-minimax-routed-exec"
+        activate_for_task(task_id, session_id="session-guard-minimax", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: simple token-heavy edit loop | CONFIDENCE: high",
+            session_id="session-guard-minimax",
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the quick edit",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["route_path"] == "quick-edit"
+        assert result["attempts"][0]["kind"] == "hermes_minimax_m27"
+        command = mock_run.call_args.args[0]
+        assert command[:6] == ["hermes", "chat", "-m", "MiniMax-M2.7", "--provider", "minimax"]
+
+    def test_routed_exec_dispatches_mimo_primary_for_long_context(self, tmp_path):
+        task_id = "guarded-task-mimo-routed-exec"
+        activate_for_task(task_id, session_id="session-guard-mimo", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: long-context | MODEL: Hermes CLI (xiaomi/mimo-v2-pro via nous) | REASON: massive context analysis | CONFIDENCE: high",
+            session_id="session-guard-mimo",
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Analyze the large codebase",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["route_path"] == "long-context"
+        assert result["attempts"][0]["kind"] == "hermes_nous_mimo_v2_pro"
+        command = mock_run.call_args.args[0]
+        assert command[:6] == ["hermes", "chat", "-m", "xiaomi/mimo-v2-pro", "--provider", "nous"]
+
     def test_routing_guard_blocks_native_terminal_mutation_after_route_lock(self):
         task_id = "guarded-task-native-terminal-after-route"
         activate_for_task(task_id, session_id="session-native-terminal-after-route", skills=["routing-layer"])
