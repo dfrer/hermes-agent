@@ -70,6 +70,15 @@ This checkout is configured for safer recurring upstream merges:
    git merge --ff-only codex/upstream-sync-<timestamp>
    ```
 
+9. Clear the banner update cache after a manual Git-based update so new Hermes sessions do not show a stale
+   "commits behind" warning:
+
+   ```powershell
+   Remove-Item ~/.hermes/.update_check -ErrorAction SilentlyContinue
+   ```
+
+   `hermes update` does this automatically. A custom manual merge workflow does not.
+
 ## Why This Workflow
 
 - keeps upstream merges out of your live working tree
