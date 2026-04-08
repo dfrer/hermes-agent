@@ -224,6 +224,10 @@ class TestDefaultPreloadedSkills:
         config = {"agent": {"preloaded_skills": ["routing-layer", "github-auth"]}}
         assert get_default_preloaded_skills(config) == ["routing-layer", "github-auth"]
 
+    def test_default_preloaded_skills_can_disable_default_routing_layer_via_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "1")
+        assert get_default_preloaded_skills({"agent": {}}) == []
+
     def test_reports_missing_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "present-skill")

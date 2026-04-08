@@ -235,6 +235,9 @@ class TestHandleFunctionCall:
         env = mock_run.call_args.kwargs["env"]
         assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
         assert env["GLM_BASE_URL"] == "https://api.z.ai/api/coding/paas/v4"
+        assert env["HERMES_DISABLE_DEFAULT_ROUTING_SKILL"] == "1"
+        assert "already-routed implementation executor" in env["HERMES_EPHEMERAL_SYSTEM_PROMPT"]
+        assert mock_run.call_args.kwargs["timeout"] == 900
 
     def test_routed_exec_dispatches_minimax_primary_for_quick_edit(self, tmp_path):
         task_id = "guarded-task-minimax-routed-exec"
@@ -282,6 +285,7 @@ class TestHandleFunctionCall:
         assert result["attempts"][0]["kind"] == "hermes_minimax_m27"
         command = mock_run.call_args.args[0]
         assert command[:6] == ["hermes", "chat", "-m", "MiniMax-M2.7", "--provider", "minimax"]
+        assert mock_run.call_args.kwargs["timeout"] == 300
 
     def test_routed_exec_dispatches_mimo_primary_for_long_context(self, tmp_path):
         task_id = "guarded-task-mimo-routed-exec"
@@ -552,6 +556,83 @@ class TestHandleFunctionCall:
         assert len(second_result["attempts"]) == 1
         assert second_result["attempts"][0]["kind"] == "codex_gpt54mini"
         assert mock_run.call_count == 3
+
+    def test_routed_exec_returns_compact_failure_summary_for_timeout_chain(self, tmp_path):
+        task_id = "guarded-task-routed-timeout-summary"
+        activate_for_task(task_id, session_id="session-routed-timeout-summary", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: marathon | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-routed-timeout-summary",
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=124, stdout="timed out while editing files", stderr=""),
+                    MagicMock(returncode=124, stdout="timed out while running verification", stderr=""),
+                ],
+            ),
+            patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is False
+        assert result["timeout_seconds"] == 900
+        assert result["timeout_source"] == "route-default"
+        assert len(result["attempt_summary"]) == 2
+        assert "timed out" in (result["failure_guidance"] or "").lower()
+        assert result["attempts"][0]["output_excerpt"]
+        assert result["attempts"][0]["output_path"]
+
+    def test_routed_exec_explicit_timeout_overrides_route_default(self, tmp_path):
+        task_id = "guarded-task-routed-timeout-override"
+        activate_for_task(task_id, session_id="session-routed-timeout-override", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: high-risk fix | CONFIDENCE: high",
+            session_id="session-routed-timeout-override",
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                            "timeout": 42,
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["timeout_seconds"] == 42
+        assert result["timeout_source"] == "explicit"
+        assert mock_run.call_args.kwargs["timeout"] == 42
 
     def test_git_commit_requires_explicit_user_permission(self):
         task_id = "guarded-task-git"

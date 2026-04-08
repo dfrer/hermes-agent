@@ -64,6 +64,7 @@ _GIT_MUTATION_REQUEST_RE = re.compile(
 _LEADING_ENV_ASSIGNMENTS_RE = re.compile(r"^(?:[a-z_][a-z0-9_]*=\S+\s+)+", re.IGNORECASE)
 _TIMEOUT_PREFIX_RE = re.compile(r"^timeout\s+\d+\s+", re.IGNORECASE)
 _VERIFICATION_OUTPUT_PIPE_RE = re.compile(r"(?i)\|\s*(?:tail|head|select-object)\b")
+_VERIFICATION_OUTPUT_PIPE_SPLIT_RE = re.compile(r"(?i)\|\s*(?:tail|head|select-object)\b.*$")
 
 _READ_ONLY_TERMINAL_PREFIXES = (
     "cd",
@@ -933,6 +934,8 @@ def _is_read_only_terminal_command(command: str) -> bool:
     for part in commands:
         if any(marker in part for marker in _TERMINAL_MUTATION_MARKERS):
             return False
+        if _is_safe_git_branch_inspection_command(part):
+            continue
         if not any(
             part == prefix or part.startswith(f"{prefix} ")
             for prefix in _READ_ONLY_TERMINAL_PREFIXES
@@ -955,7 +958,79 @@ def _normalize_verification_segment(segment: str) -> str:
     return normalized
 
 
-def _classify_verification_command(command: str) -> Optional[str]:
+def _is_safe_git_branch_inspection_command(command: str) -> bool:
+    normalized = " ".join((command or "").strip().lower().split())
+    if not normalized.startswith("git branch"):
+        return False
+
+    tokens = normalized.split()
+    if len(tokens) < 2 or tokens[:2] != ["git", "branch"]:
+        return False
+
+    branch_tokens = tokens[2:]
+    if not branch_tokens:
+        return True
+
+    safe_flags = {
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "--show-current",
+        "--list",
+        "--color",
+        "--no-color",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--column",
+        "--sort",
+        "--ignore-case",
+        "--omit-empty",
+        "--format",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    }
+    value_flags = {
+        "--column",
+        "--sort",
+        "--format",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    }
+
+    idx = 0
+    saw_list = False
+    while idx < len(branch_tokens):
+        token = branch_tokens[idx]
+        if token in {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--set-upstream-to", "-u", "--unset-upstream", "--track", "--no-track", "--edit-description"}:
+            return False
+        if token in safe_flags:
+            if token == "--list":
+                saw_list = True
+            if token in value_flags:
+                idx += 1
+                if idx >= len(branch_tokens):
+                    return False
+            idx += 1
+            continue
+        if token.startswith("-"):
+            return False
+        if saw_list:
+            idx += 1
+            continue
+        return False
+
+    return True
+
+
+def _classify_verification_command(command: str, *, allow_output_pipe: bool = False) -> Optional[str]:
     raw = (command or "").strip()
     if not raw:
         return None
@@ -966,6 +1041,10 @@ def _classify_verification_command(command: str) -> Optional[str]:
     if _UNSAFE_REDIRECTION_RE.search(normalized):
         return None
     if _VERIFICATION_OUTPUT_PIPE_RE.search(normalized):
+        if not allow_output_pipe:
+            return None
+        normalized = _VERIFICATION_OUTPUT_PIPE_SPLIT_RE.sub("", normalized).strip()
+    if not normalized:
         return None
     if "| codex exec" in normalized or "| hermes chat" in normalized:
         return None
@@ -1004,6 +1083,21 @@ def _classify_verification_command(command: str) -> Optional[str]:
 
 def _is_verification_terminal_command(command: str) -> bool:
     return _classify_verification_command(command) is not None
+
+
+def _verification_terminal_block_reason(command: str) -> Optional[str]:
+    normalized = " ".join((command or "").strip().lower().split())
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
+    if not _VERIFICATION_OUTPUT_PIPE_RE.search(normalized):
+        return None
+    verification_kind = _classify_verification_command(command, allow_output_pipe=True)
+    if verification_kind is None:
+        return None
+    return (
+        "Routing guard blocked verification through `terminal`: do not pipe build/test/lint output through "
+        "`tail`/`head`/`Select-Object` because that can mask the true exit status. "
+        f"Run the `{verification_kind}` command directly."
+    )
 
 
 def _validate_routed_codex_terminal_command(command: str) -> Optional[str]:
@@ -1282,6 +1376,9 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                     "`terminal` remains available only for approved verification commands, read-only inspection, "
                     "and explicitly permitted git actions."
                 )
+            verification_issue = _verification_terminal_block_reason(command)
+            if verification_issue:
+                return verification_issue
             if _is_verification_terminal_command(command):
                 return None
             if _is_read_only_terminal_command(command):

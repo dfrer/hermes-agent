@@ -218,6 +218,22 @@ def test_allows_chained_read_only_terminal_inspection():
         deactivate_for_task(task_id)
 
 
+def test_allows_read_only_git_branch_listing_before_routing():
+    task_id = "task-routing-terminal-git-branch-listing"
+    activate_for_task(task_id, session_id="session-git-branch-listing", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {"command": "cd ~/societies && git branch -a && git log --oneline -10 | head -5"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_allows_read_only_terminal_with_quoted_pipe_pattern():
     task_id = "task-routing-terminal-quoted-pipe"
     activate_for_task(task_id, session_id="session-3c", skills=["routing-layer"])
@@ -388,6 +404,27 @@ def test_allows_local_verification_terminal_after_routing_decision():
             )
             is None
         )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_verification_output_pipe_with_specific_guidance():
+    task_id = "task-routing-terminal-verification-pipe"
+    activate_for_task(task_id, session_id="session-terminal-verification-pipe", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-terminal-verification-pipe",
+        )
+        blocked = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "cd ~/societies && dotnet build src/societies/Societies.csproj 2>&1 | tail -5"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "blocked verification through `terminal`" in blocked
+        assert "Run the `dotnet build` command directly." in blocked
     finally:
         deactivate_for_task(task_id)
 

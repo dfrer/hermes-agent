@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,14 +21,28 @@ from agent.routing_guard import (
     get_routing_decision,
     get_session_lane_context,
 )
+from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_SECONDS = 120
-_MAX_OUTPUT_CHARS = 50_000
+_DEFAULT_TIMEOUT_SECONDS = 300
+_MAX_OUTPUT_CHARS = 8_000
+_MAX_OUTPUT_EXCERPT_CHARS = 600
 _WSL_PREFIX_RE = re.compile(r"^\\\\wsl\.localhost\\([^\\]+)\\", re.IGNORECASE)
 _ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+_BYTES_LITERAL_RE = re.compile(r"""^b(?P<quote>['"]).*(?P=quote)$""", re.DOTALL)
+_ROUTE_TIMEOUT_SECONDS: dict[tuple[str, str], int] = {
+    ("3A", "high-risk"): 1200,
+    ("3B", "marathon"): 900,
+    ("3B", "long-context"): 900,
+    ("3C", "quick-edit"): 300,
+}
+_INNER_HERMES_EPHEMERAL_PROMPT = (
+    "You are running as the already-routed implementation executor for an outer Hermes session. "
+    "Do not re-run the routing-layer classification flow inside this child session. "
+    "Implement directly using the available tools, then run verification and report the concrete outcome."
+)
 
 
 def _detect_wsl_unc_prefix() -> Optional[str]:
@@ -68,8 +84,22 @@ def _find_executable(name: str) -> Optional[str]:
     return None
 
 
+def _normalize_captured_output(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if _BYTES_LITERAL_RE.match(raw):
+        try:
+            literal = ast.literal_eval(raw)
+            if isinstance(literal, (bytes, bytearray)):
+                return bytes(literal).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    return raw
+
+
 def _truncate_output(text: str) -> str:
-    clean = redact_sensitive_text(str(text or "").strip())
+    clean = redact_sensitive_text(_normalize_captured_output(text))
     if len(clean) <= _MAX_OUTPUT_CHARS:
         return clean
     head_chars = int(_MAX_OUTPUT_CHARS * 0.4)
@@ -86,6 +116,58 @@ def _combine_output(stdout: str, stderr: str) -> str:
     if stdout and stderr:
         return f"{stdout.rstrip()}\n{stderr.rstrip()}".strip()
     return (stdout or stderr or "").strip()
+
+
+def _output_excerpt(text: str) -> str:
+    clean = _truncate_output(text)
+    if len(clean) <= _MAX_OUTPUT_EXCERPT_CHARS:
+        return clean
+    return f"{clean[:_MAX_OUTPUT_EXCERPT_CHARS]}…"
+
+
+def _default_timeout_for_route(decision: dict[str, Any]) -> int:
+    tier = str(decision.get("tier", "")).upper()
+    path = str(decision.get("path", "") or "").strip().lower()
+    return _ROUTE_TIMEOUT_SECONDS.get((tier, path), _DEFAULT_TIMEOUT_SECONDS)
+
+
+def _write_attempt_output(task_id: str, attempt_index: int, kind: str, output: str) -> Optional[str]:
+    clean = redact_sensitive_text(_normalize_captured_output(output))
+    if not clean:
+        return None
+    safe_task = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(task_id or "routed-exec")).strip("-") or "routed-exec"
+    safe_kind = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(kind or "attempt")).strip("-") or "attempt"
+    out_dir = get_hermes_home() / "cache" / "routed_exec"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{safe_task}_{int(time.time() * 1000)}_{attempt_index:02d}_{safe_kind}.log"
+    path = out_dir / filename
+    path.write_text(clean, encoding="utf-8")
+    return str(path)
+
+
+def _summarize_attempts(attempts: list[dict[str, Any]]) -> list[str]:
+    summary: list[str] = []
+    for index, attempt in enumerate(attempts, start=1):
+        executor = str(attempt.get("executor", attempt.get("kind", "attempt")) or "attempt")
+        if attempt.get("failed"):
+            failure_kind = str(attempt.get("failure_kind") or "failure")
+            exit_code = attempt.get("exit_code", -1)
+            summary.append(f"{index}. {executor}: failed ({failure_kind}, exit {exit_code})")
+        else:
+            exit_code = attempt.get("exit_code", 0)
+            summary.append(f"{index}. {executor}: succeeded (exit {exit_code})")
+    return summary
+
+
+def _failure_guidance(attempts: list[dict[str, Any]], default_timeout_used: bool, timeout_seconds: int) -> Optional[str]:
+    if not attempts or not all(bool(item.get("failed")) for item in attempts):
+        return None
+    if default_timeout_used and all(str(item.get("failure_kind") or "") == "timeout" for item in attempts):
+        return (
+            f"All routed attempts timed out after the route default ({timeout_seconds}s per attempt). "
+            "Retry with a narrower implementation prompt or a larger explicit `timeout`."
+        )
+    return None
 
 
 def _command_preview(kind: str, workdir: str) -> str:
@@ -212,6 +294,10 @@ def _run_hermes(
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
+    env.setdefault("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "1")
+    env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = (
+        f"{env.get('HERMES_EPHEMERAL_SYSTEM_PROMPT', '').strip()}\n\n{_INNER_HERMES_EPHEMERAL_PROMPT}"
+    ).strip()
     command = [
         executable,
         "chat",
@@ -321,13 +407,15 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             "Use an existing absolute path."
         )
 
-    effective_timeout = int(timeout or _DEFAULT_TIMEOUT_SECONDS)
+    default_timeout = _default_timeout_for_route(decision)
+    effective_timeout = int(timeout or default_timeout)
+    default_timeout_used = timeout is None
     attempts: list[dict[str, Any]] = []
 
     codex_executable = _find_executable("codex")
     hermes_executable = _find_executable("hermes")
 
-    for target in plan:
+    for attempt_index, target in enumerate(plan, start=1):
         kind = target["kind"]
         if kind == "hermes_glm_zai":
             attempt = _run_hermes(
@@ -390,12 +478,19 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
                 "timed_out": False,
                 "error": f"Unsupported routed executor kind: {kind}",
             }
+        raw_attempt_output = str(attempt.get("output", "") or "")
+        attempt["output_excerpt"] = _output_excerpt(raw_attempt_output)
+        attempt["output_path"] = None
+        if raw_attempt_output and (attempt.get("failed") or len(raw_attempt_output) > _MAX_OUTPUT_EXCERPT_CHARS):
+            attempt["output_path"] = _write_attempt_output(task_id, attempt_index, kind, raw_attempt_output)
         attempts.append(attempt)
         if not attempt.get("failed"):
             break
 
     final_attempt = attempts[-1] if attempts else None
     success = bool(final_attempt) and not bool(final_attempt.get("failed"))
+    attempt_summary = _summarize_attempts(attempts)
+    failure_guidance = _failure_guidance(attempts, default_timeout_used, effective_timeout)
 
     return tool_result(
         {
@@ -405,9 +500,13 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             "route_model": decision.get("model"),
             "session_lane": get_session_lane_context(task_id),
             "workdir": workdir,
+            "timeout_seconds": effective_timeout,
+            "timeout_source": "route-default" if default_timeout_used else "explicit",
+            "attempt_summary": attempt_summary,
             "attempts": attempts,
             "output": str(final_attempt.get("output", "") if final_attempt else ""),
             "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
+            "failure_guidance": None if success else failure_guidance,
             "error": None if success else (
                 str(final_attempt.get("error", "")).strip()
                 or (
@@ -450,7 +549,7 @@ ROUTED_EXEC_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Per-attempt timeout in seconds. Defaults to 120.",
+                "description": "Per-attempt timeout in seconds. Defaults to a route-aware value (3B marathon/long-context 900, 3A high-risk 1200, 3C quick-edit 300).",
                 "minimum": 1,
             },
         },

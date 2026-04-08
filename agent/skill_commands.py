@@ -7,6 +7,7 @@ can invoke skills via /skill-name commands and prompt-only built-ins like
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,8 @@ def get_default_preloaded_skills(config: Optional[dict[str, Any]] = None) -> lis
 
     Defaults to ``routing-layer`` when config does not override the list.
     """
+    disable_default_routing = os.getenv("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "").strip().lower() in {"1", "true", "yes", "on"}
+
     if config is None:
         try:
             from hermes_cli.config import load_config
@@ -69,7 +72,10 @@ def get_default_preloaded_skills(config: Optional[dict[str, Any]] = None) -> lis
     if configured is None:
         configured = list(DEFAULT_PRELOADED_SKILLS)
 
-    return normalize_skill_identifiers(configured)
+    normalized = normalize_skill_identifiers(configured)
+    if disable_default_routing:
+        normalized = [skill for skill in normalized if skill != "routing-layer"]
+    return normalized
 
 
 def build_plan_path(
