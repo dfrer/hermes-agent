@@ -198,7 +198,13 @@ class TestHandleFunctionCall:
 
     def test_routed_exec_dispatches_minimax_primary_for_quick_edit(self, tmp_path):
         task_id = "guarded-task-minimax-routed-exec"
-        activate_for_task(task_id, session_id="session-guard-minimax", skills=["routing-layer"])
+        activate_for_task(
+            task_id,
+            session_id="session-guard-minimax",
+            skills=["routing-layer"],
+            session_model="MiniMax-M2.7",
+            session_provider="minimax",
+        )
         record_routing_decision(
             task_id,
             "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: simple token-heavy edit loop | CONFIDENCE: high",
@@ -228,6 +234,11 @@ class TestHandleFunctionCall:
 
         assert result["success"] is True
         assert result["route_path"] == "quick-edit"
+        assert result["session_lane"] == {
+            "model": "MiniMax-M2.7",
+            "provider": "minimax",
+            "label": "MiniMax-M2.7 via minimax",
+        }
         assert result["attempts"][0]["kind"] == "hermes_minimax_m27"
         command = mock_run.call_args.args[0]
         assert command[:6] == ["hermes", "chat", "-m", "MiniMax-M2.7", "--provider", "minimax"]

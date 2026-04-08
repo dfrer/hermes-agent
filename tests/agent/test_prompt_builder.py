@@ -16,6 +16,7 @@ from agent.prompt_builder import (
     _find_hermes_md,
     _find_git_root,
     _strip_yaml_frontmatter,
+    build_routing_session_prompt,
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
@@ -47,6 +48,12 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_build_routing_session_prompt_uses_current_session_model(self):
+        prompt = build_routing_session_prompt("xiaomi/mimo-v2-pro", "nous")
+        assert "Current Hermes session model for the local/main lane" in prompt
+        assert "`xiaomi/mimo-v2-pro via nous`" in prompt
+        assert "Routed implementation paths are separate" in prompt
 
 
 # =========================================================================

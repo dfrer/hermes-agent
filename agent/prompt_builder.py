@@ -239,6 +239,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "\n"
     "<routing_discipline>\n"
     "- Prefer the explicit routing format `TIER: ... | PATH: ... | MODEL: ... | REASON: ... | CONFIDENCE: ...`.\n"
+    "- The main/local lane always runs on the current Hermes session model/provider for this session; do not assume a fixed main model.\n"
     "- If a routing decision has already been emitted for the current coding task, keep that route stable.\n"
     "- Do not silently change from `3A` to `3B`/`3C` or vice versa during ordinary investigation.\n"
     "- Use route archetypes intentionally: `quick-edit` for simple low-risk edit loops, `marathon` for long autonomous build/test/fix work, `long-context` for very large-context analysis, and `high-risk` for dangerous or expensive-to-unwind changes.\n"
@@ -255,6 +256,24 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Only perform commit/push/worktree-cleanup git actions when the user explicitly asked for that git action.\n"
     "</git_authority>"
 )
+
+
+def build_routing_session_prompt(model: str = "", provider: str = "") -> str:
+    normalized_model = str(model or "").strip()
+    normalized_provider = str(provider or "").strip()
+    if not normalized_model and not normalized_provider:
+        return ""
+    if normalized_model and normalized_provider:
+        label = f"{normalized_model} via {normalized_provider}"
+    else:
+        label = normalized_model or normalized_provider
+    return (
+        "<routing_session_context>\n"
+        f"- Current Hermes session model for the local/main lane: `{label}`.\n"
+        "- Keep planning, diagnosis, read-only inspection, review, local verification, and final synthesis on this current session model unless the routing policy says to delegate implementation.\n"
+        "- Routed implementation paths are separate and must still follow the routing-layer matrix and fallback rules.\n"
+        "</routing_session_context>"
+    )
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.

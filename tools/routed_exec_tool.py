@@ -17,6 +17,7 @@ from agent.routing_guard import (
     _classify_routed_failure_kind,
     get_routed_execution_plan,
     get_routing_decision,
+    get_session_lane_context,
 )
 from tools.registry import registry, tool_error, tool_result
 
@@ -402,6 +403,7 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             "tier": decision.get("tier"),
             "route_path": decision.get("path"),
             "route_model": decision.get("model"),
+            "session_lane": get_session_lane_context(task_id),
             "workdir": workdir,
             "attempts": attempts,
             "output": str(final_attempt.get("output", "") if final_attempt else ""),

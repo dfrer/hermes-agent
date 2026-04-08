@@ -283,9 +283,27 @@ def _derive_git_permissions(user_message: str) -> dict[str, bool]:
     }
 
 
-def _new_task_state(*, session_id: str = "", skills: Optional[list[str]] = None, user_message: str = "") -> dict[str, Any]:
+def _format_session_lane_label(model: str = "", provider: str = "") -> str:
+    normalized_model = str(model or "").strip()
+    normalized_provider = str(provider or "").strip()
+    if normalized_model and normalized_provider:
+        return f"{normalized_model} via {normalized_provider}"
+    return normalized_model or normalized_provider
+
+
+def _new_task_state(
+    *,
+    session_id: str = "",
+    skills: Optional[list[str]] = None,
+    user_message: str = "",
+    session_model: str = "",
+    session_provider: str = "",
+) -> dict[str, Any]:
     return {
         "session_id": session_id or "",
+        "session_model": str(session_model or "").strip(),
+        "session_provider": str(session_provider or "").strip(),
+        "session_lane_label": _format_session_lane_label(session_model, session_provider),
         "skills": list(skills or []),
         "enforced": True,
         "routed": False,
@@ -312,6 +330,8 @@ def activate_for_task(
     session_id: str = "",
     skills: Optional[list[str]] = None,
     user_message: str = "",
+    session_model: str = "",
+    session_provider: str = "",
 ) -> None:
     if not task_id:
         return
@@ -321,6 +341,8 @@ def activate_for_task(
             session_id=session_id,
             skills=skills,
             user_message=user_message,
+            session_model=session_model,
+            session_provider=session_provider,
         )
 
 
@@ -379,6 +401,19 @@ def get_routing_decision(task_id: str) -> Optional[dict[str, str]]:
         if not isinstance(decision, dict):
             return None
         return dict(decision)
+
+
+def get_session_lane_context(task_id: str) -> dict[str, str]:
+    if not task_id:
+        return {"model": "", "provider": "", "label": ""}
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id, {})
+        return {
+            "model": str(state.get("session_model", "") or ""),
+            "provider": str(state.get("session_provider", "") or ""),
+            "label": str(state.get("session_lane_label", "") or ""),
+        }
 
 
 def get_route_attempts(task_id: str) -> dict[str, Any]:

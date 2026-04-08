@@ -52,6 +52,8 @@ $patchPath = Join-Path $dest "routing-stack.patch"
 $logPath = Join-Path $dest "commits.txt"
 $restorePath = Join-Path $dest "RESTORE.md"
 $manifestPath = Join-Path $dest "manifest.json"
+$policyHistoryRepo = Join-Path $hermesHome "routing-policy-history"
+$policyHistoryHead = ""
 
 & git -C $RepoRoot bundle create $bundlePath HEAD | Out-Null
 if ($LASTEXITCODE -ne 0) {
@@ -71,6 +73,9 @@ if (Test-Path $soulPath) {
 }
 if (Test-Path $routingSkillPath) {
     Copy-Item $routingSkillPath (Join-Path $dest "routing-layer.SKILL.md")
+}
+if (Test-Path (Join-Path $policyHistoryRepo ".git")) {
+    $policyHistoryHead = (& git -c "safe.directory=$policyHistoryRepo" -C $policyHistoryRepo rev-parse --short=8 HEAD | Out-String).Trim()
 }
 
 $restoreText = @"
@@ -98,6 +103,9 @@ Restore options:
 Reference files copied with this backup:
 - SOUL.md
 - routing-layer.SKILL.md
+
+If present, the external policy history repo lives at:
+- $policyHistoryRepo
 "@
 $restoreText | Out-File -FilePath $restorePath -Encoding utf8
 
@@ -110,6 +118,8 @@ $manifest = @{
     base_ref = $BaseRef
     commit_count = $commitList.Count
     commits = $commitList
+    policy_history_repo = $policyHistoryRepo
+    policy_history_head = $policyHistoryHead
     files = @(
         "routing-integration.bundle",
         "routing-stack.patch",

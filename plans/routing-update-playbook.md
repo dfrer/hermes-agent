@@ -13,6 +13,7 @@ This checkout is configured for safer recurring upstream merges:
 - repo-local `merge.conflictstyle=zdiff3`
 - focused routing regression script: `scripts/test-routing-contract.ps1`
 - disposable update-worktree helper: `scripts/prepare-hermes-update.ps1`
+- out-of-repo policy history sync: `scripts/sync-routing-policy-history.ps1`
 
 ## Safe Update Workflow
 
@@ -79,6 +80,15 @@ This checkout is configured for safer recurring upstream merges:
 
    `hermes update` does this automatically. A custom manual merge workflow does not.
 
+10. Sync the top-level routing policy files that live outside the `hermes-agent` repo:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\sync-routing-policy-history.ps1
+   ```
+
+   This snapshots `~/.hermes/SOUL.md` and `~/.hermes/skills/routing-layer/SKILL.md` into a dedicated
+   history repo at `~/.hermes/routing-policy-history/`.
+
 ## Why This Workflow
 
 - keeps upstream merges out of your live working tree
@@ -115,3 +125,9 @@ Each backup includes:
 - restore instructions
 
 Use this before large upstream merges or before any risky routing refactor.
+
+For normal policy-file version history between full backups, also run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\sync-routing-policy-history.ps1
+```

@@ -7,6 +7,7 @@ from agent.routing_guard import (
     deactivate_for_task,
     get_routed_execution_plan,
     get_routing_decision,
+    get_session_lane_context,
     get_verification_attempts,
     has_route_lock,
     pre_tool_call_block_reason,
@@ -22,6 +23,26 @@ def test_blocks_file_mutation_before_routing_decision():
         reason = pre_tool_call_block_reason("patch", {"path": "demo.py"}, task_id)
         assert reason is not None
         assert "emit a routing decision line" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_activate_for_task_records_current_session_lane_identity():
+    task_id = "task-routing-session-lane"
+    activate_for_task(
+        task_id,
+        session_id="session-lane",
+        skills=["routing-layer"],
+        session_model="xiaomi/mimo-v2-pro",
+        session_provider="nous",
+    )
+    try:
+        context = get_session_lane_context(task_id)
+        assert context == {
+            "model": "xiaomi/mimo-v2-pro",
+            "provider": "nous",
+            "label": "xiaomi/mimo-v2-pro via nous",
+        }
     finally:
         deactivate_for_task(task_id)
 

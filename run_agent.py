@@ -90,7 +90,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, build_routing_session_prompt
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -2756,6 +2756,13 @@ class AIAgent:
             skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
+
+        routing_session_prompt = build_routing_session_prompt(
+            model=self.model,
+            provider=self.provider,
+        )
+        if routing_session_prompt:
+            prompt_parts.append(routing_session_prompt)
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
@@ -6949,6 +6956,8 @@ class AIAgent:
                     session_id=self.session_id or "",
                     skills=self.preloaded_skills,
                     user_message=persist_user_message or user_message or "",
+                    session_model=self.model or "",
+                    session_provider=self.provider or "",
                 )
             except Exception:
                 logger.debug("Failed to activate routing guard for task %s", effective_task_id, exc_info=True)
