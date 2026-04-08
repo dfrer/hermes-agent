@@ -21,6 +21,11 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_routing_toolset_exists(self):
+        ts = get_toolset("routing")
+        assert ts is not None
+        assert "routed_exec" in ts["tools"]
+
     def test_unknown_returns_none(self):
         assert get_toolset("nonexistent") is None
 
@@ -78,6 +83,7 @@ class TestValidateToolset:
     def test_valid(self):
         assert validate_toolset("web") is True
         assert validate_toolset("terminal") is True
+        assert validate_toolset("routing") is True
 
     def test_all_alias_valid(self):
         assert validate_toolset("all") is True
@@ -141,3 +147,12 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_hermes_platforms_include_routed_exec(self):
+        platforms = ["hermes-cli", "hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant"]
+        for name in platforms:
+            assert "routed_exec" in TOOLSETS[name]["tools"]
+
+    def test_editor_and_api_platforms_include_routed_exec(self):
+        for name in ["hermes-acp", "hermes-api-server"]:
+            assert "routed_exec" in TOOLSETS[name]["tools"]

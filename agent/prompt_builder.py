@@ -249,6 +249,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- For `3C / quick-edit`, prefer `Hermes CLI (MiniMax-M2.7 via minimax)`.\n"
     "- After route lock, use `terminal` only for approved local verification commands (tests/build/lint/artifact checks), read-only inspection, or explicitly permitted git actions.\n"
     "- Do not invent fake route labels such as `MODEL: local execution` for verification; verification is a local lane within the active routed task.\n"
+    "- Do not use `execute_code` to bypass the routing layer. For routed coding work, use `routed_exec`; for verification, use approved local `terminal` commands.\n"
     "</routing_discipline>\n"
     "\n"
     "<git_authority>\n"

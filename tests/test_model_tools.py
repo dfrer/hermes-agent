@@ -14,6 +14,7 @@ from agent.routing_guard import (
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
@@ -100,6 +101,23 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "Routing guard blocked `write_file`" in result["error"]
 
+    def test_routing_guard_blocks_execute_code_before_routing(self):
+        task_id = "guarded-task-execute-code-before-route"
+        activate_for_task(task_id, session_id="session-guard-exec-before", skills=["routing-layer"])
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "execute_code",
+                    {"code": "print('hi')"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "do not use code execution to bypass routing" in result["error"]
+
     def test_routing_guard_blocks_native_mutating_tool_after_decision(self):
         task_id = "guarded-task-routed"
         activate_for_task(task_id, session_id="session-guard-2", skills=["routing-layer"])
@@ -121,6 +139,28 @@ class TestHandleFunctionCall:
 
         assert "error" in result
         assert "native `write_file`" in result["error"]
+
+    def test_routing_guard_blocks_execute_code_after_routing_decision(self):
+        task_id = "guarded-task-execute-code-after-route"
+        activate_for_task(task_id, session_id="session-guard-exec-after", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: marathon | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-guard-exec-after",
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "execute_code",
+                    {"code": "print('hi')"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "stay on the routed model path" in result["error"]
 
     def test_routed_exec_dispatches_codex_for_tier_3a(self, tmp_path):
         task_id = "guarded-task-codex-routed-exec"
@@ -598,3 +638,8 @@ class TestBackwardCompat:
     def test_tool_to_toolset_map(self):
         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
         assert len(TOOL_TO_TOOLSET_MAP) > 0
+
+    def test_hermes_cli_toolset_includes_routed_exec(self):
+        defs = get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+        names = {item["function"]["name"] for item in defs}
+        assert "routed_exec" in names

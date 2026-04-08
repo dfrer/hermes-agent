@@ -233,6 +233,21 @@ def test_blocks_implementation_oriented_delegate_before_routing():
         deactivate_for_task(task_id)
 
 
+def test_blocks_execute_code_before_routing():
+    task_id = "task-routing-execute-code-before-route"
+    activate_for_task(task_id, session_id="session-execute-code-before-route", skills=["routing-layer"])
+    try:
+        blocked = pre_tool_call_block_reason(
+            "execute_code",
+            {"code": "print('hi')"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "do not use code execution to bypass routing" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_blocks_native_delegate_after_routing_decision():
     task_id = "task-routing-delegate-routed"
     activate_for_task(task_id, session_id="session-5", skills=["routing-layer"])
@@ -249,6 +264,26 @@ def test_blocks_native_delegate_after_routing_decision():
         )
         assert blocked is not None
         assert "native `delegate_task`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_execute_code_after_routing_decision():
+    task_id = "task-routing-execute-code-after-route"
+    activate_for_task(task_id, session_id="session-execute-code-after-route", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope change | CONFIDENCE: high",
+            session_id="session-execute-code-after-route",
+        )
+        blocked = pre_tool_call_block_reason(
+            "execute_code",
+            {"code": "print('hi')"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "stay on the routed model path" in blocked
     finally:
         deactivate_for_task(task_id)
 

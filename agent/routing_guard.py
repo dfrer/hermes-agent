@@ -1181,8 +1181,22 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
     routing_task = is_routing_enforced_task(task_id)
     decision_error = _get_decision_error(task_id)
 
-    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec"}:
+    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec", "execute_code"}:
         return decision_error
+
+    if tool_name == "execute_code":
+        if not routing_task:
+            return None
+        if routed:
+            return (
+                f"Routing guard blocked `execute_code` for task {task_id}: "
+                "stay on the routed model path for implementation. Use `routed_exec` for routed coding work, "
+                "and use approved local verification commands through `terminal` when you need tests/build/lint checks."
+            )
+        return (
+            f"Routing guard blocked `execute_code` for task {task_id}: "
+            "do not use code execution to bypass routing. Before route lock, only read-only inspection tools are allowed."
+        )
 
     if tool_name in {"patch", "write_file"}:
         if routed and routing_task:
