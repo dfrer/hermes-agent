@@ -113,7 +113,13 @@ def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
     reason = getattr(entry, "last_error_reason", None)
-    reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
+    message = getattr(entry, "last_error_message", None)
+    detail_parts = []
+    if isinstance(reason, str) and reason.strip():
+        detail_parts.append(reason.strip())
+    if isinstance(message, str) and message.strip():
+        detail_parts.append(message.strip())
+    reason_text = f" [{' | '.join(detail_parts)}]" if detail_parts else ""
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
     exhausted_until = _exhausted_until(entry)
     if exhausted_until is None:

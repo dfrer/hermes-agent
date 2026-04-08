@@ -498,6 +498,25 @@ def handle_function_call(
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
         try:
+            from agent.routing_guard import pre_tool_call_block_reason, rewrite_routed_tool_args
+
+            function_args = rewrite_routed_tool_args(
+                function_name,
+                function_args if isinstance(function_args, dict) else {},
+                task_id or "",
+            )
+
+            block_reason = pre_tool_call_block_reason(
+                function_name,
+                function_args if isinstance(function_args, dict) else {},
+                task_id or "",
+            )
+            if block_reason:
+                return json.dumps({"error": block_reason})
+        except Exception:
+            logger.debug("Routing guard pre_tool_call check failed for %s", function_name, exc_info=True)
+
+        try:
             from hermes_cli.plugins import invoke_hook
             invoke_hook(
                 "pre_tool_call",
@@ -525,6 +544,18 @@ def handle_function_call(
                 task_id=task_id,
                 user_task=user_task,
             )
+
+        try:
+            from agent.routing_guard import record_tool_result
+
+            record_tool_result(
+                task_id or "",
+                function_name,
+                function_args if isinstance(function_args, dict) else {},
+                result,
+            )
+        except Exception:
+            logger.debug("Routing guard post_tool_call tracking failed for %s", function_name, exc_info=True)
 
         try:
             from hermes_cli.plugins import invoke_hook

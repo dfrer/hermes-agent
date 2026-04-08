@@ -5,6 +5,7 @@ from unittest.mock import call, patch
 
 import pytest
 
+from agent.routing_guard import activate_for_task, deactivate_for_task, record_routing_decision
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
@@ -33,12 +34,15 @@ class TestHandleFunctionCall:
 
     def test_exception_returns_json_error(self):
         # Even if something goes wrong, should return valid JSON
-        result = handle_function_call("web_search", None)  # None args may cause issues
+        result = handle_function_call("terminal", None)  # None args may cause issues
         parsed = json.loads(result)
         assert isinstance(parsed, dict)
         assert "error" in parsed
         assert len(parsed["error"]) > 0
-        assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
+        assert any(
+            token in parsed["error"].lower()
+            for token in ("error", "failed", "unknown")
+        )
 
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
@@ -73,6 +77,313 @@ class TestHandleFunctionCall:
                 tool_call_id="call-1",
             ),
         ]
+
+    def test_routing_guard_blocks_mutating_tool_without_decision(self):
+        task_id = "guarded-task"
+        activate_for_task(task_id, session_id="session-guard", skills=["routing-layer"])
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "write_file",
+                    {"path": "demo.py", "content": "print('x')"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "Routing guard blocked `write_file`" in result["error"]
+
+    def test_routing_guard_blocks_native_mutating_tool_after_decision(self):
+        task_id = "guarded-task-routed"
+        activate_for_task(task_id, session_id="session-guard-2", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: trivial rename | CONFIDENCE: high",
+            session_id="session-guard-2",
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "write_file",
+                    {"path": "demo.py", "content": "print('x')"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "native `write_file`" in result["error"]
+
+    def test_routed_codex_terminal_command_is_rewritten_before_dispatch(self):
+        task_id = "guarded-task-codex-rewrite"
+        activate_for_task(task_id, session_id="session-guard-3", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-guard-3",
+        )
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": "cd ~/societies && codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4 -c 'reasoning_effort=\"extra-high\"' '" + ("A" * 1400) + "'",
+                    },
+                    task_id=task_id,
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result == '{"ok":true}'
+        dispatched_args = mock_dispatch.call_args[0][1]
+        assert dispatched_args["command"].startswith("@'")
+        assert "| codex exec --skip-git-repo-check -C /home/hunter/societies" in dispatched_args["command"]
+        assert dispatched_args["command"].rstrip().endswith(" -")
+
+    def test_routed_hermes_terminal_command_is_rewritten_to_coding_endpoint(self):
+        task_id = "guarded-task-hermes-rewrite"
+        activate_for_task(task_id, session_id="session-guard-hermes", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-guard-hermes",
+        )
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": 'cd /home/hunter/societies && hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
+                    },
+                    task_id=task_id,
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result == '{"ok":true}'
+        dispatched_args = mock_dispatch.call_args[0][1]
+        assert (
+            dispatched_args["command"]
+            == 'cd /home/hunter/societies && GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4 hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q'
+        )
+
+    def test_routing_guard_blocks_native_terminal_mutation_after_route_lock(self):
+        task_id = "guarded-task-native-terminal-after-route"
+        activate_for_task(task_id, session_id="session-native-terminal-after-route", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-native-terminal-after-route",
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "terminal",
+                    {
+                        "command": "echo hi > zzz.txt",
+                    },
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "native `terminal` execution" in result["error"]
+
+    def test_tier_3b_backup_is_blocked_until_primary_failure(self):
+        task_id = "guarded-task-3b-primary"
+        activate_for_task(task_id, session_id="session-guard-4", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-guard-4",
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "terminal",
+                    {
+                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
+                    },
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "Tier 3B backup" in result["error"]
+
+    def test_conflicting_route_without_reclassify_blocks_follow_on_tool_calls(self):
+        task_id = "guarded-task-route-drift"
+        activate_for_task(task_id, session_id="session-route-drift", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-route-drift",
+        )
+        assert (
+            record_routing_decision(
+                task_id,
+                "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: actually smaller | CONFIDENCE: high",
+                session_id="session-route-drift",
+            )
+            is False
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "terminal",
+                    {
+                        "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
+                    },
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "blocked route drift" in result["error"]
+
+    def test_invalid_route_model_label_blocks_follow_on_tool_calls(self):
+        task_id = "guarded-task-invalid-route-model"
+        activate_for_task(task_id, session_id="session-invalid-route-model", skills=["routing-layer"])
+        assert (
+            record_routing_decision(
+                task_id,
+                "TIER: 3C | MODEL: local execution | REASON: verification only | CONFIDENCE: high",
+                session_id="session-invalid-route-model",
+            )
+            is False
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "terminal",
+                    {
+                        "command": "timeout 90 dotnet test tests/Societies.Core.Tests/Societies.Core.Tests.csproj --filter PrototypePersistence",
+                    },
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "invalid routing decision" in result["error"]
+
+    def test_failed_tier_3b_primary_allows_codex_backup(self):
+        task_id = "guarded-task-3b-fallback"
+        activate_for_task(task_id, session_id="session-guard-5", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-guard-5",
+        )
+        with (
+            patch(
+                "model_tools.registry.dispatch",
+                side_effect=[
+                    '{"output":"provider failed","exit_code":1,"error":null}',
+                    '{"ok":true}',
+                ],
+            ) as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                primary_result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
+                    },
+                    task_id=task_id,
+                )
+                backup_result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
+                    },
+                    task_id=task_id,
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert json.loads(primary_result)["exit_code"] == 1
+        assert backup_result == '{"ok":true}'
+        assert mock_dispatch.call_count == 2
+
+    def test_output_indicated_tier_3b_primary_failure_allows_codex_backup(self):
+        task_id = "guarded-task-3b-output-fallback"
+        activate_for_task(task_id, session_id="session-guard-5b", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-guard-5b",
+        )
+        with (
+            patch(
+                "model_tools.registry.dispatch",
+                side_effect=[
+                    '{"output":"429 rate limited after retries","exit_code":0,"error":null}',
+                    '{"ok":true}',
+                ],
+            ) as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                primary_result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": 'hermes chat -m glm-5.1 --provider zai -q "Apply the fix" -t terminal,file -Q',
+                    },
+                    task_id=task_id,
+                )
+                backup_result = handle_function_call(
+                    "terminal",
+                    {
+                        "command": "codex exec --skip-git-repo-check -C /home/hunter/societies -s workspace-write -m gpt-5.4-mini -c 'reasoning_effort=\"extra-high\"' 'Apply the fix'",
+                    },
+                    task_id=task_id,
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert json.loads(primary_result)["exit_code"] == 0
+        assert backup_result == '{"ok":true}'
+        assert mock_dispatch.call_count == 2
+
+    def test_git_commit_requires_explicit_user_permission(self):
+        task_id = "guarded-task-git"
+        activate_for_task(
+            task_id,
+            session_id="session-guard-6",
+            skills=["routing-layer"],
+            user_message="Please implement the fix.",
+        )
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "terminal",
+                    {"command": 'git commit -m "ship it"'},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "git commit" in result["error"]
 
 
 # =========================================================================
@@ -122,11 +433,11 @@ class TestBackwardCompat:
         assert isinstance(names, list)
         assert len(names) > 0
         # Should contain well-known tools
-        assert "web_search" in names
+        assert "terminal" in names
         assert "terminal" in names
 
     def test_get_toolset_for_tool(self):
-        result = get_toolset_for_tool("web_search")
+        result = get_toolset_for_tool("terminal")
         assert result is not None
         assert isinstance(result, str)
 

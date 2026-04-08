@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -8,18 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def _make_real_cli(**kwargs):
-    clean_config = {
-        "model": {
-            "default": "anthropic/claude-opus-4.6",
-            "base_url": "https://openrouter.ai/api/v1",
-            "provider": "auto",
-        },
-        "display": {"compact": False, "tool_progress": "all"},
-        "agent": {},
-        "terminal": {"env_type": "local"},
-    }
-    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+def _import_cli_with_stubs():
     prompt_toolkit_stubs = {
         "prompt_toolkit": MagicMock(),
         "prompt_toolkit.history": MagicMock(),
@@ -35,17 +25,38 @@ def _make_real_cli(**kwargs):
         "prompt_toolkit.key_binding": MagicMock(),
         "prompt_toolkit.completion": MagicMock(),
         "prompt_toolkit.formatted_text": MagicMock(),
+        "prompt_toolkit.cursor_shapes": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
+        "fire": MagicMock(),
     }
-    with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
-        "os.environ", clean_env, clear=False
-    ):
+    with patch.dict(sys.modules, prompt_toolkit_stubs):
         import cli as cli_mod
 
-        cli_mod = importlib.reload(cli_mod)
+        return importlib.reload(cli_mod)
+
+
+def _make_real_cli(**kwargs):
+    clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    with patch.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        cli_mod = _import_cli_with_stubs()
         with patch.object(cli_mod, "get_tool_definitions", return_value=[]), patch.dict(
             cli_mod.__dict__, {"CLI_CONFIG": clean_config}
         ):
-            return cli_mod.HermesCLI(**kwargs)
+            cli_obj = cli_mod.HermesCLI(**kwargs)
+            cli_obj._test_cli_module = cli_mod
+            return cli_obj
 
 
 class _DummyCLI:
@@ -69,7 +80,7 @@ class _DummyCLI:
 
 
 def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
-    import cli as cli_mod
+    cli_mod = _import_cli_with_stubs()
 
     created = {}
 
@@ -93,7 +104,7 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
 
 
 def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
-    import cli as cli_mod
+    cli_mod = _import_cli_with_stubs()
 
     monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kwargs: _DummyCLI(**kwargs))
     monkeypatch.setattr(
@@ -106,13 +117,43 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         cli_mod.main(skills="missing-skill", list_tools=True)
 
 
+def test_main_ignores_missing_default_preloaded_skill(monkeypatch):
+    cli_mod = _import_cli_with_stubs()
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "get_default_preloaded_skills",
+        lambda config=None: ["routing-layer"],
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("", [], ["routing-layer"]),
+    )
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(list_tools=True)
+
+    cli_obj = created["cli"]
+    assert cli_obj.system_prompt == "base prompt"
+    assert cli_obj.preloaded_skills == []
+
+
 def test_show_banner_does_not_print_skills():
     """show_banner() no longer prints the activated skills line — it moved to run()."""
     cli_obj = _make_real_cli(compact=False)
+    cli_mod = cli_obj._test_cli_module
     cli_obj.preloaded_skills = ["hermes-agent-dev", "github-auth"]
     cli_obj.console = MagicMock()
 
-    with patch("cli.build_welcome_banner") as mock_banner, patch(
+    with patch.object(cli_mod, "build_welcome_banner") as mock_banner, patch(
         "shutil.get_terminal_size", return_value=os.terminal_size((120, 40))
     ):
         cli_obj.show_banner()

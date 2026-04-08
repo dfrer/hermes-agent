@@ -1086,6 +1086,7 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     build_plan_path,
     build_preloaded_skills_prompt,
+    get_default_preloaded_skills,
 )
 
 _skill_commands = scan_skill_commands()
@@ -1102,26 +1103,9 @@ def _get_plugin_cmd_handler_names() -> set:
 
 def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> list[str]:
     """Normalize a CLI skills flag into a deduplicated list of skill identifiers."""
-    if not skills:
-        return []
+    from agent.skill_commands import normalize_skill_identifiers
 
-    if isinstance(skills, str):
-        raw_values = [skills]
-    elif isinstance(skills, (list, tuple)):
-        raw_values = [str(item) for item in skills if item is not None]
-    else:
-        raw_values = [str(skills)]
-
-    parsed: list[str] = []
-    seen: set[str] = set()
-    for raw in raw_values:
-        for part in raw.split(","):
-            normalized = part.strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            parsed.append(normalized)
-    return parsed
+    return normalize_skill_identifiers(skills)
 
 
 def save_config_value(key_path: str, value: any) -> bool:
@@ -2343,6 +2327,7 @@ class HermesCLI:
                 reasoning_callback=self._current_reasoning_callback(),
 
                 fallback_model=self._fallback_model,
+                preloaded_skills=self.preloaded_skills,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
@@ -8498,6 +8483,11 @@ def main(
         toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
+    default_skills = get_default_preloaded_skills(CLI_CONFIG)
+    combined_skills: list[str] = []
+    for skill_name in [*default_skills, *parsed_skills]:
+        if skill_name not in combined_skills:
+            combined_skills.append(skill_name)
 
     # Create CLI instance
     cli = HermesCLI(
@@ -8514,13 +8504,14 @@ def main(
         pass_session_id=pass_session_id,
     )
 
-    if parsed_skills:
+    if combined_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-            parsed_skills,
+            combined_skills,
             task_id=cli.session_id,
         )
-        if missing_skills:
-            missing_display = ", ".join(missing_skills)
+        explicit_missing = [skill_name for skill_name in missing_skills if skill_name in parsed_skills]
+        if explicit_missing:
+            missing_display = ", ".join(explicit_missing)
             raise ValueError(f"Unknown skill(s): {missing_display}")
         if skills_prompt:
             cli.system_prompt = "\n\n".join(

@@ -19,6 +19,57 @@ _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+DEFAULT_PRELOADED_SKILLS = ("routing-layer",)
+
+
+def normalize_skill_identifiers(
+    skill_identifiers: str | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    """Normalize skill identifiers into a deduplicated ordered list."""
+    if not skill_identifiers:
+        return []
+
+    if isinstance(skill_identifiers, str):
+        raw_values = [skill_identifiers]
+    elif isinstance(skill_identifiers, (list, tuple)):
+        raw_values = [str(item) for item in skill_identifiers if item is not None]
+    else:
+        raw_values = [str(skill_identifiers)]
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for part in raw.split(","):
+            normalized = part.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            parsed.append(normalized)
+    return parsed
+
+
+def get_default_preloaded_skills(config: Optional[dict[str, Any]] = None) -> list[str]:
+    """Return the configured session-default skills.
+
+    Defaults to ``routing-layer`` when config does not override the list.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    agent_cfg = config.get("agent", {}) if isinstance(config, dict) else {}
+    configured = None
+    if isinstance(agent_cfg, dict):
+        configured = agent_cfg.get("preloaded_skills")
+
+    if configured is None:
+        configured = list(DEFAULT_PRELOADED_SKILLS)
+
+    return normalize_skill_identifiers(configured)
 
 
 def build_plan_path(
@@ -352,7 +403,7 @@ def build_preloaded_skills_prompt(
 
         loaded_skill, skill_dir, skill_name = loaded
         activation_note = (
-            f'[SYSTEM: The user launched this CLI session with the "{skill_name}" skill '
+            f'[SYSTEM: This session started with the "{skill_name}" skill '
             "preloaded. Treat its instructions as active guidance for the duration of this "
             "session unless the user overrides them.]"
         )

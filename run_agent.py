@@ -537,6 +537,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        preloaded_skills: List[str] | None = None,
         persist_session: bool = True,
     ):
         """
@@ -601,6 +602,7 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
+        self.preloaded_skills = list(preloaded_skills or [])
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -5976,6 +5978,20 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        if function_name == "delegate_task":
+            try:
+                from agent.routing_guard import pre_tool_call_block_reason
+
+                block_reason = pre_tool_call_block_reason(
+                    function_name,
+                    function_args,
+                    effective_task_id,
+                )
+                if block_reason:
+                    return json.dumps({"error": block_reason})
+            except Exception:
+                logger.debug("Routing guard check failed for delegate_task", exc_info=True)
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
@@ -6042,6 +6058,17 @@ class AIAgent:
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
             )
 
+    def _normalize_tool_args_for_display(self, function_name: str, function_args: dict, effective_task_id: str) -> dict:
+        if not isinstance(function_args, dict):
+            return function_args
+        try:
+            from agent.routing_guard import rewrite_routed_tool_args
+
+            return rewrite_routed_tool_args(function_name, function_args, effective_task_id)
+        except Exception:
+            logger.debug("Failed to normalize tool args for display: %s", function_name, exc_info=True)
+            return function_args
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
@@ -6079,6 +6106,12 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+
+            function_args = self._normalize_tool_args_for_display(
+                function_name,
+                function_args,
+                effective_task_id,
+            )
 
             # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
@@ -6294,6 +6327,12 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            function_args = self._normalize_tool_args_for_display(
+                function_name,
+                function_args,
+                effective_task_id,
+            )
+
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
                 if self.verbose_logging:
@@ -6395,6 +6434,17 @@ class AIAgent:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
+                try:
+                    from agent.routing_guard import pre_tool_call_block_reason
+
+                    block_reason = pre_tool_call_block_reason(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                    )
+                except Exception:
+                    block_reason = None
+                    logger.debug("Routing guard check failed for delegate_task", exc_info=True)
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -6409,14 +6459,17 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = _delegate_task(
-                        goal=function_args.get("goal"),
-                        context=function_args.get("context"),
-                        toolsets=function_args.get("toolsets"),
-                        tasks=tasks_arg,
-                        max_iterations=function_args.get("max_iterations"),
-                        parent_agent=self,
-                    )
+                    if block_reason:
+                        function_result = json.dumps({"error": block_reason})
+                    else:
+                        function_result = _delegate_task(
+                            goal=function_args.get("goal"),
+                            context=function_args.get("context"),
+                            toolsets=function_args.get("toolsets"),
+                            tasks=tasks_arg,
+                            max_iterations=function_args.get("max_iterations"),
+                            parent_agent=self,
+                        )
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None
@@ -6849,6 +6902,19 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        _routing_guard_active = "routing-layer" in self.preloaded_skills
+        if _routing_guard_active:
+            try:
+                from agent.routing_guard import activate_for_task
+
+                activate_for_task(
+                    effective_task_id,
+                    session_id=self.session_id or "",
+                    skills=self.preloaded_skills,
+                    user_message=persist_user_message or user_message or "",
+                )
+            except Exception:
+                logger.debug("Failed to activate routing guard for task %s", effective_task_id, exc_info=True)
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -8527,6 +8593,22 @@ class AIAgent:
                 if hasattr(self, '_incomplete_scratchpad_retries'):
                     self._incomplete_scratchpad_retries = 0
 
+                if _routing_guard_active and assistant_message.content:
+                    try:
+                        from agent.routing_guard import record_routing_decision
+
+                        record_routing_decision(
+                            effective_task_id,
+                            assistant_message.content,
+                            session_id=self.session_id or "",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to record routing decision for task %s",
+                            effective_task_id,
+                            exc_info=True,
+                        )
+
                 if self.api_mode == "codex_responses" and finish_reason == "incomplete":
                     if not hasattr(self, "_codex_incomplete_retries"):
                         self._codex_incomplete_retries = 0
@@ -9033,6 +9115,13 @@ class AIAgent:
 
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)
+        if _routing_guard_active:
+            try:
+                from agent.routing_guard import deactivate_for_task
+
+                deactivate_for_task(effective_task_id)
+            except Exception:
+                logger.debug("Failed to deactivate routing guard for task %s", effective_task_id, exc_info=True)
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)

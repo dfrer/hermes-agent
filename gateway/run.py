@@ -6554,6 +6554,33 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            session_preloaded_skills: list[str] = []
+            try:
+                from agent.skill_commands import (
+                    build_preloaded_skills_prompt,
+                    get_default_preloaded_skills,
+                )
+
+                session_preloaded_skills = get_default_preloaded_skills()
+                if session_preloaded_skills:
+                    skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+                        session_preloaded_skills,
+                        task_id=session_id,
+                    )
+                    if missing_skills:
+                        logger.debug(
+                            "[Gateway] Missing default preloaded skills for session %s: %s",
+                            session_id,
+                            ", ".join(missing_skills),
+                        )
+                    session_preloaded_skills = loaded_skills
+                    if skills_prompt:
+                        combined_ephemeral = "\n\n".join(
+                            part for part in (skills_prompt, combined_ephemeral) if part
+                        ).strip()
+            except Exception as exc:
+                logger.debug("[Gateway] Failed to preload session skills: %s", exc)
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
             try:
@@ -6651,6 +6678,7 @@ class GatewayRunner:
                     user_id=source.user_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    preloaded_skills=session_preloaded_skills,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

@@ -10,6 +10,8 @@ from agent.skill_commands import (
     build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    get_default_preloaded_skills,
+    normalize_skill_identifiers,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -206,6 +208,21 @@ class TestBuildPreloadedSkillsPrompt:
         assert "first-skill" in prompt
         assert "second-skill" in prompt
         assert "preloaded" in prompt.lower()
+
+
+class TestDefaultPreloadedSkills:
+    def test_normalize_skill_identifiers_deduplicates(self):
+        assert normalize_skill_identifiers("routing-layer, routing-layer,foo") == [
+            "routing-layer",
+            "foo",
+        ]
+
+    def test_default_preloaded_skills_falls_back_to_routing_layer(self):
+        assert get_default_preloaded_skills({"agent": {}}) == ["routing-layer"]
+
+    def test_default_preloaded_skills_respects_config_override(self):
+        config = {"agent": {"preloaded_skills": ["routing-layer", "github-auth"]}}
+        assert get_default_preloaded_skills(config) == ["routing-layer", "github-auth"]
 
     def test_reports_missing_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

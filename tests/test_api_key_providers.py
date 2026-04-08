@@ -119,7 +119,7 @@ class TestProviderRegistry:
 PROVIDER_ENV_VARS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY",
+    "GLM_API_KEY", "GLM_BASE_URL", "ZAI_API_KEY", "Z_AI_API_KEY",
     "KIMI_API_KEY", "KIMI_BASE_URL", "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY",
     "AI_GATEWAY_API_KEY", "AI_GATEWAY_BASE_URL",
     "KILOCODE_API_KEY", "KILOCODE_BASE_URL",
@@ -135,6 +135,9 @@ def _clear_provider_env(monkeypatch):
     for key in PROVIDER_ENV_VARS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    # Keep these tests independent of the developer machine's GitHub CLI auth.
+    monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth._try_gh_cli_token", lambda: None)
 
 
 class TestResolveProvider:
@@ -500,6 +503,36 @@ class TestRuntimeProviderResolution:
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "glm-key"
         assert "z.ai" in result["base_url"] or "api.z.ai" in result["base_url"]
+
+    def test_runtime_zai_refreshes_stale_pool_base_url(self, monkeypatch):
+        monkeypatch.setenv("GLM_API_KEY", "glm-key")
+
+        class _Entry:
+            runtime_base_url = "https://api.z.ai/api/paas/v4"
+            base_url = "https://api.z.ai/api/paas/v4"
+            runtime_api_key = "glm-key"
+            access_token = "glm-key"
+            source = "env:GLM_API_KEY"
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                return _Entry()
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_pool", lambda provider: _Pool())
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.auth_mod._resolve_zai_base_url",
+            lambda api_key, default_url, env_url: "https://api.z.ai/api/coding/paas/v4",
+        )
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="zai")
+
+        assert result["provider"] == "zai"
+        assert result["base_url"] == "https://api.z.ai/api/coding/paas/v4"
 
     def test_runtime_kimi(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
