@@ -147,6 +147,9 @@ def _resolve_runtime_from_pool_entry(
     base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     api_mode = "chat_completions"
+    endpoint_source = ""
+    endpoint_id = ""
+    endpoint_label = ""
     if provider == "zai":
         pconfig = PROVIDER_REGISTRY.get("zai")
         env_url = ""
@@ -154,11 +157,15 @@ def _resolve_runtime_from_pool_entry(
             env_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
         if api_key and pconfig:
             try:
-                base_url = auth_mod._resolve_zai_base_url(
+                endpoint_info = auth_mod._resolve_zai_endpoint_info(
                     api_key,
                     pconfig.inference_base_url,
                     env_url,
-                ).rstrip("/")
+                )
+                base_url = str(endpoint_info.get("base_url", pconfig.inference_base_url)).rstrip("/")
+                endpoint_source = str(endpoint_info.get("source", "") or "")
+                endpoint_id = str(endpoint_info.get("endpoint_id", "") or "")
+                endpoint_label = str(endpoint_info.get("endpoint_label", "") or "")
             except Exception:
                 logger.debug("Failed to refresh Z.AI runtime base URL from pool entry", exc_info=True)
     if provider == "openai-codex":
@@ -208,7 +215,7 @@ def _resolve_runtime_from_pool_entry(
     if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    return {
+    resolved = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -217,6 +224,11 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    if provider == "zai":
+        resolved["endpoint_source"] = endpoint_source
+        resolved["endpoint_id"] = endpoint_id
+        resolved["endpoint_label"] = endpoint_label
+    return resolved
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:

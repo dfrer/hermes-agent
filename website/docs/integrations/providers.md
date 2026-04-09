@@ -169,8 +169,17 @@ model:
 Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, or `DASHSCOPE_BASE_URL` environment variables.
 
 :::note Z.AI Endpoint Auto-Detection
-When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually — the working endpoint is detected and cached automatically.
-:::
+When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually when auto-detection is desired — the working endpoint is detected and cached automatically.
+
+If you *do* set `GLM_BASE_URL`, that manual override always wins and auto-detection is bypassed until the override is cleared.
+::: 
+
+#### Z.AI troubleshooting
+
+- If a coding-plan key is being treated like a direct-API key, check whether `GLM_BASE_URL` is pinned to the wrong endpoint.
+- `hermes doctor` now reports the effective Z.AI endpoint and whether it came from an env override, cache, live probe, or default fallback.
+- A stale `GLM_BASE_URL` override can produce quota or endpoint errors even when the key itself is valid; clear the override to let Hermes auto-detect again.
+- Transient `429` text in routed child logs does not necessarily mean the routed attempt failed; Hermes now distinguishes warning output from the final routed status.
 
 ### xAI (Grok) Prompt Caching
 

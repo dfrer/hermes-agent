@@ -101,6 +101,61 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "Routing guard blocked `write_file`" in result["error"]
 
+    def test_routing_guard_allows_docs_only_write_without_decision(self):
+        task_id = "guarded-task-docs-write"
+        activate_for_task(task_id, session_id="session-guard-docs", skills=["routing-layer"])
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "write_file",
+                        {"path": "/home/hunter/wiki/entities/societies.md", "content": "# Societies\n"},
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result == {"ok": True}
+        assert mock_dispatch.call_count == 1
+
+    def test_routing_guard_blocks_behavior_markdown_write_without_decision(self):
+        task_id = "guarded-task-behavior-write"
+        activate_for_task(task_id, session_id="session-guard-behavior", skills=["routing-layer"])
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "write_file",
+                    {"path": "/home/hunter/project/AGENTS.md", "content": "# changed\n"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "behavior-changing markdown" in result["error"]
+
+    def test_routing_guard_blocks_config_text_write_without_decision(self):
+        task_id = "guarded-task-config-write"
+        activate_for_task(task_id, session_id="session-guard-config", skills=["routing-layer"])
+        try:
+            result = json.loads(
+                handle_function_call(
+                    "write_file",
+                    {"path": "/home/hunter/project/config.yaml", "content": "value: 1\n"},
+                    task_id=task_id,
+                )
+            )
+        finally:
+            deactivate_for_task(task_id)
+
+        assert "error" in result
+        assert "config or executable text" in result["error"]
+
     def test_routing_guard_blocks_execute_code_before_routing(self):
         task_id = "guarded-task-execute-code-before-route"
         activate_for_task(task_id, session_id="session-guard-exec-before", skills=["routing-layer"])
@@ -210,9 +265,22 @@ class TestHandleFunctionCall:
         with (
             patch(
                 "tools.routed_exec_tool.subprocess.run",
-                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout='HERMES_ROUTED_RESULT: {"status":"success","summary":"done"}',
+                    stderr="",
+                ),
             ) as mock_run,
             patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
+            patch(
+                "tools.routed_exec_tool.resolve_api_key_provider_credentials",
+                return_value={
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                    "endpoint_source": "probe",
+                    "endpoint_id": "coding-global",
+                    "endpoint_label": "Global (Coding Plan)",
+                },
+            ),
             patch("hermes_cli.plugins.invoke_hook"),
         ):
             try:
@@ -231,12 +299,14 @@ class TestHandleFunctionCall:
 
         assert result["success"] is True
         assert result["attempts"][0]["kind"] == "hermes_glm_zai"
+        assert result["resolved_base_url"] == "https://api.z.ai/api/coding/paas/v4"
+        assert result["endpoint_source"] == "probe"
         command = mock_run.call_args.args[0]
         env = mock_run.call_args.kwargs["env"]
         assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
-        assert env["GLM_BASE_URL"] == "https://api.z.ai/api/coding/paas/v4"
         assert env["HERMES_DISABLE_DEFAULT_ROUTING_SKILL"] == "1"
         assert "already-routed implementation executor" in env["HERMES_EPHEMERAL_SYSTEM_PROMPT"]
+        assert any("HERMES_ROUTED_RESULT:" in str(item) for item in command)
         assert mock_run.call_args.kwargs["timeout"] == 900
 
     def test_routed_exec_dispatches_minimax_primary_for_quick_edit(self, tmp_path):
@@ -518,9 +588,22 @@ class TestHandleFunctionCall:
             patch(
                 "tools.routed_exec_tool.subprocess.run",
                 side_effect=[
-                    MagicMock(returncode=0, stdout="HTTP 429: Insufficient balance or no resource package. Please recharge.", stderr=""),
-                    MagicMock(returncode=0, stdout="backup ok", stderr=""),
-                    MagicMock(returncode=0, stdout="backup reused", stderr=""),
+                    MagicMock(
+                        returncode=0,
+                        stdout=(
+                            "HTTP 429: The service may be temporarily overloaded.\n"
+                            'HERMES_ROUTED_RESULT: {"status":"success","summary":"done"}'
+                        ),
+                        stderr="",
+                    ),
+                    MagicMock(
+                        returncode=-6,
+                        stdout=(
+                            'HERMES_ROUTED_RESULT: {"status":"success","summary":"verification complete"}\n'
+                            "Fatal Python error: _enter_buffered_busy: could not acquire lock for <stdin> at interpreter shutdown"
+                        ),
+                        stderr="",
+                    ),
                 ],
             ) as mock_run,
             patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
@@ -551,11 +634,54 @@ class TestHandleFunctionCall:
                 deactivate_for_task(task_id)
 
         assert first_result["success"] is True
-        assert len(first_result["attempts"]) == 2
+        assert len(first_result["attempts"]) == 1
+        assert first_result["attempts"][0]["warning_kinds"] == ["rate_limited"]
         assert second_result["success"] is True
         assert len(second_result["attempts"]) == 1
-        assert second_result["attempts"][0]["kind"] == "codex_gpt54mini"
-        assert mock_run.call_count == 3
+        assert second_result["attempts"][0]["kind"] == "hermes_glm_zai"
+        assert "executor_shutdown_after_success" in second_result["attempts"][0]["warning_kinds"]
+        assert mock_run.call_count == 2
+
+    def test_routed_exec_resolves_nonexistent_workdir_to_existing_parent(self, tmp_path):
+        task_id = "guarded-task-routed-nonexistent-workdir"
+        activate_for_task(task_id, session_id="session-routed-nonexistent-workdir", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-routed-nonexistent-workdir",
+        )
+        target = tmp_path / "nested" / "project"
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout='HERMES_ROUTED_RESULT: {"status":"success","summary":"done"}',
+                    stderr="",
+                ),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="codex"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(target),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["requested_workdir"] == str(target)
+        assert result["resolved_workdir"] == str(tmp_path)
+        assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+        assert mock_run.call_args.args[0][4] == str(tmp_path)
 
     def test_routed_exec_returns_compact_failure_summary_for_timeout_chain(self, tmp_path):
         task_id = "guarded-task-routed-timeout-summary"

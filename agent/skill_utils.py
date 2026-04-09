@@ -316,6 +316,65 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
     return result
 
 
+def extract_skill_routing_hints(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract normalized routing hints from parsed frontmatter.
+
+    Skills may optionally declare routing behavior via::
+
+        metadata:
+          hermes:
+            routing:
+              task_class: non_coding_authoring | coding | mixed
+              non_code_write_globs:
+                - "wiki/**"
+
+    Returns a normalized dict with keys:
+    - ``task_class``: one of ``coding``, ``non_coding_authoring``, ``mixed``
+    - ``non_code_write_globs``: list[str]
+
+    Missing or malformed metadata falls back conservatively to ``coding`` with
+    an empty glob list.
+    """
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return {"task_class": "coding", "non_code_write_globs": []}
+
+    hermes = metadata.get("hermes")
+    if not isinstance(hermes, dict):
+        return {"task_class": "coding", "non_code_write_globs": []}
+
+    routing = hermes.get("routing")
+    if not isinstance(routing, dict):
+        return {"task_class": "coding", "non_code_write_globs": []}
+
+    raw_task_class = str(routing.get("task_class", "") or "").strip().lower()
+    task_class = (
+        raw_task_class
+        if raw_task_class in {"coding", "non_coding_authoring", "mixed"}
+        else "coding"
+    )
+
+    raw_globs = routing.get("non_code_write_globs")
+    if isinstance(raw_globs, str):
+        raw_globs = [raw_globs]
+    if not isinstance(raw_globs, list):
+        raw_globs = []
+
+    globs: List[str] = []
+    seen: set[str] = set()
+    for entry in raw_globs:
+        value = str(entry or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        globs.append(value)
+
+    return {
+        "task_class": task_class,
+        "non_code_write_globs": globs,
+    }
+
+
 def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     """Scan all enabled skills and collect their config variable declarations.
 

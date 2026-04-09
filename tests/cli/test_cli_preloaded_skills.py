@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.skill_commands import SkillPromptPayload
+
 
 def _import_cli_with_stubs():
     prompt_toolkit_stubs = {
@@ -92,7 +94,12 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("skill prompt", ["hermes-agent-dev", "github-auth"], []),
+        lambda skills, task_id=None: SkillPromptPayload(
+            message="skill prompt",
+            loaded_skill_names=["hermes-agent-dev", "github-auth"],
+            missing_identifiers=[],
+            routing_hints=[{"skill_name": "hermes-agent-dev", "task_class": "coding", "non_code_write_globs": []}],
+        ),
     )
 
     with pytest.raises(SystemExit):
@@ -101,6 +108,7 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     cli_obj = created["cli"]
     assert cli_obj.system_prompt == "base prompt\n\nskill prompt"
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
+    assert cli_obj.preloaded_skill_hints == [{"skill_name": "hermes-agent-dev", "task_class": "coding", "non_code_write_globs": []}]
 
 
 def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
@@ -110,7 +118,12 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("", [], ["missing-skill"]),
+        lambda skills, task_id=None: SkillPromptPayload(
+            message="",
+            loaded_skill_names=[],
+            missing_identifiers=["missing-skill"],
+            routing_hints=[],
+        ),
     )
 
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
@@ -135,7 +148,12 @@ def test_main_ignores_missing_default_preloaded_skill(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("", [], ["routing-layer"]),
+        lambda skills, task_id=None: SkillPromptPayload(
+            message="",
+            loaded_skill_names=[],
+            missing_identifiers=["routing-layer"],
+            routing_hints=[],
+        ),
     )
 
     with pytest.raises(SystemExit):
@@ -144,6 +162,7 @@ def test_main_ignores_missing_default_preloaded_skill(monkeypatch):
     cli_obj = created["cli"]
     assert cli_obj.system_prompt == "base prompt"
     assert cli_obj.preloaded_skills == []
+    assert cli_obj.preloaded_skill_hints == []
 
 
 def test_show_banner_does_not_print_skills():

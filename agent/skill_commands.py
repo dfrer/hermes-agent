@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -21,6 +22,14 @@ _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 DEFAULT_PRELOADED_SKILLS = ("routing-layer",)
+
+
+@dataclass
+class SkillPromptPayload:
+    message: str = ""
+    loaded_skill_names: list[str] = field(default_factory=list)
+    missing_identifiers: list[str] = field(default_factory=list)
+    routing_hints: list[dict[str, Any]] = field(default_factory=list)
 
 
 def normalize_skill_identifiers(
@@ -134,6 +143,48 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             skill_dir = None
 
     return loaded_skill, skill_dir, skill_name
+
+
+def _extract_skill_routing_hint(
+    loaded_skill: dict[str, Any],
+    skill_dir: Path | None,
+    skill_name: str,
+) -> dict[str, Any] | None:
+    try:
+        from agent.skill_utils import extract_skill_routing_hints, parse_frontmatter
+
+        raw_content = str(loaded_skill.get("raw_content") or loaded_skill.get("content") or "")
+        frontmatter = {}
+        if raw_content:
+            frontmatter, _ = parse_frontmatter(raw_content)
+
+        metadata = frontmatter.get("metadata")
+        hermes_meta = metadata.get("hermes") if isinstance(metadata, dict) else None
+        routing_meta = hermes_meta.get("routing") if isinstance(hermes_meta, dict) else None
+        if not isinstance(routing_meta, dict):
+            return None
+
+        normalized = extract_skill_routing_hints(frontmatter)
+    except Exception:
+        return None
+
+    skill_path = str(loaded_skill.get("path") or "")
+    if not skill_path and skill_dir is not None:
+        try:
+            skill_path = str(skill_dir / "SKILL.md")
+        except Exception:
+            skill_path = ""
+
+    return {
+        "skill_name": str(skill_name or "").strip(),
+        "skill_path": skill_path,
+        "task_class": str(normalized.get("task_class") or "coding"),
+        "non_code_write_globs": [
+            str(item)
+            for item in (normalized.get("non_code_write_globs") or [])
+            if str(item or "").strip()
+        ],
+    }
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
@@ -350,7 +401,7 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
-) -> Optional[str]:
+) -> Optional[SkillPromptPayload]:
     """Build the user message content for a skill slash command invocation.
 
     Args:
@@ -367,26 +418,34 @@ def build_skill_invocation_message(
 
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
-        return f"[Failed to load skill: {skill_info['name']}]"
+        return SkillPromptPayload(message=f"[Failed to load skill: {skill_info['name']}]")
 
     loaded_skill, skill_dir, skill_name = loaded
     activation_note = (
         f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"
     )
-    return _build_skill_message(
-        loaded_skill,
-        skill_dir,
-        activation_note,
-        user_instruction=user_instruction,
-        runtime_note=runtime_note,
+    return SkillPromptPayload(
+        message=_build_skill_message(
+            loaded_skill,
+            skill_dir,
+            activation_note,
+            user_instruction=user_instruction,
+            runtime_note=runtime_note,
+        ),
+        loaded_skill_names=[skill_name],
+        routing_hints=[
+            hint
+            for hint in [_extract_skill_routing_hint(loaded_skill, skill_dir, skill_name)]
+            if isinstance(hint, dict)
+        ],
     )
 
 
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
-) -> tuple[str, list[str], list[str]]:
+) -> SkillPromptPayload:
     """Load one or more skills for session-wide CLI preloading.
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
@@ -394,6 +453,7 @@ def build_preloaded_skills_prompt(
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
+    routing_hints: list[dict[str, Any]] = []
 
     seen: set[str] = set()
     for raw_identifier in skill_identifiers:
@@ -421,5 +481,13 @@ def build_preloaded_skills_prompt(
             )
         )
         loaded_names.append(skill_name)
+        hint = _extract_skill_routing_hint(loaded_skill, skill_dir, skill_name)
+        if isinstance(hint, dict):
+            routing_hints.append(hint)
 
-    return "\n\n".join(prompt_parts), loaded_names, missing
+    return SkillPromptPayload(
+        message="\n\n".join(prompt_parts),
+        loaded_skill_names=loaded_names,
+        missing_identifiers=missing,
+        routing_hints=routing_hints,
+    )

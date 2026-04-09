@@ -700,9 +700,28 @@ def run_doctor(args):
                 print(f"  {color('✓', Colors.GREEN)} {_label} {color('(key configured)', Colors.DIM)}")
                 continue
             print(f"  Checking {_pname} API...", end="", flush=True)
+            _detail = ""
+            _zai_resolution = None
             try:
                 import httpx
                 _base = os.getenv(_base_env, "")
+                if _pname == "Z.AI / GLM":
+                    from hermes_cli.auth import _resolve_zai_endpoint_info
+
+                    _zai_resolution = _resolve_zai_endpoint_info(
+                        _key,
+                        (_default_url or "").rsplit("/models", 1)[0],
+                        _base,
+                        diagnose_override=True,
+                    )
+                    _base = str(_zai_resolution.get("base_url", "") or _base)
+                    _source_label = {
+                        "env_override": "env override",
+                        "cache": "cache",
+                        "probe": "probe",
+                        "default_fallback": "default fallback",
+                    }.get(str(_zai_resolution.get("source", "") or ""), str(_zai_resolution.get("source", "") or ""))
+                    _detail = f" ({_zai_resolution.get('endpoint_label', 'Z.AI endpoint')} via {_source_label})"
                 # Auto-detect Kimi Code keys (sk-kimi-) → api.kimi.com
                 if not _base and _key.startswith("sk-kimi-"):
                     _base = "https://api.kimi.com/coding/v1"
@@ -716,14 +735,34 @@ def run_doctor(args):
                     timeout=10,
                 )
                 if _resp.status_code == 200:
-                    print(f"\r  {color('✓', Colors.GREEN)} {_label}                          ")
+                    print(f"\r  {color('✓', Colors.GREEN)} {_label}{color(_detail, Colors.DIM)}")
                 elif _resp.status_code == 401:
-                    print(f"\r  {color('✗', Colors.RED)} {_label} {color('(invalid API key)', Colors.DIM)}           ")
+                    print(f"\r  {color('✗', Colors.RED)} {_label} {color(f'(invalid API key){_detail}', Colors.DIM)}")
                     issues.append(f"Check {_env_vars[0]} in .env")
                 else:
-                    print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(HTTP {_resp.status_code})', Colors.DIM)}           ")
+                    print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(HTTP {_resp.status_code}){_detail}', Colors.DIM)}")
+                    if _zai_resolution and _zai_resolution.get("override_mismatch"):
+                        print(
+                            "     "
+                            + color(
+                                "GLM_BASE_URL override may be stale. "
+                                f"Clear it to re-enable auto-detection for {_zai_resolution.get('suggested_endpoint_label', 'the detected endpoint')} "
+                                f"({_zai_resolution.get('suggested_base_url', '')}).",
+                                Colors.DIM,
+                            )
+                        )
             except Exception as _e:
-                print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e})', Colors.DIM)}           ")
+                print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e}){_detail}', Colors.DIM)}")
+                if _zai_resolution and _zai_resolution.get("override_mismatch"):
+                    print(
+                        "     "
+                        + color(
+                            "GLM_BASE_URL override may be stale. "
+                            f"Clear it to re-enable auto-detection for {_zai_resolution.get('suggested_endpoint_label', 'the detected endpoint')} "
+                            f"({_zai_resolution.get('suggested_base_url', '')}).",
+                            Colors.DIM,
+                        )
+                    )
 
     # =========================================================================
     # Check: Submodules

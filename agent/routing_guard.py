@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 import json
+from pathlib import Path
 import re
+import shlex
 import threading
 import time
 from typing import Any, Optional
@@ -17,6 +20,7 @@ _RECLASSIFY_MARKER_RE = re.compile(r"(?i)\b(?:reclassify|reclassification|route 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _MARKDOWN_LINE_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+\.\s+)?")
 _MARKDOWN_WRAP_RE = re.compile(r"^(?:\*\*|__|`+)+|(?:\*\*|__|`+)+$")
+_PATCH_TARGET_RE = re.compile(r"(?im)^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s+(.+?)\s*$")
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 _SHELL_CHAIN_RE = re.compile(r"\s*(?:&&|;)\s*")
 _SAFE_REDIRECTION_RE = re.compile(r"\b\d>&\d\b|(^|[\s(])(?:\d*>|>)(?:\s*)(?:/dev/null|nul)\b", re.IGNORECASE)
@@ -35,7 +39,6 @@ _HERMES_MINIMAX_MODEL_RE = re.compile(r"(?i)(?:^|\s)-m\s+minimax-m2\.7\b")
 _HERMES_MINIMAX_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+minimax\b")
 _HERMES_MIMO_MODEL_RE = re.compile(r"(?i)(?:^|\s)-m\s+(?:xiaomi/)?mimo-v2-pro\b")
 _HERMES_NOUS_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+nous\b")
-_HERMES_GLM_BASE_URL_RE = re.compile(r"(?i)\bGLM_BASE_URL=(?P<value>\S+)")
 _CODEX_EXEC_RE = re.compile(r"(?i)\bcodex\s+exec\b")
 _CODEX_GPT54_MINI_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4-mini\b")
 _CODEX_GPT54_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4\b")
@@ -201,7 +204,94 @@ _IMPLEMENTATION_DELEGATE_KEYWORDS = (
     "feature",
     "test",
 )
-_ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+_WORK_CLASS_CODE = "code"
+_WORK_CLASS_CONFIG = "config_or_executable_text"
+_WORK_CLASS_BEHAVIOR = "behavior_markdown"
+_WORK_CLASS_DOCS = "docs_text"
+_WORK_CLASS_UNKNOWN = "unknown"
+_WORK_CLASS_MIXED = "mixed"
+_TASK_CLASS_CODING = "coding"
+_TASK_CLASS_NON_CODING = "non_coding_authoring"
+_TASK_CLASS_MIXED = "mixed"
+_DOC_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".mdx", ".txt", ".rst", ".adoc", ".org"})
+_CONFIG_TEXT_SUFFIXES = frozenset(
+    {
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".xml",
+        ".sql",
+        ".csproj",
+        ".props",
+        ".targets",
+    }
+)
+_EXECUTABLE_TEXT_SUFFIXES = frozenset({".sh", ".bash", ".ps1", ".bat", ".cmd"})
+_CODE_FILE_SUFFIXES = frozenset(
+    {
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".cs",
+        ".java",
+        ".go",
+        ".rs",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".swift",
+        ".kt",
+        ".kts",
+        ".rb",
+        ".php",
+        ".html",
+        ".css",
+        ".scss",
+        ".sass",
+    }
+)
+_BEHAVIOR_MARKDOWN_FILENAMES = frozenset(
+    {
+        "soul.md",
+        "agents.md",
+        "hermes.md",
+        ".hermes.md",
+        "claude.md",
+        ".cursorrules",
+        "skill.md",
+    }
+)
+_DOCS_BASENAME_PREFIXES = (
+    "readme",
+    "changelog",
+    "release",
+    "design",
+    "notes",
+    "report",
+    "summary",
+)
+_NON_CODE_PATH_SEGMENTS = frozenset({"wiki", "docs", "notes", "plans", "queries", "comparisons"})
+_CODE_SENSITIVE_ROOT_PATTERNS = (
+    "src/",
+    "app/",
+    "lib/",
+    "packages/",
+    "tests/",
+    "scripts/",
+    ".github/workflows/",
+    "infra/",
+    "config/",
+    "migrations/",
+    "database/",
+)
 _ROUTED_QUOTA_EXHAUSTED_RE = re.compile(
     r"(?is)\b(?:insufficient balance|no resource package|resource package|quota exhausted|credits? exhausted|please recharge)\b"
 )
@@ -334,20 +424,94 @@ def _format_session_lane_label(model: str = "", provider: str = "") -> str:
     return normalized_model or normalized_provider
 
 
+def _normalize_skill_routing_hint(hint: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(hint, dict):
+        return None
+
+    raw_task_class = str(hint.get("task_class", "") or "").strip().lower()
+    task_class = (
+        raw_task_class
+        if raw_task_class in {_TASK_CLASS_CODING, _TASK_CLASS_NON_CODING, _TASK_CLASS_MIXED}
+        else _TASK_CLASS_CODING
+    )
+
+    raw_globs = hint.get("non_code_write_globs") or []
+    if isinstance(raw_globs, str):
+        raw_globs = [raw_globs]
+    if not isinstance(raw_globs, list):
+        raw_globs = []
+
+    globs: list[str] = []
+    seen: set[str] = set()
+    for entry in raw_globs:
+        value = str(entry or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        globs.append(value)
+
+    return {
+        "skill_name": str(hint.get("skill_name", "") or "").strip(),
+        "skill_path": str(hint.get("skill_path", "") or "").strip(),
+        "task_class": task_class,
+        "non_code_write_globs": globs,
+    }
+
+
+def _normalize_active_skill_hints(hints: Optional[list[Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for raw in hints or []:
+        hint = _normalize_skill_routing_hint(raw)
+        if not isinstance(hint, dict):
+            continue
+        key = (
+            hint.get("skill_name", ""),
+            hint.get("skill_path", ""),
+            hint.get("task_class", _TASK_CLASS_CODING),
+            tuple(hint.get("non_code_write_globs", [])),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(hint)
+    return normalized
+
+
+def _derive_task_class(active_skill_hints: Optional[list[dict[str, Any]]]) -> str:
+    classes = {
+        str(item.get("task_class", "") or "").strip().lower()
+        for item in (active_skill_hints or [])
+        if isinstance(item, dict)
+    }
+    if _TASK_CLASS_MIXED in classes:
+        return _TASK_CLASS_MIXED
+    if _TASK_CLASS_CODING in classes and _TASK_CLASS_NON_CODING in classes:
+        return _TASK_CLASS_MIXED
+    if _TASK_CLASS_NON_CODING in classes:
+        return _TASK_CLASS_NON_CODING
+    return _TASK_CLASS_CODING
+
+
 def _new_task_state(
     *,
     session_id: str = "",
     skills: Optional[list[str]] = None,
+    active_skill_hints: Optional[list[dict[str, Any]]] = None,
     user_message: str = "",
     session_model: str = "",
     session_provider: str = "",
 ) -> dict[str, Any]:
+    normalized_hints = _normalize_active_skill_hints(active_skill_hints)
     return {
         "session_id": session_id or "",
         "session_model": str(session_model or "").strip(),
         "session_provider": str(session_provider or "").strip(),
         "session_lane_label": _format_session_lane_label(session_model, session_provider),
         "skills": list(skills or []),
+        "active_skill_hints": normalized_hints,
+        "task_class": _derive_task_class(normalized_hints),
+        "last_mutation_class": None,
         "enforced": True,
         "routed": False,
         "decision": None,
@@ -372,6 +536,7 @@ def activate_for_task(
     *,
     session_id: str = "",
     skills: Optional[list[str]] = None,
+    active_skill_hints: Optional[list[dict[str, Any]]] = None,
     user_message: str = "",
     session_model: str = "",
     session_provider: str = "",
@@ -383,6 +548,7 @@ def activate_for_task(
         _task_state[task_id] = _new_task_state(
             session_id=session_id,
             skills=skills,
+            active_skill_hints=active_skill_hints,
             user_message=user_message,
             session_model=session_model,
             session_provider=session_provider,
@@ -426,6 +592,241 @@ def _strip_think_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text or "")
 
 
+def _normalize_path_value(path: str) -> str:
+    raw = str(path or "").strip().replace("\\", "/")
+    raw = re.sub(r"/{2,}", "/", raw)
+    return raw
+
+
+def _lower_wrapped_path(path: str) -> str:
+    normalized = _normalize_path_value(path).strip("/")
+    return f"/{normalized.lower()}/" if normalized else "/"
+
+
+def _path_parts_lower(path: str) -> list[str]:
+    normalized = _normalize_path_value(path).strip("/")
+    if not normalized:
+        return []
+    return [part.lower() for part in normalized.split("/") if part]
+
+
+def _is_behavior_markdown_path(path: str) -> bool:
+    normalized = _normalize_path_value(path)
+    if not normalized:
+        return False
+    basename = Path(normalized).name.lower()
+    if basename in _BEHAVIOR_MARKDOWN_FILENAMES:
+        return True
+    if basename.endswith(".mdc") and "/.cursor/rules/" in _lower_wrapped_path(normalized):
+        return True
+    return False
+
+
+def _is_config_or_executable_text_path(path: str) -> bool:
+    normalized = _normalize_path_value(path)
+    if not normalized:
+        return False
+    basename = Path(normalized).name.lower()
+    suffix = Path(normalized).suffix.lower()
+    if suffix in _CONFIG_TEXT_SUFFIXES or suffix in _EXECUTABLE_TEXT_SUFFIXES:
+        return True
+    if basename.startswith(".env"):
+        return True
+    if basename.startswith("dockerfile"):
+        return True
+    if basename.startswith("compose"):
+        return True
+    if basename.startswith("docker-compose"):
+        return True
+    return False
+
+
+def _is_code_sensitive_path(path: str) -> bool:
+    wrapped = _lower_wrapped_path(path)
+    return any(f"/{pattern.strip('/').lower()}/" in wrapped for pattern in _CODE_SENSITIVE_ROOT_PATTERNS)
+
+
+def _is_docs_text_path(path: str) -> bool:
+    normalized = _normalize_path_value(path)
+    if not normalized:
+        return False
+    basename = Path(normalized).name.lower()
+    suffix = Path(normalized).suffix.lower()
+    if suffix in _DOC_TEXT_SUFFIXES:
+        return True
+    return basename.startswith(_DOCS_BASENAME_PREFIXES)
+
+
+def _classify_path_work_class(path: str) -> str:
+    normalized = _normalize_path_value(path)
+    if not normalized:
+        return _WORK_CLASS_UNKNOWN
+    if _is_behavior_markdown_path(normalized):
+        return _WORK_CLASS_BEHAVIOR
+    if _is_config_or_executable_text_path(normalized):
+        return _WORK_CLASS_CONFIG
+    if _is_code_sensitive_path(normalized):
+        return _WORK_CLASS_CODE
+    if _is_docs_text_path(normalized):
+        return _WORK_CLASS_DOCS
+    if Path(normalized).suffix.lower() in _CODE_FILE_SUFFIXES:
+        return _WORK_CLASS_CODE
+    return _WORK_CLASS_UNKNOWN
+
+
+def _collect_mutation_target_paths(tool_name: str, args: dict[str, Any]) -> list[str]:
+    if tool_name == "write_file":
+        path = _normalize_path_value(str(args.get("path", "") or ""))
+        return [path] if path else []
+
+    if tool_name != "patch":
+        return []
+
+    mode = str(args.get("mode", "replace") or "replace").strip().lower()
+    if mode == "replace":
+        path = _normalize_path_value(str(args.get("path", "") or ""))
+        return [path] if path else []
+
+    if mode != "patch":
+        return []
+
+    patch_text = str(args.get("patch", "") or "")
+    return [
+        _normalize_path_value(match.strip())
+        for match in _PATCH_TARGET_RE.findall(patch_text)
+        if _normalize_path_value(match.strip())
+    ]
+
+
+def _classify_file_mutation(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    targets = _collect_mutation_target_paths(tool_name, args)
+    if not targets:
+        return {"class": _WORK_CLASS_UNKNOWN, "targets": [], "target_classes": []}
+
+    target_classes = [_classify_path_work_class(path) for path in targets]
+    unique = set(target_classes)
+    if _WORK_CLASS_BEHAVIOR in unique:
+        mutation_class = _WORK_CLASS_BEHAVIOR if unique == {_WORK_CLASS_BEHAVIOR} else _WORK_CLASS_MIXED
+    elif _WORK_CLASS_CODE in unique:
+        mutation_class = _WORK_CLASS_CODE if unique == {_WORK_CLASS_CODE} else _WORK_CLASS_MIXED
+    elif _WORK_CLASS_CONFIG in unique:
+        mutation_class = _WORK_CLASS_CONFIG if unique == {_WORK_CLASS_CONFIG} else _WORK_CLASS_MIXED
+    elif unique == {_WORK_CLASS_DOCS}:
+        mutation_class = _WORK_CLASS_DOCS
+    elif len(unique) == 1:
+        mutation_class = next(iter(unique))
+    else:
+        mutation_class = _WORK_CLASS_MIXED
+
+    return {
+        "class": mutation_class,
+        "targets": targets,
+        "target_classes": target_classes,
+    }
+
+
+def _path_glob_candidates(path: str) -> list[str]:
+    normalized = _normalize_path_value(path).strip("/")
+    if not normalized:
+        return []
+    parts = [part for part in normalized.split("/") if part]
+    candidates: list[str] = []
+    for index in range(len(parts)):
+        candidates.append("/".join(parts[index:]))
+    return candidates
+
+
+def _matches_non_code_globs(path: str, globs: list[str]) -> bool:
+    candidates = [candidate.lower() for candidate in _path_glob_candidates(path)]
+    for pattern in globs:
+        normalized_pattern = str(pattern or "").strip().replace("\\", "/").strip("/").lower()
+        if not normalized_pattern:
+            continue
+        for candidate in candidates:
+            if fnmatchcase(candidate, normalized_pattern):
+                return True
+    return False
+
+
+def _is_default_docs_authoring_path(path: str) -> bool:
+    normalized = _normalize_path_value(path)
+    if not normalized:
+        return False
+    basename = Path(normalized).name.lower()
+    if basename.startswith(_DOCS_BASENAME_PREFIXES):
+        return True
+    return any(segment in _NON_CODE_PATH_SEGMENTS for segment in _path_parts_lower(normalized))
+
+
+def _get_active_skill_hints(task_id: str) -> list[dict[str, Any]]:
+    if not task_id:
+        return []
+    with _task_state_lock:
+        _purge_expired()
+        hints = _task_state.get(task_id, {}).get("active_skill_hints")
+        return [dict(item) for item in hints if isinstance(item, dict)] if isinstance(hints, list) else []
+
+
+def _set_last_mutation_class(task_id: str, mutation_class: str) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        state["last_mutation_class"] = mutation_class
+        state["updated_at"] = time.time()
+
+
+def _is_allowed_docs_text_mutation(mutation: dict[str, Any], task_id: str) -> bool:
+    if mutation.get("class") != _WORK_CLASS_DOCS:
+        return False
+    targets = mutation.get("targets") or []
+    if not targets:
+        return False
+
+    skill_globs: list[str] = []
+    for hint in _get_active_skill_hints(task_id):
+        if str(hint.get("task_class", "") or "").strip().lower() != _TASK_CLASS_NON_CODING:
+            continue
+        skill_globs.extend(
+            str(item)
+            for item in (hint.get("non_code_write_globs") or [])
+            if str(item or "").strip()
+        )
+
+    for path in targets:
+        if _is_default_docs_authoring_path(path):
+            continue
+        if skill_globs and _matches_non_code_globs(path, skill_globs):
+            continue
+        return False
+    return True
+
+
+def _describe_mutation_block_reason(mutation: dict[str, Any]) -> str:
+    mutation_class = str(mutation.get("class", "") or _WORK_CLASS_UNKNOWN)
+    target_classes = set(mutation.get("target_classes") or [])
+    if mutation_class == _WORK_CLASS_BEHAVIOR:
+        return "blocked because this is behavior-changing markdown"
+    if mutation_class == _WORK_CLASS_CONFIG:
+        return "blocked because this is config or executable text that can change runtime behavior"
+    if mutation_class == _WORK_CLASS_CODE:
+        return "blocked because this targets code or code-sensitive project paths"
+    if mutation_class == _WORK_CLASS_DOCS:
+        return "blocked because this docs/text write is outside the allowed non-code authoring scope"
+    if mutation_class == _WORK_CLASS_MIXED:
+        if _WORK_CLASS_BEHAVIOR in target_classes:
+            return "blocked because this patch mixes behavior-changing markdown with other routed targets"
+        if _WORK_CLASS_CODE in target_classes and _WORK_CLASS_DOCS in target_classes:
+            return "blocked because this patch mixes docs and code targets"
+        if _WORK_CLASS_CONFIG in target_classes and _WORK_CLASS_DOCS in target_classes:
+            return "blocked because this patch mixes docs and config/executable-text targets"
+        return "blocked because this patch mixes multiple work classes and defaults to routing"
+    return "blocked because the target files could not be classified confidently"
+
+
 def _normalize_routing_lines(text: str) -> str:
     normalized_lines: list[str] = []
     for raw_line in (text or "").splitlines():
@@ -457,6 +858,18 @@ def get_session_lane_context(task_id: str) -> dict[str, str]:
             "provider": str(state.get("session_provider", "") or ""),
             "label": str(state.get("session_lane_label", "") or ""),
         }
+
+
+def get_task_class(task_id: str) -> str:
+    if not task_id:
+        return _TASK_CLASS_CODING
+    with _task_state_lock:
+        _purge_expired()
+        return str(_task_state.get(task_id, {}).get("task_class", _TASK_CLASS_CODING) or _TASK_CLASS_CODING)
+
+
+def get_active_skill_hints(task_id: str) -> list[dict[str, Any]]:
+    return _get_active_skill_hints(task_id)
 
 
 def get_route_attempts(task_id: str) -> dict[str, Any]:
@@ -789,13 +1202,75 @@ def _is_explicitly_permitted_git_terminal_command(command: str, task_id: str) ->
     )
 
 
+def _normalize_recorded_attempt(entry: dict[str, Any]) -> tuple[bool, Optional[str], int]:
+    output = str(entry.get("output", "") or "")
+    failure_kind = str(entry.get("failure_kind", "") or "").strip()
+    status = str(entry.get("status", "") or "").strip().lower()
+    try:
+        exit_code = int(entry.get("exit_code", 0) or 0)
+    except Exception:
+        exit_code = 0
+
+    if status in {"success", "failed", "timeout"}:
+        failed = status != "success"
+        if failed and not failure_kind:
+            if status == "timeout":
+                failure_kind = "timeout"
+            else:
+                failure_kind = str(_classify_routed_failure_kind(output) or "execution_failure")
+        return failed, failure_kind or None, exit_code
+
+    failed = bool(entry.get("failed"))
+    if not failed:
+        failed = exit_code != 0 or bool(_ROUTED_FAILURE_OUTPUT_RE.search(output))
+    if failed and not failure_kind:
+        failure_kind = str(_classify_routed_failure_kind(output) or ("timeout" if exit_code == 124 else "execution_failure"))
+    return failed, failure_kind or None, exit_code
+
+
 def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], result: Any) -> None:
     if (
-        tool_name not in {"terminal", "routed_exec"}
+        tool_name not in {"terminal", "routed_exec", "skill_view"}
         or not task_id
         or not isinstance(args, dict)
         or not is_active_for_task(task_id)
     ):
+        return
+
+    if tool_name == "skill_view":
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return
+
+        metadata = payload.get("metadata")
+        hermes_meta = metadata.get("hermes") if isinstance(metadata, dict) else None
+        routing_meta = hermes_meta.get("routing") if isinstance(hermes_meta, dict) else None
+        if not isinstance(routing_meta, dict):
+            return
+
+        hint = _normalize_skill_routing_hint(
+            {
+                "skill_name": payload.get("name", ""),
+                "skill_path": payload.get("path", ""),
+                "task_class": routing_meta.get("task_class", _TASK_CLASS_CODING),
+                "non_code_write_globs": routing_meta.get("non_code_write_globs", []),
+            }
+        )
+        if not isinstance(hint, dict):
+            return
+
+        with _task_state_lock:
+            _purge_expired()
+            state = _task_state.get(task_id)
+            if not state:
+                return
+            merged = _normalize_active_skill_hints([*(state.get("active_skill_hints") or []), hint])
+            state["active_skill_hints"] = merged
+            state["task_class"] = _derive_task_class(merged)
+            state["updated_at"] = time.time()
         return
 
     if tool_name == "routed_exec":
@@ -827,15 +1302,7 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
                 route_kind = str(entry.get("kind", "") or "")
                 if not route_kind:
                     continue
-                output = str(entry.get("output", "") or "")
-                failure_kind = str(entry.get("failure_kind") or "") or _classify_routed_failure_kind(output)
-                failed = bool(entry.get("failed"))
-                if not failed:
-                    exit_code = entry.get("exit_code", 0)
-                    try:
-                        failed = int(exit_code or 0) != 0 or bool(_ROUTED_FAILURE_OUTPUT_RE.search(output))
-                    except Exception:
-                        failed = True
+                failed, failure_kind, _ = _normalize_recorded_attempt(entry)
                 attempts["last_attempt_kind"] = route_kind
                 attempts["last_attempt_failed"] = failed
                 attempts["last_attempt_failure_kind"] = failure_kind if failed else None
@@ -865,13 +1332,10 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
         payload = json.loads(result) if isinstance(result, str) else result
         output = str(payload.get("output", "") or "")
         error_text = str(payload.get("error", "") or "")
-        exit_code = int(payload.get("exit_code", 1) or 0)
-        failure_kind = _classify_routed_failure_kind(output)
-        failed = (
-            bool(error_text)
-            or exit_code != 0
-            or bool(_ROUTED_FAILURE_OUTPUT_RE.search(output))
-        )
+        failed, failure_kind, exit_code = _normalize_recorded_attempt(payload)
+        failed = bool(error_text) or failed
+        if failed and not failure_kind:
+            failure_kind = _classify_routed_failure_kind(output) or "execution_failure"
     except Exception:
         failed = True
 
@@ -1100,6 +1564,61 @@ def _verification_terminal_block_reason(command: str) -> Optional[str]:
     )
 
 
+def _classify_visual_verification_command(command: str) -> Optional[str]:
+    raw = (command or "").strip()
+    if not raw:
+        return None
+
+    normalized = " ".join(raw.lower().split())
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
+    if _UNSAFE_REDIRECTION_RE.search(normalized) or _VERIFICATION_OUTPUT_PIPE_RE.search(normalized):
+        return None
+    if _classify_routed_terminal_command(normalized) is not None:
+        return None
+
+    parts = _split_shell_segments(normalized, ("&&", ";"))
+    if not parts:
+        return None
+
+    saw_preview = False
+    for part in parts:
+        if _is_read_only_terminal_command(part):
+            continue
+        candidate = _normalize_verification_segment(part)
+        try:
+            tokens = shlex.split(candidate)
+        except ValueError:
+            return None
+        if len(tokens) >= 5 and tokens[:3] in (["python", "-m", "http.server"], ["python3", "-m", "http.server"]):
+            if "--directory" in tokens or "-d" in tokens:
+                return None
+            if "--bind" not in tokens:
+                return None
+            bind_index = tokens.index("--bind")
+            if bind_index + 1 >= len(tokens) or tokens[bind_index + 1] not in {"127.0.0.1", "localhost", "::1"}:
+                return None
+            saw_preview = True
+            continue
+        if len(tokens) >= 2 and tokens[0] in {"http-server", "npx"}:
+            token_text = " ".join(tokens)
+            if token_text.startswith("npx http-server") or token_text.startswith("http-server"):
+                if "--host" in tokens:
+                    host_index = tokens.index("--host")
+                    host = tokens[host_index + 1] if host_index + 1 < len(tokens) else ""
+                elif "-a" in tokens:
+                    host_index = tokens.index("-a")
+                    host = tokens[host_index + 1] if host_index + 1 < len(tokens) else ""
+                else:
+                    host = ""
+                if host not in {"127.0.0.1", "localhost", "::1"}:
+                    return None
+                saw_preview = True
+                continue
+        return None
+
+    return "local-preview" if saw_preview else None
+
+
 def _validate_routed_codex_terminal_command(command: str) -> Optional[str]:
     raw = (command or "").strip()
     if not raw:
@@ -1220,24 +1739,6 @@ def _build_powershell_herestring(prompt: str) -> str:
     return f"@'\n{safe_prompt}\n'@"
 
 
-def _pin_routed_hermes_glm_base_url(command: str) -> str:
-    raw = (command or "").strip()
-    if _classify_routed_terminal_command(raw) != "hermes_glm_zai":
-        return raw
-
-    if _HERMES_GLM_BASE_URL_RE.search(raw):
-        return _HERMES_GLM_BASE_URL_RE.sub(
-            f"GLM_BASE_URL={_ZAI_CODING_BASE_URL}",
-            raw,
-            count=1,
-        )
-
-    hermes_idx = raw.lower().find("hermes chat")
-    if hermes_idx < 0:
-        return raw
-    return f"{raw[:hermes_idx]}GLM_BASE_URL={_ZAI_CODING_BASE_URL} {raw[hermes_idx:]}"
-
-
 def rewrite_routed_tool_args(tool_name: str, args: dict[str, Any], task_id: str) -> dict[str, Any]:
     if (
         tool_name != "terminal"
@@ -1255,9 +1756,6 @@ def rewrite_routed_tool_args(tool_name: str, args: dict[str, Any], task_id: str)
 
     rewritten = raw
     route_kind = _classify_routed_terminal_command(raw)
-
-    if route_kind == "hermes_glm_zai":
-        rewritten = _pin_routed_hermes_glm_base_url(rewritten)
 
     if "codex exec" not in raw.lower():
         if rewritten == raw:
@@ -1335,14 +1833,19 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
         )
 
     if tool_name in {"patch", "write_file"}:
+        mutation = _classify_file_mutation(tool_name, args if isinstance(args, dict) else {})
+        _set_last_mutation_class(task_id, str(mutation.get("class", _WORK_CLASS_UNKNOWN)))
+        if not routed and _is_allowed_docs_text_mutation(mutation, task_id):
+            return None
         if routed and routing_task:
             return (
                 f"Routing guard blocked native `{tool_name}` for task {task_id}: "
                 "stay on the routed model path and do not fall back to native file mutation."
             )
+        detail = _describe_mutation_block_reason(mutation)
         return (
             f"Routing guard blocked `{tool_name}` for task {task_id}: "
-            "emit a routing decision line before mutating files."
+            f"{detail}. Emit a routing decision line before mutating files."
         )
 
     if tool_name == "routed_exec":
@@ -1381,12 +1884,14 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                 return verification_issue
             if _is_verification_terminal_command(command):
                 return None
+            if _classify_visual_verification_command(command) is not None:
+                return None
             if _is_read_only_terminal_command(command):
                 return None
             return (
                 f"Routing guard blocked native `terminal` execution for task {task_id}: "
                 "after a routing decision, non-read-only shell work must stay on the routed model path. "
-                "Only routed model execution via `routed_exec`, approved verification commands, and read-only inspection commands are allowed."
+                "Only routed model execution via `routed_exec`, approved verification commands, localhost-only visual preview commands, and read-only inspection commands are allowed."
             )
         if routed:
             return None

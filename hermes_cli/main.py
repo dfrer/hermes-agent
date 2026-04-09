@@ -956,7 +956,7 @@ def select_provider_and_model(args=None):
     extended_providers = [
         ("copilot-acp", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
         ("gemini", "Google AI Studio (Gemini models — OpenAI-compatible endpoint)"),
-        ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
+        ("zai", "Z.AI / GLM (auto-detects direct and coding-plan endpoints)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
         ("minimax-cn", "MiniMax China (domestic direct API)"),
@@ -2264,7 +2264,12 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         deactivate_provider,
     )
     from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
-    from hermes_cli.models import fetch_api_models, opencode_model_api_mode, normalize_opencode_model_id
+    from hermes_cli.models import (
+        fetch_api_models,
+        opencode_model_api_mode,
+        normalize_opencode_model_id,
+        validate_requested_model,
+    )
 
     pconfig = PROVIDER_REGISTRY[provider_id]
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
@@ -2290,6 +2295,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
                 print("Cancelled.")
                 return
             save_env_value(key_env, new_key)
+            existing_key = new_key
             print("API key saved.")
             print()
     else:
@@ -2302,14 +2308,65 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         current_base = get_env_value(base_url_env) or os.getenv(base_url_env, "")
     effective_base = current_base or pconfig.inference_base_url
 
-    try:
-        override = input(f"Base URL [{effective_base}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
+    if provider_id == "zai":
+        from hermes_cli.auth import _resolve_zai_endpoint_info
+
+        zai_info = _resolve_zai_endpoint_info(
+            existing_key,
+            pconfig.inference_base_url,
+            current_base,
+            diagnose_override=True,
+        )
+        effective_base = str(zai_info.get("base_url", pconfig.inference_base_url) or pconfig.inference_base_url)
+        source_label = {
+            "env_override": "env override",
+            "cache": "cache",
+            "probe": "probe",
+            "default_fallback": "default fallback",
+        }.get(str(zai_info.get("source", "") or ""), str(zai_info.get("source", "") or ""))
+        print(f"  Effective endpoint: {zai_info.get('endpoint_label', 'Z.AI endpoint')} via {source_label}")
+        print(f"  Base URL: {effective_base}")
+        if zai_info.get("override_mismatch"):
+            print(
+                "  Note: GLM_BASE_URL is set, but this key also matches "
+                f"{zai_info.get('suggested_endpoint_label', 'a different endpoint')} "
+                f"at {zai_info.get('suggested_base_url', '')}. Clear GLM_BASE_URL to re-enable auto-detection."
+            )
         print()
-        override = ""
-    if override and base_url_env:
-        save_env_value(base_url_env, override)
-        effective_base = override
+        prompt_label = (
+            f"{base_url_env} override [Enter=keep, -=clear auto-detect, or paste custom URL]: "
+            if base_url_env
+            else "Base URL override [Enter=keep or paste custom URL]: "
+        )
+        try:
+            override = input(prompt_label).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            override = ""
+        if base_url_env:
+            if override == "-":
+                save_env_value(base_url_env, "")
+                current_base = ""
+                zai_info = _resolve_zai_endpoint_info(existing_key, pconfig.inference_base_url, "")
+                effective_base = str(zai_info.get("base_url", pconfig.inference_base_url) or pconfig.inference_base_url)
+                print(f"  Auto-detected endpoint restored → {zai_info.get('endpoint_label', 'Z.AI endpoint')} ({effective_base})")
+                print()
+            elif override:
+                save_env_value(base_url_env, override)
+                current_base = override
+                zai_info = _resolve_zai_endpoint_info(existing_key, pconfig.inference_base_url, override, diagnose_override=True)
+                effective_base = str(zai_info.get("base_url", override) or override)
+                print(f"  Using manual override → {effective_base}")
+                print()
+    else:
+        try:
+            override = input(f"Base URL [{effective_base}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            override = ""
+        if override and base_url_env:
+            save_env_value(base_url_env, override)
+            effective_base = override
 
     # Model selection — resolution order:
     #   1. models.dev registry (cached, filtered for agentic/tool-capable models)
@@ -2360,6 +2417,19 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     if selected:
         if provider_id in {"opencode-zen", "opencode-go"}:
             selected = normalize_opencode_model_id(provider_id, selected)
+
+        validation = None
+        if provider_id == "zai":
+            validation = validate_requested_model(
+                selected,
+                provider_id,
+                api_key=existing_key or (get_env_value(key_env) if key_env else ""),
+                base_url=effective_base,
+            )
+            validation_message = str((validation or {}).get("message", "") or "").strip()
+            if validation_message:
+                print(validation_message)
+                print()
 
         _save_model_choice(selected)
 

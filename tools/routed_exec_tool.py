@@ -21,6 +21,7 @@ from agent.routing_guard import (
     get_routing_decision,
     get_session_lane_context,
 )
+from hermes_cli.auth import resolve_api_key_provider_credentials
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error, tool_result
 
@@ -30,8 +31,10 @@ _DEFAULT_TIMEOUT_SECONDS = 300
 _MAX_OUTPUT_CHARS = 8_000
 _MAX_OUTPUT_EXCERPT_CHARS = 600
 _WSL_PREFIX_RE = re.compile(r"^\\\\wsl\.localhost\\([^\\]+)\\", re.IGNORECASE)
-_ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 _BYTES_LITERAL_RE = re.compile(r"""^b(?P<quote>['"]).*(?P=quote)$""", re.DOTALL)
+_ROUTED_RESULT_MARKER = "HERMES_ROUTED_RESULT:"
+_ROUTED_RESULT_RE = re.compile(rf"(?m)^\s*{re.escape(_ROUTED_RESULT_MARKER)}\s*(?P<payload>\{{.*\}})\s*$")
+_EXECUTOR_SHUTDOWN_RE = re.compile(r"(?is)_enter_buffered_busy|fatal python error.*interpreter shutdown")
 _ROUTE_TIMEOUT_SECONDS: dict[tuple[str, str], int] = {
     ("3A", "high-risk"): 1200,
     ("3B", "marathon"): 900,
@@ -53,22 +56,44 @@ def _detect_wsl_unc_prefix() -> Optional[str]:
     return f"\\\\wsl.localhost\\{match.group(1)}"
 
 
-def _resolve_host_workdir(workdir: str) -> Optional[str]:
+def _candidate_host_paths(workdir: str) -> list[Path]:
+    expanded = os.path.expanduser(str(workdir or "").strip())
+    if not expanded:
+        return []
+
+    candidates = [Path(expanded)]
+    if expanded.startswith("/"):
+        unc_prefix = _detect_wsl_unc_prefix()
+        if unc_prefix:
+            candidates.append(Path(unc_prefix + expanded.replace("/", "\\")))
+    return candidates
+
+
+def _nearest_existing_dir(path: Path) -> Optional[Path]:
+    current = path
+    while True:
+        if current.is_dir():
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _resolve_host_workdir(workdir: str) -> Optional[dict[str, str]]:
     raw = str(workdir or "").strip()
     if not raw:
         return None
 
-    expanded = os.path.expanduser(raw)
-    direct = Path(expanded)
-    if direct.is_dir():
-        return str(direct)
-
-    if expanded.startswith("/"):
-        unc_prefix = _detect_wsl_unc_prefix()
-        if unc_prefix:
-            candidate = Path(unc_prefix + expanded.replace("/", "\\"))
-            if candidate.is_dir():
-                return str(candidate)
+    for candidate in _candidate_host_paths(raw):
+        existing = _nearest_existing_dir(candidate)
+        if not existing:
+            continue
+        return {
+            "requested_workdir": os.path.expanduser(raw),
+            "resolved_workdir": str(existing),
+            "target_exists": "1" if candidate.is_dir() else "",
+        }
 
     return None
 
@@ -131,6 +156,23 @@ def _default_timeout_for_route(decision: dict[str, Any]) -> int:
     return _ROUTE_TIMEOUT_SECONDS.get((tier, path), _DEFAULT_TIMEOUT_SECONDS)
 
 
+def _build_routed_prompt(task: str, *, requested_workdir: str, resolved_workdir: str) -> str:
+    requested = str(requested_workdir or "").strip() or resolved_workdir
+    resolved = str(resolved_workdir or "").strip() or requested
+    return (
+        f"{str(task or '').strip()}\n\n"
+        "Execution context:\n"
+        f"- Requested target workdir: {requested}\n"
+        f"- Existing launch workdir: {resolved}\n"
+        "- If the requested target workdir does not exist yet, create it first and then work there.\n\n"
+        "Completion contract:\n"
+        f"- Emit exactly one final line beginning with `{_ROUTED_RESULT_MARKER}` followed by compact JSON.\n"
+        '- JSON schema: {"status":"success|failed|timeout","summary":"...","verification":"...","warnings":["..."]}\n'
+        "- Set `status` to `success` only if the requested task is actually complete.\n"
+        "- Do not wrap the final JSON line in Markdown fences.\n"
+    )
+
+
 def _write_attempt_output(task_id: str, attempt_index: int, kind: str, output: str) -> Optional[str]:
     clean = redact_sensitive_text(_normalize_captured_output(output))
     if not clean:
@@ -155,7 +197,11 @@ def _summarize_attempts(attempts: list[dict[str, Any]]) -> list[str]:
             summary.append(f"{index}. {executor}: failed ({failure_kind}, exit {exit_code})")
         else:
             exit_code = attempt.get("exit_code", 0)
-            summary.append(f"{index}. {executor}: succeeded (exit {exit_code})")
+            if attempt.get("warning_kinds"):
+                warnings = ", ".join(str(item) for item in attempt.get("warning_kinds", []))
+                summary.append(f"{index}. {executor}: succeeded with warnings ({warnings}, exit {exit_code})")
+            else:
+                summary.append(f"{index}. {executor}: succeeded (exit {exit_code})")
     return summary
 
 
@@ -170,6 +216,118 @@ def _failure_guidance(attempts: list[dict[str, Any]], default_timeout_used: bool
     return None
 
 
+def _extract_structured_routed_result(output: str) -> Optional[dict[str, Any]]:
+    matches = list(_ROUTED_RESULT_RE.finditer(str(output or "")))
+    if not matches:
+        return None
+    try:
+        payload = json.loads(matches[-1].group("payload"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status", "") or "").strip().lower()
+    if status not in {"success", "failed", "timeout"}:
+        return None
+    warnings = payload.get("warnings")
+    normalized_warnings = [str(item).strip() for item in warnings] if isinstance(warnings, list) else []
+    return {
+        "status": status,
+        "summary": str(payload.get("summary", "") or "").strip(),
+        "verification": str(payload.get("verification", "") or "").strip(),
+        "warnings": [item for item in normalized_warnings if item],
+        "failure_kind": str(payload.get("failure_kind", "") or "").strip(),
+    }
+
+
+def _classify_warning_kinds(output: str, *, structured_status: Optional[str]) -> list[str]:
+    warning_kinds: list[str] = []
+    classified = _classify_routed_failure_kind(output)
+    if structured_status == "success" and classified:
+        warning_kinds.append(classified)
+    if structured_status == "success" and _EXECUTOR_SHUTDOWN_RE.search(str(output or "")):
+        warning_kinds.append("executor_shutdown_after_success")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in warning_kinds:
+        if item and item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def _finalize_attempt(
+    *,
+    kind: str,
+    executor: str,
+    command_preview: str,
+    raw_output: str,
+    exit_code: int,
+    timed_out: bool,
+    error: str = "",
+    resolved_base_url: str = "",
+    endpoint_source: str = "",
+    endpoint_id: str = "",
+    endpoint_label: str = "",
+) -> dict[str, Any]:
+    structured = _extract_structured_routed_result(raw_output)
+    warning_kinds = _classify_warning_kinds(raw_output, structured_status=structured.get("status") if structured else None)
+    output = _truncate_output(raw_output)
+
+    status = "failed"
+    failed = True
+    failure_kind = ""
+    if timed_out:
+        status = "timeout"
+        failure_kind = "timeout"
+    elif structured:
+        status = str(structured.get("status", "") or "failed")
+        failed = status != "success"
+        if failed:
+            failure_kind = str(structured.get("failure_kind", "") or _classify_routed_failure_kind(raw_output) or "execution_failure")
+    elif error:
+        status = "failed"
+        failure_kind = "execution_failure"
+    elif int(exit_code or 0) != 0:
+        status = "failed"
+        failure_kind = str(_classify_routed_failure_kind(raw_output) or "execution_failure")
+    else:
+        status = "success"
+        failed = False
+
+    if status == "success":
+        failed = False
+        failure_kind = ""
+
+    attempt = {
+        "kind": kind,
+        "executor": executor,
+        "command_preview": command_preview,
+        "output": output,
+        "exit_code": int(exit_code),
+        "failed": failed,
+        "failure_kind": failure_kind if failed else None,
+        "timed_out": timed_out,
+        "status": status,
+        "summary": str(structured.get("summary", "") if structured else ""),
+        "verification": str(structured.get("verification", "") if structured else ""),
+        "warning_kinds": warning_kinds,
+    }
+    if error:
+        attempt["error"] = error
+    if structured and structured.get("warnings"):
+        attempt["warnings"] = list(structured["warnings"])
+    if resolved_base_url:
+        attempt["resolved_base_url"] = resolved_base_url
+    if endpoint_source:
+        attempt["endpoint_source"] = endpoint_source
+    if endpoint_id:
+        attempt["endpoint_id"] = endpoint_id
+    if endpoint_label:
+        attempt["endpoint_label"] = endpoint_label
+    return attempt
+
+
 def _command_preview(kind: str, workdir: str) -> str:
     if kind == "codex_gpt54":
         return (
@@ -182,10 +340,7 @@ def _command_preview(kind: str, workdir: str) -> str:
             '-m gpt-5.4-mini -c reasoning_effort="extra-high" -'
         )
     if kind == "hermes_glm_zai":
-        return (
-            "GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4 "
-            "hermes chat -m glm-5.1 --provider zai -q <prompt> -t terminal,file -Q"
-        )
+        return "hermes chat -m glm-5.1 --provider zai -q <prompt> -t terminal,file -Q"
     if kind == "hermes_minimax_m27":
         return "hermes chat -m MiniMax-M2.7 --provider minimax -q <prompt> -t terminal,file -Q"
     if kind == "hermes_nous_mimo_v2_pro":
@@ -217,67 +372,55 @@ def _run_codex(*, executable: str, model: str, workdir: str, host_cwd: str, prom
             timeout=timeout,
             cwd=host_cwd,
         )
-        output = _truncate_output(_combine_output(result.stdout, result.stderr))
-        failure_kind = _classify_routed_failure_kind(output)
-        failed = bool(result.returncode != 0 or failure_kind)
-        return {
-            "kind": "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            "executor": f"Codex CLI ({model})",
-            "command_preview": _command_preview(
+        return _finalize_attempt(
+            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
+            executor=f"Codex CLI ({model})",
+            command_preview=_command_preview(
                 "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
                 workdir,
             ),
-            "output": output,
-            "exit_code": int(result.returncode),
-            "failed": failed,
-            "failure_kind": failure_kind if failed else None,
-            "timed_out": False,
-        }
+            raw_output=_combine_output(result.stdout, result.stderr),
+            exit_code=int(result.returncode),
+            timed_out=False,
+        )
     except subprocess.TimeoutExpired as exc:
-        output = _truncate_output(_combine_output(exc.stdout or "", exc.stderr or ""))
-        return {
-            "kind": "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            "executor": f"Codex CLI ({model})",
-            "command_preview": _command_preview(
+        return _finalize_attempt(
+            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
+            executor=f"Codex CLI ({model})",
+            command_preview=_command_preview(
                 "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
                 workdir,
             ),
-            "output": output,
-            "exit_code": 124,
-            "failed": True,
-            "failure_kind": "timeout",
-            "timed_out": True,
-        }
+            raw_output=_combine_output(exc.stdout or "", exc.stderr or ""),
+            exit_code=124,
+            timed_out=True,
+        )
     except FileNotFoundError:
-        return {
-            "kind": "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            "executor": f"Codex CLI ({model})",
-            "command_preview": _command_preview(
+        return _finalize_attempt(
+            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
+            executor=f"Codex CLI ({model})",
+            command_preview=_command_preview(
                 "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
                 workdir,
             ),
-            "output": "",
-            "exit_code": -1,
-            "failed": True,
-            "failure_kind": "execution_failure",
-            "timed_out": False,
-            "error": f"Executable not found: {executable}",
-        }
+            raw_output="",
+            exit_code=-1,
+            timed_out=False,
+            error=f"Executable not found: {executable}",
+        )
     except Exception as exc:
-        return {
-            "kind": "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            "executor": f"Codex CLI ({model})",
-            "command_preview": _command_preview(
+        return _finalize_attempt(
+            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
+            executor=f"Codex CLI ({model})",
+            command_preview=_command_preview(
                 "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
                 workdir,
             ),
-            "output": "",
-            "exit_code": -1,
-            "failed": True,
-            "failure_kind": "execution_failure",
-            "timed_out": False,
-            "error": str(exc),
-        }
+            raw_output="",
+            exit_code=-1,
+            timed_out=False,
+            error=str(exc),
+        )
 
 
 def _run_hermes(
@@ -289,15 +432,25 @@ def _run_hermes(
     kind: str,
     model: str,
     provider: str,
-    env_overrides: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
-    if env_overrides:
-        env.update(env_overrides)
     env.setdefault("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "1")
     env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = (
         f"{env.get('HERMES_EPHEMERAL_SYSTEM_PROMPT', '').strip()}\n\n{_INNER_HERMES_EPHEMERAL_PROMPT}"
     ).strip()
+    resolved_base_url = ""
+    endpoint_source = ""
+    endpoint_id = ""
+    endpoint_label = ""
+    if provider == "zai":
+        try:
+            creds = resolve_api_key_provider_credentials("zai")
+            resolved_base_url = str(creds.get("base_url", "") or "")
+            endpoint_source = str(creds.get("endpoint_source", "") or "")
+            endpoint_id = str(creds.get("endpoint_id", "") or "")
+            endpoint_label = str(creds.get("endpoint_label", "") or "")
+        except Exception:
+            logger.debug("Failed to resolve Z.AI endpoint metadata for routed exec", exc_info=True)
     command = [
         executable,
         "chat",
@@ -320,71 +473,75 @@ def _run_hermes(
             cwd=host_cwd,
             env=env,
         )
-        output = _truncate_output(_combine_output(result.stdout, result.stderr))
-        failure_kind = _classify_routed_failure_kind(output)
-        failed = bool(result.returncode != 0 or failure_kind)
-        return {
-            "kind": kind,
-            "executor": {
+        return _finalize_attempt(
+            kind=kind,
+            executor={
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
             }.get(kind, f"Hermes CLI ({model} via {provider})"),
-            "command_preview": _command_preview(kind, host_cwd),
-            "output": output,
-            "exit_code": int(result.returncode),
-            "failed": failed,
-            "failure_kind": failure_kind if failed else None,
-            "timed_out": False,
-        }
+            command_preview=_command_preview(kind, host_cwd),
+            raw_output=_combine_output(result.stdout, result.stderr),
+            exit_code=int(result.returncode),
+            timed_out=False,
+            resolved_base_url=resolved_base_url,
+            endpoint_source=endpoint_source,
+            endpoint_id=endpoint_id,
+            endpoint_label=endpoint_label,
+        )
     except subprocess.TimeoutExpired as exc:
-        output = _truncate_output(_combine_output(exc.stdout or "", exc.stderr or ""))
-        return {
-            "kind": kind,
-            "executor": {
+        return _finalize_attempt(
+            kind=kind,
+            executor={
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
             }.get(kind, f"Hermes CLI ({model} via {provider})"),
-            "command_preview": _command_preview(kind, host_cwd),
-            "output": output,
-            "exit_code": 124,
-            "failed": True,
-            "failure_kind": "timeout",
-            "timed_out": True,
-        }
+            command_preview=_command_preview(kind, host_cwd),
+            raw_output=_combine_output(exc.stdout or "", exc.stderr or ""),
+            exit_code=124,
+            timed_out=True,
+            resolved_base_url=resolved_base_url,
+            endpoint_source=endpoint_source,
+            endpoint_id=endpoint_id,
+            endpoint_label=endpoint_label,
+        )
     except FileNotFoundError:
-        return {
-            "kind": kind,
-            "executor": {
+        return _finalize_attempt(
+            kind=kind,
+            executor={
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
             }.get(kind, f"Hermes CLI ({model} via {provider})"),
-            "command_preview": _command_preview(kind, host_cwd),
-            "output": "",
-            "exit_code": -1,
-            "failed": True,
-            "failure_kind": "execution_failure",
-            "timed_out": False,
-            "error": f"Executable not found: {executable}",
-        }
+            command_preview=_command_preview(kind, host_cwd),
+            raw_output="",
+            exit_code=-1,
+            timed_out=False,
+            error=f"Executable not found: {executable}",
+            resolved_base_url=resolved_base_url,
+            endpoint_source=endpoint_source,
+            endpoint_id=endpoint_id,
+            endpoint_label=endpoint_label,
+        )
     except Exception as exc:
-        return {
-            "kind": kind,
-            "executor": {
+        return _finalize_attempt(
+            kind=kind,
+            executor={
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
             }.get(kind, f"Hermes CLI ({model} via {provider})"),
-            "command_preview": _command_preview(kind, host_cwd),
-            "output": "",
-            "exit_code": -1,
-            "failed": True,
-            "failure_kind": "execution_failure",
-            "timed_out": False,
-            "error": str(exc),
-        }
+            command_preview=_command_preview(kind, host_cwd),
+            raw_output="",
+            exit_code=-1,
+            timed_out=False,
+            error=str(exc),
+            resolved_base_url=resolved_base_url,
+            endpoint_source=endpoint_source,
+            endpoint_id=endpoint_id,
+            endpoint_label=endpoint_label,
+        )
 
 
 def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, task_id: str = "") -> str:
@@ -400,12 +557,19 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
     if not plan:
         return tool_error("No routed execution plan is available for the current task.")
 
-    host_cwd = _resolve_host_workdir(workdir)
-    if not host_cwd:
+    workdir_info = _resolve_host_workdir(workdir)
+    if not workdir_info:
         return tool_error(
             f"Could not resolve routed_exec workdir `{workdir}` on this host. "
-            "Use an existing absolute path."
+            "Use an absolute path whose parent directory already exists."
         )
+    requested_workdir = str(workdir_info.get("requested_workdir", workdir) or workdir)
+    resolved_workdir = str(workdir_info.get("resolved_workdir", "") or "")
+    routed_prompt = _build_routed_prompt(
+        prompt,
+        requested_workdir=requested_workdir,
+        resolved_workdir=resolved_workdir,
+    )
 
     default_timeout = _default_timeout_for_route(decision)
     effective_timeout = int(timeout or default_timeout)
@@ -420,19 +584,18 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
         if kind == "hermes_glm_zai":
             attempt = _run_hermes(
                 executable=hermes_executable or "hermes",
-                host_cwd=host_cwd,
-                prompt=prompt,
+                host_cwd=resolved_workdir,
+                prompt=routed_prompt,
                 timeout=effective_timeout,
                 kind="hermes_glm_zai",
                 model="glm-5.1",
                 provider="zai",
-                env_overrides={"GLM_BASE_URL": _ZAI_CODING_BASE_URL},
             )
         elif kind == "hermes_minimax_m27":
             attempt = _run_hermes(
                 executable=hermes_executable or "hermes",
-                host_cwd=host_cwd,
-                prompt=prompt,
+                host_cwd=resolved_workdir,
+                prompt=routed_prompt,
                 timeout=effective_timeout,
                 kind="hermes_minimax_m27",
                 model="MiniMax-M2.7",
@@ -441,8 +604,8 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
         elif kind == "hermes_nous_mimo_v2_pro":
             attempt = _run_hermes(
                 executable=hermes_executable or "hermes",
-                host_cwd=host_cwd,
-                prompt=prompt,
+                host_cwd=resolved_workdir,
+                prompt=routed_prompt,
                 timeout=effective_timeout,
                 kind="hermes_nous_mimo_v2_pro",
                 model="xiaomi/mimo-v2-pro",
@@ -452,18 +615,18 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             attempt = _run_codex(
                 executable=codex_executable or "codex",
                 model="gpt-5.4",
-                workdir=workdir,
-                host_cwd=host_cwd,
-                prompt=prompt,
+                workdir=resolved_workdir,
+                host_cwd=resolved_workdir,
+                prompt=routed_prompt,
                 timeout=effective_timeout,
             )
         elif kind == "codex_gpt54mini":
             attempt = _run_codex(
                 executable=codex_executable or "codex",
                 model="gpt-5.4-mini",
-                workdir=workdir,
-                host_cwd=host_cwd,
-                prompt=prompt,
+                workdir=resolved_workdir,
+                host_cwd=resolved_workdir,
+                prompt=routed_prompt,
                 timeout=effective_timeout,
             )
         else:
@@ -499,13 +662,19 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             "route_path": decision.get("path"),
             "route_model": decision.get("model"),
             "session_lane": get_session_lane_context(task_id),
-            "workdir": workdir,
+            "workdir": requested_workdir,
+            "requested_workdir": requested_workdir,
+            "resolved_workdir": resolved_workdir,
             "timeout_seconds": effective_timeout,
             "timeout_source": "route-default" if default_timeout_used else "explicit",
             "attempt_summary": attempt_summary,
             "attempts": attempts,
             "output": str(final_attempt.get("output", "") if final_attempt else ""),
             "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
+            "status": str(final_attempt.get("status", "failed") if final_attempt else "failed"),
+            "warning_kinds": list(final_attempt.get("warning_kinds", []) if final_attempt else []),
+            "resolved_base_url": str(final_attempt.get("resolved_base_url", "") if final_attempt else ""),
+            "endpoint_source": str(final_attempt.get("endpoint_source", "") if final_attempt else ""),
             "failure_guidance": None if success else failure_guidance,
             "error": None if success else (
                 str(final_attempt.get("error", "")).strip()
@@ -545,7 +714,7 @@ ROUTED_EXEC_SCHEMA = {
             },
             "workdir": {
                 "type": "string",
-                "description": "Absolute project working directory for the routed task.",
+                "description": "Absolute project working directory or target directory for the routed task. If the target does not exist yet, routed_exec will launch from the nearest existing parent and instruct the child executor to create it.",
             },
             "timeout": {
                 "type": "integer",
