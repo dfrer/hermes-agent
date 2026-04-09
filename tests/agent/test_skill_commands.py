@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    SkillPromptPayload,
     build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
@@ -199,15 +200,39 @@ class TestBuildPreloadedSkillsPrompt:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "first-skill")
             _make_skill(tmp_path, "second-skill")
-            prompt, loaded, missing = build_preloaded_skills_prompt(
+            payload = build_preloaded_skills_prompt(
                 ["first-skill", "second-skill"]
             )
 
-        assert missing == []
-        assert loaded == ["first-skill", "second-skill"]
-        assert "first-skill" in prompt
-        assert "second-skill" in prompt
-        assert "preloaded" in prompt.lower()
+        assert payload.missing_identifiers == []
+        assert payload.loaded_skill_names == ["first-skill", "second-skill"]
+        assert "first-skill" in payload.message
+        assert "second-skill" in payload.message
+        assert "preloaded" in payload.message.lower()
+        assert payload.routing_hints == []
+
+    def test_preloaded_skill_payload_includes_explicit_routing_hints(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "llm-wiki",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    routing:\n"
+                    "      task_class: non_coding_authoring\n"
+                    "      non_code_write_globs:\n"
+                    "        - wiki/**\n"
+                ),
+            )
+            payload = build_preloaded_skills_prompt(["llm-wiki"])
+
+        assert payload.loaded_skill_names == ["llm-wiki"]
+        assert len(payload.routing_hints) == 1
+        assert payload.routing_hints[0]["skill_name"] == "llm-wiki"
+        assert payload.routing_hints[0]["skill_path"].endswith("llm-wiki\\SKILL.md")
+        assert payload.routing_hints[0]["task_class"] == "non_coding_authoring"
+        assert payload.routing_hints[0]["non_code_write_globs"] == ["wiki/**"]
 
 
 class TestDefaultPreloadedSkills:
@@ -231,13 +256,13 @@ class TestDefaultPreloadedSkills:
     def test_reports_missing_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "present-skill")
-            prompt, loaded, missing = build_preloaded_skills_prompt(
+            payload = build_preloaded_skills_prompt(
                 ["present-skill", "missing-skill"]
             )
 
-        assert "present-skill" in prompt
-        assert loaded == ["present-skill"]
-        assert missing == ["missing-skill"]
+        assert "present-skill" in payload.message
+        assert payload.loaded_skill_names == ["present-skill"]
+        assert payload.missing_identifiers == ["missing-skill"]
 
 
 class TestBuildSkillInvocationMessage:
@@ -259,26 +284,52 @@ Generate some audio.
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             scan_skill_commands()
-            msg = build_skill_invocation_message("/audiocraft-audio-generation", "compose")
+            payload = build_skill_invocation_message("/audiocraft-audio-generation", "compose")
 
-        assert msg is not None
-        assert "AudioCraft" in msg
-        assert "compose" in msg
+        assert payload is not None
+        assert "AudioCraft" in payload.message
+        assert "compose" in payload.message
 
     def test_builds_message(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "test-skill")
             scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
-        assert msg is not None
-        assert "test-skill" in msg
-        assert "do stuff" in msg
+            payload = build_skill_invocation_message("/test-skill", "do stuff")
+        assert payload is not None
+        assert "test-skill" in payload.message
+        assert "do stuff" in payload.message
 
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             scan_skill_commands()
             msg = build_skill_invocation_message("/nonexistent")
         assert msg is None
+
+    def test_invocation_payload_includes_explicit_routing_hints(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "llm-wiki",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    routing:\n"
+                    "      task_class: non_coding_authoring\n"
+                    "      non_code_write_globs:\n"
+                    "        - wiki/**\n"
+                ),
+            )
+            scan_skill_commands()
+            payload = build_skill_invocation_message("/llm-wiki", "seed it")
+
+        assert isinstance(payload, SkillPromptPayload)
+        assert payload is not None
+        assert "seed it" in payload.message
+        assert len(payload.routing_hints) == 1
+        assert payload.routing_hints[0]["skill_name"] == "llm-wiki"
+        assert payload.routing_hints[0]["skill_path"].endswith("llm-wiki\\SKILL.md")
+        assert payload.routing_hints[0]["task_class"] == "non_coding_authoring"
+        assert payload.routing_hints[0]["non_code_write_globs"] == ["wiki/**"]
 
     def test_uses_shared_skill_loader_for_secure_setup(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
@@ -312,10 +363,10 @@ Generate some audio.
                 ),
             )
             scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
+            payload = build_skill_invocation_message("/test-skill", "do stuff")
 
-        assert msg is not None
-        assert "test-skill" in msg
+        assert payload is not None
+        assert "test-skill" in payload.message
         assert len(calls) == 1
         assert calls[0][0] == "TENOR_API_KEY"
 
@@ -350,10 +401,10 @@ Generate some audio.
                     ),
                 )
                 scan_skill_commands()
-                msg = build_skill_invocation_message("/test-skill", "do stuff")
+                payload = build_skill_invocation_message("/test-skill", "do stuff")
 
-        assert msg is not None
-        assert "local cli" in msg.lower()
+        assert payload is not None
+        assert "local cli" in payload.message.lower()
 
     def test_preserves_remaining_remote_setup_warning(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
@@ -376,10 +427,10 @@ Generate some audio.
                 ),
             )
             scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
+            payload = build_skill_invocation_message("/test-skill", "do stuff")
 
-        assert msg is not None
-        assert "remote environment" in msg.lower()
+        assert payload is not None
+        assert "remote environment" in payload.message.lower()
 
     def test_supporting_file_hint_uses_file_path_argument(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -388,10 +439,10 @@ Generate some audio.
             references.mkdir()
             (references / "api.md").write_text("reference")
             scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
+            payload = build_skill_invocation_message("/test-skill", "do stuff")
 
-        assert msg is not None
-        assert 'file_path="<path>"' in msg
+        assert payload is not None
+        assert 'file_path="<path>"' in payload.message
 
 
 class TestPlanSkillHelpers:
@@ -411,7 +462,7 @@ class TestPlanSkillHelpers:
                 body="Save plans under .hermes/plans in the active workspace and do not execute the work.",
             )
             scan_skill_commands()
-            msg = build_skill_invocation_message(
+            payload = build_skill_invocation_message(
                 "/plan",
                 "Add a /plan command",
                 runtime_note=(
@@ -420,9 +471,9 @@ class TestPlanSkillHelpers:
                 ),
             )
 
-        assert msg is not None
-        assert "Save plans under $HERMES_HOME/plans" not in msg
-        assert ".hermes/plans" in msg
-        assert "Add a /plan command" in msg
-        assert ".hermes/plans/plan.md" in msg
-        assert "Runtime note:" in msg
+        assert payload is not None
+        assert "Save plans under $HERMES_HOME/plans" not in payload.message
+        assert ".hermes/plans" in payload.message
+        assert "Add a /plan command" in payload.message
+        assert ".hermes/plans/plan.md" in payload.message
+        assert "Runtime note:" in payload.message

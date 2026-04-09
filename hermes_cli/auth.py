@@ -368,6 +368,107 @@ ZAI_ENDPOINTS = [
 ]
 
 
+def _normalize_base_url(base_url: str) -> str:
+    return (base_url or "").strip().rstrip("/")
+
+
+def _zai_key_hash(api_key: str) -> str:
+    return hashlib.sha256((api_key or "").encode()).hexdigest()[:16]
+
+
+def _describe_zai_endpoint(base_url: str, *, fallback_label: str = "Custom override") -> Dict[str, str]:
+    normalized = _normalize_base_url(base_url)
+    for ep_id, ep_base_url, model, label in ZAI_ENDPOINTS:
+        if normalized == _normalize_base_url(ep_base_url):
+            return {
+                "endpoint_id": ep_id,
+                "endpoint_label": label,
+                "probe_model": model,
+            }
+    return {
+        "endpoint_id": "custom",
+        "endpoint_label": fallback_label,
+        "probe_model": "",
+    }
+
+
+def _resolve_zai_endpoint_info(
+    api_key: str,
+    default_url: str,
+    env_override: str,
+    *,
+    timeout: float = 8.0,
+    diagnose_override: bool = False,
+) -> Dict[str, str]:
+    """Resolve the effective Z.AI endpoint and describe how it was chosen."""
+
+    default_base = _normalize_base_url(default_url)
+    override_base = _normalize_base_url(env_override)
+    if override_base:
+        details = _describe_zai_endpoint(override_base)
+        resolved = {
+            "base_url": override_base,
+            "source": "env_override",
+            "endpoint_id": details["endpoint_id"],
+            "endpoint_label": details["endpoint_label"],
+            "probe_model": details["probe_model"],
+        }
+        if diagnose_override and api_key:
+            detected = detect_zai_endpoint(api_key, timeout=timeout)
+            if detected and _normalize_base_url(str(detected.get("base_url", ""))) != override_base:
+                resolved["override_mismatch"] = "1"
+                resolved["suggested_base_url"] = _normalize_base_url(str(detected.get("base_url", "")))
+                resolved["suggested_endpoint_id"] = str(detected.get("id", "") or "")
+                resolved["suggested_endpoint_label"] = str(detected.get("label", "") or "")
+                resolved["suggested_probe_model"] = str(detected.get("model", "") or "")
+        return resolved
+
+    auth_store = _load_auth_store()
+    state = _load_provider_state(auth_store, "zai") or {}
+    cached = state.get("detected_endpoint")
+    if isinstance(cached, dict) and cached.get("base_url"):
+        if cached.get("key_hash", "") == _zai_key_hash(api_key):
+            cached_base = _normalize_base_url(str(cached.get("base_url", "")))
+            details = _describe_zai_endpoint(cached_base, fallback_label=str(cached.get("label", "") or "Cached endpoint"))
+            return {
+                "base_url": cached_base,
+                "source": "cache",
+                "endpoint_id": str(cached.get("endpoint_id", "") or details["endpoint_id"]),
+                "endpoint_label": str(cached.get("label", "") or details["endpoint_label"]),
+                "probe_model": str(cached.get("model", "") or details["probe_model"]),
+            }
+
+    detected = detect_zai_endpoint(api_key, timeout=timeout)
+    if detected and detected.get("base_url"):
+        detected_base = _normalize_base_url(str(detected.get("base_url", "")))
+        state["detected_endpoint"] = {
+            "base_url": detected_base,
+            "endpoint_id": str(detected.get("id", "") or ""),
+            "model": str(detected.get("model", "") or ""),
+            "label": str(detected.get("label", "") or ""),
+            "key_hash": _zai_key_hash(api_key),
+        }
+        _save_provider_state(auth_store, "zai", state)
+        logger.info("Z.AI: auto-detected endpoint %s (%s)", detected.get("label", ""), detected_base)
+        return {
+            "base_url": detected_base,
+            "source": "probe",
+            "endpoint_id": str(detected.get("id", "") or ""),
+            "endpoint_label": str(detected.get("label", "") or ""),
+            "probe_model": str(detected.get("model", "") or ""),
+        }
+
+    details = _describe_zai_endpoint(default_base, fallback_label="Default fallback")
+    logger.debug("Z.AI: probe failed, falling back to default %s", default_base)
+    return {
+        "base_url": default_base,
+        "source": "default_fallback",
+        "endpoint_id": details["endpoint_id"],
+        "endpoint_label": details["endpoint_label"],
+        "probe_model": details["probe_model"],
+    }
+
+
 def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str, str]]:
     """Probe z.ai endpoints to find one that accepts this API key.
 
@@ -412,37 +513,7 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
     key.  The detected endpoint is cached in provider state (auth.json) keyed
     on a hash of the API key so subsequent starts skip the probe.
     """
-    if env_override:
-        return env_override
-
-    # Check provider-state cache for a previously-detected endpoint.
-    auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "zai") or {}
-    cached = state.get("detected_endpoint")
-    if isinstance(cached, dict) and cached.get("base_url"):
-        key_hash = cached.get("key_hash", "")
-        if key_hash == hashlib.sha256(api_key.encode()).hexdigest()[:16]:
-            logger.debug("Z.AI: using cached endpoint %s", cached["base_url"])
-            return cached["base_url"]
-
-    # Probe — may take up to ~8s per endpoint.
-    detected = detect_zai_endpoint(api_key)
-    if detected and detected.get("base_url"):
-        # Persist the detection result keyed on the API key hash.
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
-        state["detected_endpoint"] = {
-            "base_url": detected["base_url"],
-            "endpoint_id": detected.get("id", ""),
-            "model": detected.get("model", ""),
-            "label": detected.get("label", ""),
-            "key_hash": key_hash,
-        }
-        _save_provider_state(auth_store, "zai", state)
-        logger.info("Z.AI: auto-detected endpoint %s (%s)", detected["label"], detected["base_url"])
-        return detected["base_url"]
-
-    logger.debug("Z.AI: probe failed, falling back to default %s", default_url)
-    return default_url
+    return _resolve_zai_endpoint_info(api_key, default_url, env_override).get("base_url", default_url)
 
 
 # =============================================================================
@@ -2102,21 +2173,36 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
+    endpoint_source = ""
+    endpoint_id = ""
+    endpoint_label = ""
+    probe_model = ""
     if provider_id == "kimi-coding":
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
     elif provider_id == "zai":
-        base_url = _resolve_zai_base_url(api_key, pconfig.inference_base_url, env_url)
+        endpoint_info = _resolve_zai_endpoint_info(api_key, pconfig.inference_base_url, env_url)
+        base_url = endpoint_info.get("base_url", pconfig.inference_base_url)
+        endpoint_source = str(endpoint_info.get("source", "") or "")
+        endpoint_id = str(endpoint_info.get("endpoint_id", "") or "")
+        endpoint_label = str(endpoint_info.get("endpoint_label", "") or "")
+        probe_model = str(endpoint_info.get("probe_model", "") or "")
     elif env_url:
         base_url = env_url.rstrip("/")
     else:
         base_url = pconfig.inference_base_url
 
-    return {
+    resolved = {
         "provider": provider_id,
         "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "source": key_source or "default",
     }
+    if provider_id == "zai":
+        resolved["endpoint_source"] = endpoint_source
+        resolved["endpoint_id"] = endpoint_id
+        resolved["endpoint_label"] = endpoint_label
+        resolved["probe_model"] = probe_model
+    return resolved
 
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:

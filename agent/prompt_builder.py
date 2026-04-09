@@ -768,19 +768,14 @@ def build_skills_system_prompt(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If one clearly matches your task, "
-            "load it with skill_view(name) and follow its instructions. "
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
+            "## Skills\n"
+            "Use a skill when one clearly matches the task. "
+            "Load it with skill_view(name) and follow its instructions. "
+            "If no skill clearly matches, proceed normally.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "If none match, proceed normally without loading a skill."
+            "</available_skills>"
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

@@ -5,9 +5,11 @@ import json
 from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
+    get_active_skill_hints,
     get_routed_execution_plan,
     get_routing_decision,
     get_session_lane_context,
+    get_task_class,
     get_verification_attempts,
     has_route_lock,
     pre_tool_call_block_reason,
@@ -22,7 +24,244 @@ def test_blocks_file_mutation_before_routing_decision():
     try:
         reason = pre_tool_call_block_reason("patch", {"path": "demo.py"}, task_id)
         assert reason is not None
-        assert "emit a routing decision line" in reason
+        assert "routing decision line" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_non_code_markdown_write_before_routing_decision():
+    task_id = "task-routing-doc-write"
+    activate_for_task(task_id, session_id="session-doc-write", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "write_file",
+                {"path": "/home/hunter/wiki/entities/societies-game.md", "content": "# Societies\n"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_non_code_markdown_patch_before_routing_decision():
+    task_id = "task-routing-doc-patch"
+    activate_for_task(task_id, session_id="session-doc-patch", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "patch",
+                {
+                    "mode": "replace",
+                    "path": "/home/hunter/wiki/index.md",
+                    "old_string": "old",
+                    "new_string": "new",
+                },
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_non_code_v4a_patch_before_routing_decision():
+    task_id = "task-routing-doc-v4a"
+    activate_for_task(task_id, session_id="session-doc-v4a", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "patch",
+                {
+                    "mode": "patch",
+                    "patch": "*** Begin Patch\n*** Add File: /home/hunter/wiki/concepts/model-routing-system.md\n+test\n*** End Patch\n",
+                },
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_readme_edit_before_routing_decision():
+    task_id = "task-routing-readme-write"
+    activate_for_task(task_id, session_id="session-readme-write", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "write_file",
+                {"path": "/home/hunter/project/README.md", "content": "# Project\n"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_changelog_edit_before_routing_decision():
+    task_id = "task-routing-changelog-write"
+    activate_for_task(task_id, session_id="session-changelog-write", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "write_file",
+                {"path": "/home/hunter/project/CHANGELOG.md", "content": "## 1.2.3\n"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_behavior_markdown_before_routing_decision():
+    task_id = "task-routing-behavior-markdown"
+    activate_for_task(task_id, session_id="session-behavior-markdown", skills=["routing-layer"])
+    try:
+        for path in ("/home/hunter/.hermes/SOUL.md", "/home/hunter/project/AGENTS.md", "/home/hunter/.hermes/skills/foo/SKILL.md"):
+            reason = pre_tool_call_block_reason(
+                "write_file",
+                {"path": path, "content": "changed"},
+                task_id,
+            )
+            assert reason is not None
+            assert "behavior-changing markdown" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_config_and_executable_text_before_routing_decision():
+    task_id = "task-routing-config-text"
+    activate_for_task(task_id, session_id="session-config-text", skills=["routing-layer"])
+    try:
+        for path in (
+            "/home/hunter/project/package.json",
+            "/home/hunter/project/config.yaml",
+            "/home/hunter/project/schema.sql",
+            "/home/hunter/project/build.ps1",
+            "/home/hunter/project/Directory.Build.props",
+            "/home/hunter/project/Societies.csproj",
+        ):
+            reason = pre_tool_call_block_reason(
+                "write_file",
+                {"path": path, "content": "changed"},
+                task_id,
+            )
+            assert reason is not None
+            assert "config or executable text" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_docs_patch_under_code_sensitive_root_before_routing():
+    task_id = "task-routing-docs-in-src"
+    activate_for_task(task_id, session_id="session-docs-in-src", skills=["routing-layer"])
+    try:
+        reason = pre_tool_call_block_reason(
+            "patch",
+            {
+                "mode": "replace",
+                "path": "/home/hunter/project/src/README.md",
+                "old_string": "old",
+                "new_string": "new",
+            },
+            task_id,
+        )
+        assert reason is not None
+        assert "code or code-sensitive project paths" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_mixed_docs_and_code_v4a_patch_before_routing():
+    task_id = "task-routing-mixed-v4a"
+    activate_for_task(task_id, session_id="session-mixed-v4a", skills=["routing-layer"])
+    try:
+        reason = pre_tool_call_block_reason(
+            "patch",
+            {
+                "mode": "patch",
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Add File: /home/hunter/project/docs/notes.md\n"
+                    "+doc\n"
+                    "*** Add File: /home/hunter/project/src/app.py\n"
+                    "+print('x')\n"
+                    "*** End Patch\n"
+                ),
+            },
+            task_id,
+        )
+        assert reason is not None
+        assert "mixes docs and code targets" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_skill_scoped_plan_write_before_routing():
+    task_id = "task-routing-plan-skill"
+    activate_for_task(
+        task_id,
+        session_id="session-plan-skill",
+        skills=["routing-layer"],
+        active_skill_hints=[
+            {
+                "skill_name": "plan",
+                "task_class": "non_coding_authoring",
+                "non_code_write_globs": [".hermes/plans/**", "**/.hermes/plans/**"],
+            }
+        ],
+    )
+    try:
+        assert get_task_class(task_id) == "non_coding_authoring"
+        assert (
+            pre_tool_call_block_reason(
+                "write_file",
+                {"path": "/home/hunter/project/.hermes/plans/next-pass.md", "content": "# Plan\n"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_skill_view_updates_active_skill_hints_mid_task():
+    task_id = "task-routing-skill-view-update"
+    activate_for_task(task_id, session_id="session-skill-view-update", skills=["routing-layer"])
+    try:
+        record_tool_result(
+            task_id,
+            "skill_view",
+            {"name": "llm-wiki"},
+            json.dumps(
+                {
+                    "success": True,
+                    "name": "llm-wiki",
+                    "path": "/home/hunter/.hermes/skills/research/llm-wiki/SKILL.md",
+                    "metadata": {
+                        "hermes": {
+                            "routing": {
+                                "task_class": "non_coding_authoring",
+                                "non_code_write_globs": ["wiki/**"],
+                            }
+                        }
+                    },
+                }
+            ),
+        )
+        assert get_task_class(task_id) == "non_coding_authoring"
+        assert get_active_skill_hints(task_id) == [
+            {
+                "skill_name": "llm-wiki",
+                "skill_path": "/home/hunter/.hermes/skills/research/llm-wiki/SKILL.md",
+                "task_class": "non_coding_authoring",
+                "non_code_write_globs": ["wiki/**"],
+            }
+        ]
     finally:
         deactivate_for_task(task_id)
 
@@ -59,6 +298,27 @@ def test_allows_file_mutation_after_routing_decision():
         assert recorded is True
         assert has_route_lock(task_id) is True
         blocked = pre_tool_call_block_reason("write_file", {"path": "demo.py"}, task_id)
+        assert blocked is not None
+        assert "native `write_file`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_native_docs_write_after_routing_decision():
+    task_id = "task-routing-docs-after-route"
+    activate_for_task(task_id, session_id="session-docs-after-route", skills=["routing-layer"])
+    try:
+        recorded = record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: docs plus implementation | CONFIDENCE: high",
+            session_id="session-docs-after-route",
+        )
+        assert recorded is True
+        blocked = pre_tool_call_block_reason(
+            "write_file",
+            {"path": "/home/hunter/project/README.md", "content": "# still routed\n"},
+            task_id,
+        )
         assert blocked is not None
         assert "native `write_file`" in blocked
     finally:
@@ -672,8 +932,8 @@ def test_tier_3b_requires_primary_before_codex_backup():
         deactivate_for_task(task_id)
 
 
-def test_tier_3b_backup_unlocks_when_primary_failure_only_appears_in_output():
-    task_id = "task-routing-3b-primary-output-failure"
+def test_tier_3b_does_not_unlock_backup_when_primary_reports_structured_success():
+    task_id = "task-routing-3b-primary-structured-success"
     activate_for_task(task_id, session_id="session-3b-output-failure", skills=["routing-layer"])
     try:
         record_routing_decision(
@@ -696,14 +956,15 @@ def test_tier_3b_backup_unlocks_when_primary_failure_only_appears_in_output():
                             "executor": "Hermes CLI (glm-5.1 via zai)",
                             "output": "HTTP 429: Insufficient balance or no resource package. Please recharge.",
                             "exit_code": 0,
-                            "failed": True,
-                            "failure_kind": "quota_exhausted",
+                            "status": "success",
+                            "warning_kinds": ["quota_exhausted"],
                         }
                     ]
                 }
             ),
         )
         assert get_routed_execution_plan(task_id) == [
+            {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
         ]
     finally:
@@ -750,6 +1011,29 @@ def test_blocks_routed_hermes_output_truncation_pipe():
         )
         assert blocked is not None
         assert "use `routed_exec`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_local_visual_preview_command_after_route_lock():
+    task_id = "task-routing-local-preview"
+    activate_for_task(task_id, session_id="session-local-preview", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-local-preview",
+        )
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {
+                    "command": "cd /home/hunter/societies && python3 -m http.server 8765 --bind 127.0.0.1",
+                },
+                task_id,
+            )
+            is None
+        )
     finally:
         deactivate_for_task(task_id)
 

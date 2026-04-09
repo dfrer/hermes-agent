@@ -23,6 +23,7 @@ from hermes_cli.auth import (
     get_auth_status,
     AuthError,
     KIMI_CODE_BASE_URL,
+    _resolve_zai_endpoint_info,
     _try_gh_cli_token,
     _resolve_kimi_base_url,
 )
@@ -523,8 +524,13 @@ class TestRuntimeProviderResolution:
 
         monkeypatch.setattr("hermes_cli.runtime_provider.load_pool", lambda provider: _Pool())
         monkeypatch.setattr(
-            "hermes_cli.runtime_provider.auth_mod._resolve_zai_base_url",
-            lambda api_key, default_url, env_url: "https://api.z.ai/api/coding/paas/v4",
+            "hermes_cli.runtime_provider.auth_mod._resolve_zai_endpoint_info",
+            lambda api_key, default_url, env_url: {
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "source": "probe",
+                "endpoint_id": "coding-global",
+                "endpoint_label": "Global (Coding Plan)",
+            },
         )
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -533,6 +539,7 @@ class TestRuntimeProviderResolution:
 
         assert result["provider"] == "zai"
         assert result["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+        assert result["endpoint_source"] == "probe"
 
     def test_runtime_kimi(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
@@ -910,6 +917,46 @@ class TestZaiEndpointAutoDetect:
         creds = resolve_api_key_provider_credentials("zai")
         assert creds["base_url"] == "https://custom.example/v4"
         assert not probe_called
+
+    def test_zai_resolution_returns_endpoint_metadata(self, monkeypatch):
+        monkeypatch.setenv("GLM_API_KEY", "glm-key")
+        monkeypatch.setattr(
+            "hermes_cli.auth.detect_zai_endpoint",
+            lambda *a, **kw: {
+                "id": "coding-global",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "model": "glm-4.7",
+                "label": "Global (Coding Plan)",
+            },
+        )
+        creds = resolve_api_key_provider_credentials("zai")
+        assert creds["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+        assert creds["endpoint_source"] == "probe"
+        assert creds["endpoint_id"] == "coding-global"
+        assert creds["endpoint_label"] == "Global (Coding Plan)"
+        assert creds["probe_model"] == "glm-4.7"
+
+    def test_zai_override_diagnosis_reports_working_detected_endpoint(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.detect_zai_endpoint",
+            lambda *a, **kw: {
+                "id": "coding-global",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "model": "glm-4.7",
+                "label": "Global (Coding Plan)",
+            },
+        )
+        info = _resolve_zai_endpoint_info(
+            "glm-key",
+            "https://api.z.ai/api/paas/v4",
+            "https://custom.example/v4",
+            diagnose_override=True,
+        )
+        assert info["base_url"] == "https://custom.example/v4"
+        assert info["source"] == "env_override"
+        assert info["override_mismatch"] == "1"
+        assert info["suggested_base_url"] == "https://api.z.ai/api/coding/paas/v4"
+        assert info["suggested_endpoint_label"] == "Global (Coding Plan)"
 
     def test_no_key_skips_probe(self, monkeypatch):
         """Without an API key, no probe should occur."""

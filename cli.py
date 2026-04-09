@@ -1541,6 +1541,8 @@ class HermesCLI:
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
+        self.preloaded_skill_hints: list[dict[str, Any]] = []
+        self._pending_turn_skill_hints: list[dict[str, Any]] = []
         self._startup_skills_line_shown = False
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
@@ -2445,6 +2447,7 @@ class HermesCLI:
 
                 fallback_model=self._fallback_model,
                 preloaded_skills=self.preloaded_skills,
+                preloaded_skill_hints=self.preloaded_skill_hints,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
@@ -4686,14 +4689,15 @@ class HermesCLI:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
-                msg = build_skill_invocation_message(
+                payload = build_skill_invocation_message(
                     base_cmd, user_instruction, task_id=self.session_id
                 )
-                if msg:
+                if payload and payload.message:
                     skill_name = _skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
+                    self._pending_turn_skill_hints.extend(payload.routing_hints)
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(payload.message)
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -4745,7 +4749,7 @@ class HermesCLI:
         user_instruction = parts[1].strip() if len(parts) > 1 else ""
 
         plan_path = build_plan_path(user_instruction)
-        msg = build_skill_invocation_message(
+        payload = build_skill_invocation_message(
             "/plan",
             user_instruction,
             task_id=self.session_id,
@@ -4755,13 +4759,14 @@ class HermesCLI:
             ),
         )
 
-        if not msg:
+        if not payload or not payload.message:
             ChatConsole().print("[bold red]Failed to load the bundled /plan skill[/]")
             return
 
         _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path}")
+        self._pending_turn_skill_hints.extend(payload.routing_hints)
         if hasattr(self, '_pending_input'):
-            self._pending_input.put(msg)
+            self._pending_input.put(payload.message)
         else:
             ChatConsole().print("[bold red]Plan mode unavailable: input queue not initialized[/]")
     
@@ -6572,6 +6577,10 @@ class HermesCLI:
             def run_agent():
                 nonlocal result
                 agent_message = _voice_prefix + message if _voice_prefix else message
+                turn_skill_hints = list(self.preloaded_skill_hints)
+                if self._pending_turn_skill_hints:
+                    turn_skill_hints.extend(self._pending_turn_skill_hints)
+                    self._pending_turn_skill_hints = []
                 # Prepend pending model switch note so the model knows about the switch
                 _msn = getattr(self, '_pending_model_switch_note', None)
                 if _msn:
@@ -6584,6 +6593,7 @@ class HermesCLI:
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=message if _voice_prefix else None,
+                        active_skill_hints=turn_skill_hints,
                     )
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
@@ -8644,19 +8654,23 @@ def main(
     )
 
     if combined_skills:
-        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+        skill_payload = build_preloaded_skills_prompt(
             combined_skills,
             task_id=cli.session_id,
         )
+        skills_prompt = skill_payload.message
+        loaded_skills = skill_payload.loaded_skill_names
+        missing_skills = skill_payload.missing_identifiers
         explicit_missing = [skill_name for skill_name in missing_skills if skill_name in parsed_skills]
         if explicit_missing:
             missing_display = ", ".join(explicit_missing)
             raise ValueError(f"Unknown skill(s): {missing_display}")
+        cli.preloaded_skills = loaded_skills
+        cli.preloaded_skill_hints = skill_payload.routing_hints
         if skills_prompt:
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
-            cli.preloaded_skills = loaded_skills
 
     # Inject worktree context into agent's system prompt
     if wt_info:

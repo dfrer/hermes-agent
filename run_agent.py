@@ -484,6 +484,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         preloaded_skills: List[str] | None = None,
+        preloaded_skill_hints: List[Dict[str, Any]] | None = None,
         persist_session: bool = True,
     ):
         """
@@ -549,6 +550,7 @@ class AIAgent:
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self.preloaded_skills = list(preloaded_skills or [])
+        self.preloaded_skill_hints = [dict(item) for item in (preloaded_skill_hints or []) if isinstance(item, dict)]
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -6882,6 +6884,7 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        active_skill_hints: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -6897,7 +6900,8 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
-                    or queuing follow-up prefetch work.
+            active_skill_hints: Optional structured routing hints from
+                preloaded or user-invoked skills active for this turn.
 
         Returns:
             Dict: Complete conversation result with final response and message history
@@ -6937,6 +6941,7 @@ class AIAgent:
                     user_message=persist_user_message or user_message or "",
                     session_model=self.model or "",
                     session_provider=self.provider or "",
+                    active_skill_hints=active_skill_hints or self.preloaded_skill_hints,
                 )
             except Exception:
                 logger.debug("Failed to activate routing guard for task %s", effective_task_id, exc_info=True)

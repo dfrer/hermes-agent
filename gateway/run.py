@@ -2083,7 +2083,7 @@ class GatewayRunner:
 
                 user_instruction = event.get_command_args().strip()
                 plan_path = build_plan_path(user_instruction)
-                event.text = build_skill_invocation_message(
+                payload = build_skill_invocation_message(
                     "/plan",
                     user_instruction,
                     task_id=_quick_key,
@@ -2092,8 +2092,10 @@ class GatewayRunner:
                         f"inside the active workspace/backend cwd: {plan_path}"
                     ),
                 )
-                if not event.text:
+                if not payload or not payload.message:
                     return "Failed to load the bundled /plan skill."
+                event.text = payload.message
+                setattr(event, "_routing_skill_hints", list(payload.routing_hints))
                 canonical = None
             except Exception as e:
                 logger.exception("Failed to prepare /plan command")
@@ -2238,11 +2240,12 @@ class GatewayRunner:
                                 f"Enable it with: `hermes skills config`"
                             )
                     user_instruction = event.get_command_args().strip()
-                    msg = build_skill_invocation_message(
+                    payload = build_skill_invocation_message(
                         cmd_key, user_instruction, task_id=_quick_key
                     )
-                    if msg:
-                        event.text = msg
+                    if payload and payload.message:
+                        event.text = payload.message
+                        setattr(event, "_routing_skill_hints", list(payload.routing_hints))
                         # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
@@ -6594,6 +6597,7 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             session_preloaded_skills: list[str] = []
+            session_preloaded_skill_hints: list[dict[str, Any]] = []
             try:
                 from agent.skill_commands import (
                     build_preloaded_skills_prompt,
@@ -6602,10 +6606,13 @@ class GatewayRunner:
 
                 session_preloaded_skills = get_default_preloaded_skills()
                 if session_preloaded_skills:
-                    skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+                    skill_payload = build_preloaded_skills_prompt(
                         session_preloaded_skills,
                         task_id=session_id,
                     )
+                    skills_prompt = skill_payload.message
+                    loaded_skills = skill_payload.loaded_skill_names
+                    missing_skills = skill_payload.missing_identifiers
                     if missing_skills:
                         logger.debug(
                             "[Gateway] Missing default preloaded skills for session %s: %s",
@@ -6613,6 +6620,7 @@ class GatewayRunner:
                             ", ".join(missing_skills),
                         )
                     session_preloaded_skills = loaded_skills
+                    session_preloaded_skill_hints = list(skill_payload.routing_hints)
                     if skills_prompt:
                         combined_ephemeral = "\n\n".join(
                             part for part in (skills_prompt, combined_ephemeral) if part
@@ -6718,6 +6726,7 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                     preloaded_skills=session_preloaded_skills,
+                    preloaded_skill_hints=session_preloaded_skill_hints,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -6904,7 +6913,18 @@ class GatewayRunner:
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                turn_skill_hints = list(session_preloaded_skill_hints)
+                turn_skill_hints.extend(
+                    hint
+                    for hint in getattr(event, "_routing_skill_hints", []) or []
+                    if isinstance(hint, dict)
+                )
+                result = agent.run_conversation(
+                    message,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                    active_skill_hints=turn_skill_hints,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
