@@ -31,6 +31,30 @@ def test_to_runtime_posix_path_translates_wsl_unc():
     assert rau._to_runtime_posix_path(unc) == "/home/hunter/.hermes/hermes-agent"
 
 
+def test_git_push_disables_terminal_prompts(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        return _ok_completed(args)
+
+    monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
+    monkeypatch.setattr(rau, "_run_subprocess", fake_run)
+
+    rau._git(tmp_path, "push", rau.PUSH_REMOTE, f"{rau.LIVE_BRANCH}:{rau.LIVE_BRANCH}", check=False)
+
+    assert captured["args"] == [
+        "git",
+        "-C",
+        str(tmp_path),
+        "push",
+        rau.PUSH_REMOTE,
+        f"{rau.LIVE_BRANCH}:{rau.LIVE_BRANCH}",
+    ]
+    assert captured["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
 def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_home, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

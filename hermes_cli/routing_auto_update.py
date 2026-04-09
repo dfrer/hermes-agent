@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import re
 import shutil
@@ -263,7 +264,11 @@ def _git(
     base = ["git"]
     if cwd is None:
         base.extend(["-C", str(repo_root)])
-    return _run_subprocess(base + list(args), cwd=cwd, check=check)
+    env = None
+    if args and args[0] == "push":
+        env = os.environ.copy()
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return _run_subprocess(base + list(args), cwd=cwd, check=check, env=env)
 
 
 def _git_output(repo_root: Path, *args: str, cwd: Path | None = None) -> str:
