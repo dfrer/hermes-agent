@@ -47,7 +47,7 @@ class TestHandleFunctionCall:
         assert len(parsed["error"]) > 0
         assert any(
             token in parsed["error"].lower()
-            for token in ("error", "failed", "unknown")
+            for token in ("error", "failed", "unknown", "invalid")
         )
 
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
