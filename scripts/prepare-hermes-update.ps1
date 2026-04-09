@@ -6,10 +6,13 @@ param(
     [switch]$Apply,
     [switch]$Rebase,
     [string]$UpdateBranchPrefix = "codex/upstream-sync",
-    [string]$WorktreePath
+    [string]$WorktreePath,
+    [switch]$Json,
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = "Stop"
+$structuredOutput = $Json -or $PassThru
 
 if (-not $RepoRoot) {
     $scriptPath = $MyInvocation.MyCommand.Path
@@ -62,9 +65,11 @@ if (-not $branchName) {
     throw "Could not determine current branch."
 }
 
-Write-Host "Hermes repo: $RepoRoot"
-Write-Host "Current branch: $branchName"
-Write-Host "Fetching $Remote..."
+if (-not $structuredOutput) {
+    Write-Host "Hermes repo: $RepoRoot"
+    Write-Host "Current branch: $branchName"
+    Write-Host "Fetching $Remote..."
+}
 Invoke-Git @("fetch", $Remote, "--prune")
 
 $behindAhead = Get-GitOutput @("rev-list", "--left-right", "--count", "$branchName...$Remote/$BaseBranch")
@@ -72,11 +77,37 @@ $counts = $behindAhead -split "\s+"
 $ahead = if ($counts.Length -ge 1) { [int]$counts[0] } else { 0 }
 $behind = if ($counts.Length -ge 2) { [int]$counts[1] } else { 0 }
 
-Write-Host "Compared with ${Remote}/${BaseBranch}:"
-Write-Host "  Ahead:  $ahead"
-Write-Host "  Behind: $behind"
+$result = [ordered]@{
+    repo_root = $RepoRoot
+    current_branch = $branchName
+    remote = $Remote
+    base_branch = $BaseBranch
+    ahead = $ahead
+    behind = $behind
+    apply = [bool]$Apply
+    rebase = [bool]$Rebase
+    update_branch = $null
+    worktree_path = $null
+    integration_action = if ($Rebase) { "rebase" } else { "merge" }
+    integration_target = "$Remote/$BaseBranch"
+    status = if ($Apply) { "pending" } else { "dry_run" }
+}
+
+if (-not $structuredOutput) {
+    Write-Host "Compared with ${Remote}/${BaseBranch}:"
+    Write-Host "  Ahead:  $ahead"
+    Write-Host "  Behind: $behind"
+}
 
 if (-not $Apply) {
+    if ($Json) {
+        $result | ConvertTo-Json -Depth 4
+        return
+    }
+    if ($PassThru) {
+        [pscustomobject]$result
+        return
+    }
     Write-Host ""
     Write-Host "Dry run only. To create a disposable update worktree:"
     Write-Host "  powershell -ExecutionPolicy Bypass -File .\\scripts\\prepare-hermes-update.ps1 -Apply"
@@ -98,9 +129,11 @@ if (Test-Path $WorktreePath) {
     throw "Worktree path already exists: $WorktreePath"
 }
 
-Write-Host "Creating update worktree:"
-Write-Host "  Branch:  $updateBranch"
-Write-Host "  Path:    $WorktreePath"
+if (-not $structuredOutput) {
+    Write-Host "Creating update worktree:"
+    Write-Host "  Branch:  $updateBranch"
+    Write-Host "  Path:    $WorktreePath"
+}
 
 Invoke-Git @("worktree", "add", "-b", $updateBranch, $WorktreePath, $branchName)
 
@@ -109,6 +142,19 @@ $integrationArgs = if ($Rebase) {
 }
 else {
     @("merge", "--no-ff", "$Remote/$BaseBranch")
+}
+
+$result.update_branch = $updateBranch
+$result.worktree_path = $WorktreePath
+$result.status = "created"
+
+if ($Json) {
+    $result | ConvertTo-Json -Depth 4
+    return
+}
+if ($PassThru) {
+    [pscustomobject]$result
+    return
 }
 
 Write-Host ""

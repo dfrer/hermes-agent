@@ -2,10 +2,13 @@
 param(
     [string]$RepoRoot = "",
     [string]$BackupRoot = "",
-    [string]$BaseRef = "origin/main"
+    [string]$BaseRef = "origin/main",
+    [switch]$Json,
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = "Stop"
+$structuredOutput = $Json -or $PassThru
 
 if (-not $RepoRoot) {
     $scriptPath = $MyInvocation.MyCommand.Path
@@ -128,5 +131,27 @@ $manifest = @{
     )
 }
 $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath $manifestPath -Encoding utf8
+
+$result = [ordered]@{
+    backup_dir = $dest
+    manifest_path = $manifestPath
+    repo_root = $RepoRoot
+    branch = $branch
+    head = $head
+    short_head = $shortHead
+    base_ref = $BaseRef
+    commit_count = $commitList.Count
+    policy_history_repo = $policyHistoryRepo
+    policy_history_head = $policyHistoryHead
+}
+
+if ($Json) {
+    $result | ConvertTo-Json -Depth 6
+    return
+}
+if ($PassThru) {
+    [pscustomobject]$result
+    return
+}
 
 Write-Host "Routing backup exported to: $dest"

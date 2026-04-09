@@ -2,10 +2,13 @@
 param(
     [string]$HermesHome = "",
     [string]$HistoryRepo = "",
-    [string]$Message = ""
+    [string]$Message = "",
+    [switch]$Json,
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = "Stop"
+$structuredOutput = $Json -or $PassThru
 
 if (-not $HermesHome) {
     $scriptPath = $MyInvocation.MyCommand.Path
@@ -92,11 +95,25 @@ if (-not $status.Trim()) {
     } catch {
         $resolvedHead = ""
     }
-    if ($resolvedHead) {
-        Write-Host "Routing policy history already up to date at $HistoryRepo ($resolvedHead)"
-    } else {
-        Write-Host "Routing policy history already up to date at $HistoryRepo"
+    $result = [ordered]@{
+        status = "noop"
+        history_repo = $HistoryRepo
+        head = $resolvedHead
+        message = if ($resolvedHead) {
+            "Routing policy history already up to date at $HistoryRepo ($resolvedHead)"
+        } else {
+            "Routing policy history already up to date at $HistoryRepo"
+        }
     }
+    if ($Json) {
+        $result | ConvertTo-Json -Depth 4
+        return
+    }
+    if ($PassThru) {
+        [pscustomobject]$result
+        return
+    }
+    Write-Host $result.message
     exit 0
 }
 
@@ -107,4 +124,20 @@ if (-not $Message) {
 Invoke-HistoryGit @("commit", "-m", $Message) | Out-Null
 
 $head = Invoke-HistoryGit @("rev-parse", "--short=8", "HEAD")
-Write-Host "Routing policy history synced to: $HistoryRepo ($head)"
+$result = [ordered]@{
+    status = "updated"
+    history_repo = $HistoryRepo
+    head = $head
+    message = "Routing policy history synced to: $HistoryRepo ($head)"
+}
+
+if ($Json) {
+    $result | ConvertTo-Json -Depth 4
+    return
+}
+if ($PassThru) {
+    [pscustomobject]$result
+    return
+}
+
+Write-Host $result.message
