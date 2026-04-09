@@ -230,7 +230,7 @@ class TestBuildPreloadedSkillsPrompt:
         assert payload.loaded_skill_names == ["llm-wiki"]
         assert len(payload.routing_hints) == 1
         assert payload.routing_hints[0]["skill_name"] == "llm-wiki"
-        assert payload.routing_hints[0]["skill_path"].endswith("llm-wiki\\SKILL.md")
+        assert payload.routing_hints[0]["skill_path"].replace("\\", "/").endswith("llm-wiki/SKILL.md")
         assert payload.routing_hints[0]["task_class"] == "non_coding_authoring"
         assert payload.routing_hints[0]["non_code_write_globs"] == ["wiki/**"]
 
@@ -327,7 +327,7 @@ Generate some audio.
         assert "seed it" in payload.message
         assert len(payload.routing_hints) == 1
         assert payload.routing_hints[0]["skill_name"] == "llm-wiki"
-        assert payload.routing_hints[0]["skill_path"].endswith("llm-wiki\\SKILL.md")
+        assert payload.routing_hints[0]["skill_path"].replace("\\", "/").endswith("llm-wiki/SKILL.md")
         assert payload.routing_hints[0]["task_class"] == "non_coding_authoring"
         assert payload.routing_hints[0]["non_code_write_globs"] == ["wiki/**"]
 
