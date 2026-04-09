@@ -39,6 +39,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
     "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
     "WECOM_BOT_ID", "WECOM_SECRET",
+    "BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
@@ -569,7 +570,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 12,
+    "_config_version": 13,
 }
 
 # =============================================================================
@@ -1125,6 +1126,27 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "BLUEBUBBLES_SERVER_URL": {
+        "description": "BlueBubbles server URL for iMessage integration (e.g. http://192.168.1.10:1234)",
+        "prompt": "BlueBubbles server URL",
+        "url": "https://bluebubbles.app/",
+        "password": False,
+        "category": "messaging",
+    },
+    "BLUEBUBBLES_PASSWORD": {
+        "description": "BlueBubbles server password (from BlueBubbles Server → Settings → API)",
+        "prompt": "BlueBubbles server password",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+    },
+    "BLUEBUBBLES_ALLOWED_USERS": {
+        "description": "Comma-separated iMessage addresses (email or phone) allowed to use the bot",
+        "prompt": "Allowed iMessage addresses (comma-separated)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+    },
     "GATEWAY_ALLOW_ALL_USERS": {
         "description": "Allow all users to interact with messaging bots (true/false). Default: false.",
         "prompt": "Allow all users (true/false)",
@@ -1196,7 +1218,7 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
     "SUDO_PASSWORD": {
-        "description": "Sudo password for terminal commands requiring root access",
+        "description": "Sudo password for terminal commands requiring root access; set to an explicit empty string to try empty without prompting",
         "prompt": "Sudo password",
         "url": None,
         "password": True,
@@ -1679,6 +1701,21 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     for key in list(providers_dict.keys())[-migrated_count:]:
                         ep = providers_dict[key]
                         print(f"    → {key}: {ep.get('api', '')}")
+
+    # ── Version 12 → 13: clear dead LLM_MODEL / OPENAI_MODEL from .env ──
+    # These env vars were written by the old setup wizard but nothing reads
+    # them anymore (config.yaml is the sole source of truth since March 2026).
+    # Stale entries cause user confusion — see issue report.
+    if current_ver < 13:
+        for dead_var in ("LLM_MODEL", "OPENAI_MODEL"):
+            try:
+                old_val = get_env_value(dead_var)
+                if old_val:
+                    save_env_value(dead_var, "")
+                    if not quiet:
+                        print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
+            except Exception:
+                pass
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")
