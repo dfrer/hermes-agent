@@ -267,6 +267,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- `visual_context`, `browser_vision`, and `vision_analyze` are read-only local-lane context tools, not route archetypes or routed implementation paths.\n"
     "- For UI, web, screenshot, canvas, layout, responsive, or visual QA work, use visual context before implementation or final verification when text/DOM inspection is likely insufficient.\n"
     "- For local file/localhost visual previews, use a local browser backend; if browser SSRF protection blocks a local URL, do not keep retrying equivalent local URL forms.\n"
+    "- For animated, WebGL, video, or otherwise expensive local pages, prefer `visual_context` with `cleanup_after=true` or call `browser_close` immediately after `browser_vision` so the page does not keep consuming CPU/GPU.\n"
     "- If a routing decision has already been emitted for the current coding task, keep that route stable.\n"
     "- Do not silently change from `3A` to `3B`/`3C` or vice versa during ordinary investigation.\n"
     "- If a completed routed execution reveals a distinct follow-up coding fix that needs a different route in the same turn, use an explicit `RECLASSIFY:` routing line before the next `routed_exec` call.\n"

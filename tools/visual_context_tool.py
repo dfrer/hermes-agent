@@ -111,6 +111,15 @@ VISUAL_CONTEXT_SCHEMA = {
                 "default": True,
                 "description": "For browser source, include current console/errors.",
             },
+            "cleanup_after": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "For browser source, close the browser session after capture. "
+                    "Use this for local animated, WebGL, video, or other expensive pages "
+                    "so they do not keep consuming CPU/GPU after visual inspection."
+                ),
+            },
         },
         "required": ["source", "question"],
     },
@@ -126,6 +135,7 @@ async def visual_context_tool(
     annotate: bool = True,
     include_snapshot: bool = True,
     include_console: bool = True,
+    cleanup_after: bool = False,
     task_id: Optional[str] = None,
     user_task: Optional[str] = None,
 ) -> str:
@@ -198,6 +208,7 @@ async def visual_context_tool(
 
     from tools.browser_tool import (
         browser_console,
+        browser_close,
         browser_navigate,
         browser_snapshot,
         browser_vision,
@@ -226,6 +237,19 @@ async def visual_context_tool(
         )
 
     browser_details: dict[str, Any] = {}
+
+    def _browser_result(result: dict[str, Any]) -> str:
+        if cleanup_after:
+            try:
+                result.setdefault("browser", {})["cleanup"] = _json_or_text(
+                    browser_close(task_id=task_id)
+                )
+            except Exception as exc:
+                result.setdefault("warnings", []).append(
+                    f"browser cleanup failed: {exc}"
+                )
+        return json.dumps(result, ensure_ascii=False)
+
     clean_url = str(url or "").strip()
     if clean_url:
         navigation_payload = _json_or_text(
@@ -233,7 +257,7 @@ async def visual_context_tool(
         )
         browser_details["navigation"] = navigation_payload
         if isinstance(navigation_payload, dict) and navigation_payload.get("success") is False:
-            return json.dumps(
+            return _browser_result(
                 {
                     "success": False,
                     "source": "browser",
@@ -243,7 +267,6 @@ async def visual_context_tool(
                     "browser": _truncate_nested_text(browser_details),
                     "warnings": warnings,
                 },
-                ensure_ascii=False,
             )
 
     if include_snapshot:
@@ -282,7 +305,7 @@ async def visual_context_tool(
     }
     if isinstance(vision_payload, dict) and vision_payload.get("screenshot_path"):
         result["screenshot_path"] = vision_payload["screenshot_path"]
-    return json.dumps(result, ensure_ascii=False)
+    return _browser_result(result)
 
 
 def _handle_visual_context(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
@@ -294,6 +317,7 @@ def _handle_visual_context(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         annotate=args.get("annotate", True),
         include_snapshot=args.get("include_snapshot", True),
         include_console=args.get("include_console", True),
+        cleanup_after=args.get("cleanup_after", False),
         task_id=kw.get("task_id"),
         user_task=kw.get("user_task"),
     )

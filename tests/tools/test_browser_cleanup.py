@@ -1,5 +1,6 @@
 """Regression tests for browser session cleanup and screenshot recovery."""
 
+import json
 from unittest.mock import patch
 
 
@@ -64,6 +65,15 @@ class TestBrowserCleanup:
         assert "task-1" not in browser_tool._session_last_activity
         mock_stop.assert_called_once_with("task-1")
         mock_run.assert_called_once_with("task-1", "close", [], timeout=10)
+
+    def test_browser_close_returns_success_and_cleans_task(self):
+        browser_tool = self.browser_tool
+
+        with patch("tools.browser_tool.cleanup_browser") as mock_cleanup:
+            result = json.loads(browser_tool.browser_close("task-1"))
+
+        assert result == {"success": True, "closed": True}
+        mock_cleanup.assert_called_once_with("task-1")
 
     def test_cleanup_camofox_managed_persistence_skips_close(self):
         """When camofox mode + managed persistence, soft_cleanup fires instead of close."""

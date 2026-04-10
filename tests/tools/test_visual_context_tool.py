@@ -94,7 +94,9 @@ async def test_browser_source_collects_visual_snapshot_and_console():
                 }
             ),
         ) as mock_browser_vision,
+        patch("tools.browser_tool.browser_close") as mock_browser_close,
     ):
+        mock_browser_close.return_value = json.dumps({"success": True, "closed": True})
         result = json.loads(
             await visual_context_tool(
                 "browser",
@@ -116,6 +118,48 @@ async def test_browser_source_collects_visual_snapshot_and_console():
     mock_snapshot.assert_called_once_with(full=False, task_id="task-1", user_task="visual QA")
     mock_console.assert_called_once_with(clear=False, task_id="task-1")
     assert mock_browser_vision.call_args.kwargs["annotate"] is True
+    mock_browser_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_browser_source_can_cleanup_after_capture():
+    from tools.visual_context_tool import visual_context_tool
+
+    with (
+        patch("tools.visual_context_tool._vision_capability_error", return_value=None),
+        patch("tools.browser_tool.check_browser_requirements", return_value=True),
+        patch(
+            "tools.browser_tool.browser_navigate",
+            return_value=json.dumps({"success": True, "url": "http://127.0.0.1:3000"}),
+        ),
+        patch(
+            "tools.browser_tool.browser_snapshot",
+            return_value=json.dumps({"success": True, "content": "canvas"}),
+        ),
+        patch(
+            "tools.browser_tool.browser_console",
+            return_value=json.dumps({"success": True, "total_errors": 0}),
+        ),
+        patch(
+            "tools.browser_tool.browser_vision",
+            return_value=json.dumps({"success": True, "analysis": "Looks stable."}),
+        ),
+        patch("tools.browser_tool.browser_close") as mock_browser_close,
+    ):
+        mock_browser_close.return_value = json.dumps({"success": True, "closed": True})
+        result = json.loads(
+            await visual_context_tool(
+                "browser",
+                "Does the page look ready?",
+                url="http://127.0.0.1:3000",
+                cleanup_after=True,
+                task_id="task-visual-heavy",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["browser"]["cleanup"]["closed"] is True
+    mock_browser_close.assert_called_once_with(task_id="task-visual-heavy")
 
 
 @pytest.mark.asyncio
@@ -137,21 +181,26 @@ async def test_browser_source_stops_when_navigation_fails():
         patch("tools.browser_tool.browser_snapshot") as mock_snapshot,
         patch("tools.browser_tool.browser_console") as mock_console,
         patch("tools.browser_tool.browser_vision") as mock_browser_vision,
+        patch("tools.browser_tool.browser_close") as mock_browser_close,
     ):
+        mock_browser_close.return_value = json.dumps({"success": True, "closed": True})
         result = json.loads(
             await visual_context_tool(
                 "browser",
                 "Does the page look ready?",
                 url="http://127.0.0.1:3000",
+                cleanup_after=True,
             )
         )
 
     assert result["success"] is False
     assert "local browser backend" in result["error"]
     assert result["browser"]["navigation"]["success"] is False
+    assert result["browser"]["cleanup"]["closed"] is True
     mock_snapshot.assert_not_called()
     mock_console.assert_not_called()
     mock_browser_vision.assert_not_called()
+    mock_browser_close.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -619,7 +619,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_close",
-        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up cloud browser session quota.",
+        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up cloud browser session quota and stop local pages, animations, WebGL, video, or audio from continuing to consume CPU/GPU.",
         "parameters": {
             "type": "object",
             "properties": {},
@@ -1486,6 +1486,16 @@ def browser_back(task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
 
+def browser_close(task_id: Optional[str] = None) -> str:
+    """Close the active browser session for this task and release resources."""
+    effective_task_id = task_id or "default"
+    cleanup_browser(effective_task_id)
+    return json.dumps({
+        "success": True,
+        "closed": True,
+    }, ensure_ascii=False)
+
+
 def browser_press(key: str, task_id: Optional[str] = None) -> str:
     """
     Press a keyboard key.
@@ -2194,6 +2204,14 @@ registry.register(
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="◀️",
+)
+registry.register(
+    name="browser_close",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_close"],
+    handler=lambda args, **kw: browser_close(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="🛑",
 )
 registry.register(
     name="browser_press",
