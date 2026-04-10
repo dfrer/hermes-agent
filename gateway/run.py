@@ -482,6 +482,7 @@ class GatewayRunner:
         self._prefill_messages = self._load_prefill_messages()
         self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
         self._reasoning_config = self._load_reasoning_config()
+        self._service_tier = self._load_service_tier()
         self._show_reasoning = self._load_show_reasoning()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -513,12 +514,6 @@ class GatewayRunner:
         import threading as _threading
         self._agent_cache: Dict[str, tuple] = {}
         self._agent_cache_lock = _threading.Lock()
-
-        # Track active fallback model/provider when primary is rate-limited.
-        # Set after an agent run where fallback was activated; cleared when
-        # the primary model succeeds again or the user switches via /model.
-        self._effective_model: Optional[str] = None
-        self._effective_provider: Optional[str] = None
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
@@ -781,7 +776,8 @@ class GatewayRunner:
         )
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        from agent.routing_policy import resolve_primary_turn_route
+        from agent.smart_model_routing import resolve_turn_route
+        from hermes_cli.models import resolve_fast_mode_overrides
 
         primary = {
             "model": model,
@@ -793,7 +789,19 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        return resolve_primary_turn_route(primary)
+        route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+
+        service_tier = getattr(self, "_service_tier", None)
+        if not service_tier:
+            route["request_overrides"] = None
+            return route
+
+        try:
+            overrides = resolve_fast_mode_overrides(route.get("model"))
+        except Exception:
+            overrides = None
+        route["request_overrides"] = overrides
+        return route
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -946,6 +954,33 @@ class GatewayRunner:
         return result
 
     @staticmethod
+    def _load_service_tier() -> str | None:
+        """Load Priority Processing setting from config.yaml.
+
+        Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
+        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
+        Returns None when unset or unsupported.
+        """
+        raw = ""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                raw = str(cfg.get("agent", {}).get("service_tier", "") or "").strip()
+        except Exception:
+            pass
+
+        value = raw.lower()
+        if not value or value in {"normal", "default", "standard", "off", "none"}:
+            return None
+        if value in {"fast", "priority", "on"}:
+            return "priority"
+        logger.warning("Unknown service_tier '%s', ignoring", raw)
+        return None
+
+    @staticmethod
     def _load_show_reasoning() -> bool:
         """Load show_reasoning toggle from config.yaml display section."""
         try:
@@ -1061,6 +1096,7 @@ class GatewayRunner:
                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
                        "FEISHU_ALLOWED_USERS",
                        "WECOM_ALLOWED_USERS",
+                       "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
@@ -1073,6 +1109,7 @@ class GatewayRunner:
                        "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
                        "FEISHU_ALLOW_ALL_USERS",
                        "WECOM_ALLOW_ALL_USERS",
+                       "WEIXIN_ALLOW_ALL_USERS",
                        "BLUEBUBBLES_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
@@ -1614,6 +1651,13 @@ class GatewayRunner:
                 return None
             return WeComAdapter(config)
 
+        elif platform == Platform.WEIXIN:
+            from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
+            if not check_weixin_requirements():
+                logger.warning("Weixin: aiohttp/cryptography not installed")
+                return None
+            return WeixinAdapter(config)
+
         elif platform == Platform.MATTERMOST:
             from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
             if not check_mattermost_requirements():
@@ -1689,6 +1733,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -1704,6 +1749,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
         }
 
@@ -1983,6 +2029,11 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
+            # /background must bypass the running-agent guard — it starts a
+            # parallel task and must never interrupt the active conversation.
+            if _cmd_def_inner and _cmd_def_inner.name == "background":
+                return await self._handle_background_command(event)
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
                 adapter = self.adapters.get(source.platform)
@@ -2063,6 +2114,9 @@ class GatewayRunner:
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
+
+        if canonical == "fast":
+            return await self._handle_fast_command(event)
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
@@ -2409,37 +2463,41 @@ class GatewayRunner:
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 
-        # Auto-load skill for DM topic bindings (e.g., Telegram Private Chat Topics)
-        # Only inject on NEW sessions — for ongoing conversations the skill content
-        # is already in the conversation history from the first message.
-        if _is_new_session and getattr(event, "auto_skill", None):
+        # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
+        # Discord channel_skill_bindings).  Supports a single name or ordered list.
+        # Only inject on NEW sessions — ongoing conversations already have the
+        # skill content in their conversation history from the first message.
+        _auto = getattr(event, "auto_skill", None)
+        if _is_new_session and _auto:
+            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _skill_name = event.auto_skill
-                _loaded = _load_skill_payload(_skill_name, task_id=_quick_key)
-                if _loaded:
-                    _loaded_skill, _skill_dir, _display_name = _loaded
-                    _activation_note = (
-                        f'[SYSTEM: This conversation is in a topic with the "{_display_name}" skill '
-                        f"auto-loaded. Follow its instructions for the duration of this session.]"
-                    )
-                    _skill_msg = _build_skill_message(
-                        _loaded_skill, _skill_dir, _activation_note,
-                        user_instruction=event.text,
-                    )
-                    if _skill_msg:
-                        event.text = _skill_msg
-                        logger.info(
-                            "[Gateway] Auto-loaded skill '%s' for DM topic session %s",
-                            _skill_name, session_key,
+                _combined_parts: list[str] = []
+                _loaded_names: list[str] = []
+                for _sname in _skill_names:
+                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
+                    if _loaded:
+                        _loaded_skill, _skill_dir, _display_name = _loaded
+                        _note = (
+                            f'[SYSTEM: The "{_display_name}" skill is auto-loaded. '
+                            f"Follow its instructions for this session.]"
                         )
-                else:
-                    logger.warning(
-                        "[Gateway] DM topic skill '%s' not found in available skills",
-                        _skill_name,
+                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
+                        if _part:
+                            _combined_parts.append(_part)
+                            _loaded_names.append(_sname)
+                    else:
+                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
+                if _combined_parts:
+                    # Append the user's original text after all skill payloads
+                    _combined_parts.append(event.text)
+                    event.text = "\n\n".join(_combined_parts)
+                    logger.info(
+                        "[Gateway] Auto-loaded skill(s) %s for session %s",
+                        _loaded_names, session_key,
                     )
             except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load topic skill '%s': %s", event.auto_skill, e)
+                logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
@@ -3536,6 +3594,7 @@ class GatewayRunner:
         current_base_url = ""
         current_api_key = ""
         user_provs = None
+        custom_provs = None
         config_path = _hermes_home / "config.yaml"
         try:
             if config_path.exists():
@@ -3547,6 +3606,7 @@ class GatewayRunner:
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
+                custom_provs = cfg.get("custom_providers")
         except Exception:
             pass
 
@@ -3574,6 +3634,7 @@ class GatewayRunner:
                     providers = list_authenticated_providers(
                         current_provider=current_provider,
                         user_providers=user_provs,
+                        custom_providers=custom_provs,
                         max_models=50,
                     )
                 except Exception:
@@ -3601,6 +3662,8 @@ class GatewayRunner:
                             current_api_key=_cur_api_key,
                             is_global=False,
                             explicit_provider=provider_slug,
+                            user_providers=user_provs,
+                            custom_providers=custom_provs,
                         )
                         if not result.success:
                             return f"Error: {result.error_message}"
@@ -3679,6 +3742,7 @@ class GatewayRunner:
                 providers = list_authenticated_providers(
                     current_provider=current_provider,
                     user_providers=user_provs,
+                    custom_providers=custom_provs,
                     max_models=5,
                 )
                 for p in providers:
@@ -3708,6 +3772,8 @@ class GatewayRunner:
             current_api_key=current_api_key,
             is_global=persist_global,
             explicit_provider=explicit_provider,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
         )
 
         if not result.success:
@@ -3829,6 +3895,7 @@ class GatewayRunner:
 
         # Resolve current provider from config
         current_provider = "openrouter"
+        model_cfg = {}
         config_path = _hermes_home / 'config.yaml'
         try:
             if config_path.exists():
@@ -4569,6 +4636,7 @@ class GatewayRunner:
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
+            self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             def run_sync():
@@ -4580,6 +4648,8 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -4729,6 +4799,7 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
             reasoning_config = self._load_reasoning_config()
+            self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
             pr = self._provider_routing
 
@@ -4755,6 +4826,8 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=[],
                     reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -4908,15 +4981,82 @@ class GatewayRunner:
         else:
             return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
 
-    async def _handle_yolo_command(self, event: MessageEvent) -> str:
-        """Handle /yolo — toggle dangerous command approval bypass."""
-        current = bool(os.environ.get("HERMES_YOLO_MODE"))
-        if current:
-            os.environ.pop("HERMES_YOLO_MODE", None)
-            return "⚠️ YOLO mode **OFF** — dangerous commands will require approval."
+    async def _handle_fast_command(self, event: MessageEvent) -> str:
+        """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
+        import yaml
+        from hermes_cli.models import model_supports_fast_mode
+
+        args = event.get_command_args().strip().lower()
+        config_path = _hermes_home / "config.yaml"
+        self._service_tier = self._load_service_tier()
+
+        user_config = _load_gateway_config()
+        model = _resolve_gateway_model(user_config)
+        if not model_supports_fast_mode(model):
+            return "⚡ /fast is only available for OpenAI models that support Priority Processing."
+
+        def _save_config_key(key_path: str, value):
+            """Save a dot-separated key to config.yaml."""
+            try:
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                keys = key_path.split(".")
+                current = user_config
+                for k in keys[:-1]:
+                    if k not in current or not isinstance(current[k], dict):
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = value
+                atomic_yaml_write(config_path, user_config)
+                return True
+            except Exception as e:
+                logger.error("Failed to save config key %s: %s", key_path, e)
+                return False
+
+        if not args or args == "status":
+            status = "fast" if self._service_tier == "priority" else "normal"
+            return (
+                "⚡ Priority Processing\n\n"
+                f"Current mode: `{status}`\n\n"
+                "_Usage:_ `/fast <normal|fast|status>`"
+            )
+
+        if args in {"fast", "on"}:
+            self._service_tier = "priority"
+            saved_value = "fast"
+            label = "FAST"
+        elif args in {"normal", "off"}:
+            self._service_tier = None
+            saved_value = "normal"
+            label = "NORMAL"
         else:
-            os.environ["HERMES_YOLO_MODE"] = "1"
-            return "⚡ YOLO mode **ON** — all commands auto-approved. Use with caution."
+            return (
+                f"⚠️ Unknown argument: `{args}`\n\n"
+                "**Valid options:** normal, fast, status"
+            )
+
+        if _save_config_key("agent.service_tier", saved_value):
+            return f"⚡ ✓ Priority Processing: **{label}** (saved to config)\n_(takes effect on next message)_"
+        return f"⚡ ✓ Priority Processing: **{label}** (this session only)"
+
+    async def _handle_yolo_command(self, event: MessageEvent) -> str:
+        """Handle /yolo — toggle dangerous command approval bypass for this session only."""
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            is_session_yolo_enabled,
+        )
+
+        session_key = self._session_key_for_source(event.source)
+        current = is_session_yolo_enabled(session_key)
+        if current:
+            disable_session_yolo(session_key)
+            return "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
+        else:
+            enable_session_yolo(session_key)
+            return "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.
@@ -5264,27 +5404,76 @@ class GatewayRunner:
         )
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
-        """Handle /usage command -- show token usage for the session's last agent run."""
+        """Handle /usage command -- show token usage for the current session.
+
+        Checks both _running_agents (mid-turn) and _agent_cache (between turns)
+        so that rate limits, cost estimates, and detailed token breakdowns are
+        available whenever the user asks, not only while the agent is running.
+        """
         source = event.source
         session_key = self._session_key_for_source(source)
 
+        # Try running agent first (mid-turn), then cached agent (between turns)
         agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
 
-            # Rate limits first (when available from provider headers)
+            # Rate limits (when available from provider headers)
             rl_state = agent.get_rate_limit_state()
             if rl_state and rl_state.has_data:
                 from agent.rate_limit_tracker import format_rate_limit_compact
                 lines.append(f"⏱️ **Rate Limits:** {format_rate_limit_compact(rl_state)}")
                 lines.append("")
 
-            # Session token usage
+            # Session token usage — detailed breakdown matching CLI
+            input_tokens = getattr(agent, "session_input_tokens", 0) or 0
+            output_tokens = getattr(agent, "session_output_tokens", 0) or 0
+            cache_read = getattr(agent, "session_cache_read_tokens", 0) or 0
+            cache_write = getattr(agent, "session_cache_write_tokens", 0) or 0
+
             lines.append("📊 **Session Token Usage**")
-            lines.append(f"Prompt (input): {agent.session_prompt_tokens:,}")
-            lines.append(f"Completion (output): {agent.session_completion_tokens:,}")
+            lines.append(f"Model: `{agent.model}`")
+            lines.append(f"Input tokens: {input_tokens:,}")
+            if cache_read:
+                lines.append(f"Cache read tokens: {cache_read:,}")
+            if cache_write:
+                lines.append(f"Cache write tokens: {cache_write:,}")
+            lines.append(f"Output tokens: {output_tokens:,}")
             lines.append(f"Total: {agent.session_total_tokens:,}")
             lines.append(f"API calls: {agent.session_api_calls}")
+
+            # Cost estimation
+            try:
+                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+                cost_result = estimate_usage_cost(
+                    agent.model,
+                    CanonicalUsage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_read_tokens=cache_read,
+                        cache_write_tokens=cache_write,
+                    ),
+                    provider=getattr(agent, "provider", None),
+                    base_url=getattr(agent, "base_url", None),
+                )
+                if cost_result.amount_usd is not None:
+                    prefix = "~" if cost_result.status == "estimated" else ""
+                    lines.append(f"Cost: {prefix}${float(cost_result.amount_usd):.4f}")
+                elif cost_result.status == "included":
+                    lines.append("Cost: included")
+            except Exception:
+                pass
+
+            # Context window and compressions
             ctx = agent.context_compressor
             if ctx.last_prompt_tokens:
                 pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
@@ -5294,7 +5483,7 @@ class GatewayRunner:
 
             return "\n".join(lines)
 
-        # No running agent -- check session history for a rough count
+        # No agent at all -- check session history for a rough count
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
@@ -5305,7 +5494,7 @@ class GatewayRunner:
                 f"📊 **Session Info**\n"
                 f"Messages: {len(msgs)}\n"
                 f"Estimated context: ~{approx:,} tokens\n"
-                f"_(Detailed usage available during active conversations)_"
+                f"_(Detailed usage available after the first agent response)_"
             )
         return "No usage data available for this session."
 
@@ -5533,7 +5722,7 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.BLUEBUBBLES, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.LOCAL,
     })
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
@@ -6032,16 +6221,14 @@ class GatewayRunner:
                 return f"{disabled_note}\n\n{user_text}"
             return disabled_note
 
-        from tools.transcription_tools import transcribe_audio, get_stt_model_from_config
+        from tools.transcription_tools import transcribe_audio
         import asyncio
-
-        stt_model = get_stt_model_from_config()
 
         enriched_parts = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path, model=stt_model)
+                result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
                     enriched_parts.append(
@@ -6272,6 +6459,32 @@ class GatewayRunner:
             default=str,
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    def _apply_session_model_override(
+        self, session_key: str, model: str, runtime_kwargs: dict
+    ) -> tuple:
+        """Apply /model session overrides if present, returning (model, runtime_kwargs).
+
+        The gateway /model command stores per-session overrides in
+        ``_session_model_overrides``.  These must take precedence over
+        config.yaml defaults so the switched model is actually used for
+        subsequent messages.  Fields with ``None`` values are skipped so
+        partial overrides don't clobber valid config defaults.
+        """
+        override = self._session_model_overrides.get(session_key)
+        if not override:
+            return model, runtime_kwargs
+        model = override.get("model", model)
+        for key in ("provider", "api_key", "base_url", "api_mode"):
+            val = override.get(key)
+            if val is not None:
+                runtime_kwargs[key] = val
+        return model, runtime_kwargs
+
+    def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
+        """Return True if *agent_model* matches an active /model session override."""
+        override = self._session_model_overrides.get(session_key)
+        return override is not None and override.get("model") == agent_model
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc)."""
@@ -6683,9 +6896,15 @@ class GatewayRunner:
                     "tools": [],
                 }
 
+            # /model overrides take precedence over config.yaml defaults.
+            model, runtime_kwargs = self._apply_session_model_override(
+                session_key, model, runtime_kwargs
+            )
+
             pr = self._provider_routing
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
+            self._service_tier = self._load_service_tier()
             # Set up streaming consumer if enabled
             _stream_consumer = None
             _stream_delta_cb = None
@@ -6748,6 +6967,8 @@ class GatewayRunner:
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -6774,6 +6995,8 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.service_tier = self._service_tier
+            agent.request_overrides = turn_route.get("request_overrides")
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
@@ -7325,16 +7548,10 @@ class GatewayRunner:
             _agent = agent_holder[0]
             if _agent is not None and hasattr(_agent, 'model'):
                 _cfg_model = _resolve_gateway_model()
-                if _agent.model != _cfg_model:
-                    self._effective_model = _agent.model
-                    self._effective_provider = getattr(_agent, 'provider', None)
+                if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
                     # Fallback activated — evict cached agent so the next
                     # message starts fresh and retries the primary model.
                     self._evict_cached_agent(session_key)
-                else:
-                    # Primary model worked — clear any stale fallback state
-                    self._effective_model = None
-                    self._effective_provider = None
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
@@ -7542,7 +7759,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
     import time as _time
-    from gateway.status import get_running_pid, remove_pid_file
+    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
@@ -7551,10 +7768,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 existing_pid,
             )
             try:
-                os.kill(existing_pid, signal.SIGTERM)
+                terminate_pid(existing_pid, force=False)
             except ProcessLookupError:
                 pass  # Already gone
-            except PermissionError:
+            except (PermissionError, OSError):
                 logger.error(
                     "Permission denied killing PID %d. Cannot replace.",
                     existing_pid,
@@ -7574,9 +7791,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     existing_pid,
                 )
                 try:
-                    os.kill(existing_pid, signal.SIGKILL)
+                    terminate_pid(existing_pid, force=True)
                     _time.sleep(0.5)
-                except (ProcessLookupError, PermissionError):
+                except (ProcessLookupError, PermissionError, OSError):
                     pass
             remove_pid_file()
             # Also release all scoped locks left by the old process.

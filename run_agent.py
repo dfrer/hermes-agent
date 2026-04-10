@@ -610,6 +610,17 @@ class AIAgent:
         else:
             self.api_mode = "chat_completions"
 
+        try:
+            from hermes_cli.model_normalize import (
+                _AGGREGATOR_PROVIDERS,
+                normalize_model_for_provider,
+            )
+
+            if self.provider not in _AGGREGATOR_PROVIDERS:
+                self.model = normalize_model_for_provider(self.model, self.provider)
+        except Exception:
+            pass
+
         # Direct OpenAI sessions use the Responses API path.  GPT-5.x tool
         # calls with reasoning are rejected on /v1/chat/completions, and
         # Hermes is a tool-using client by default.
@@ -631,7 +642,6 @@ class AIAgent:
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
-        self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
@@ -798,7 +808,7 @@ class AIAgent:
                     client_kwargs["default_headers"] = copilot_default_headers()
                 elif "api.kimi.com" in effective_base.lower():
                     client_kwargs["default_headers"] = {
-                        "User-Agent": "KimiCLI/1.3",
+                        "User-Agent": "KimiCLI/1.30.0",
                     }
                 elif "portal.qwen.ai" in effective_base.lower():
                     client_kwargs["default_headers"] = _qwen_portal_headers()
@@ -1174,6 +1184,9 @@ class AIAgent:
             except (TypeError, ValueError):
                 _config_context_length = None
 
+        # Store for reuse in switch_model (so config override persists across model switches)
+        self._config_context_length = _config_context_length
+
         # Check custom_providers per-model context_length
         if _config_context_length is None:
             _custom_providers = _agent_cfg.get("custom_providers")
@@ -1328,7 +1341,6 @@ class AIAgent:
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.last_prompt_tokens = 0
             self.context_compressor.last_completion_tokens = 0
-            self.context_compressor.last_total_tokens = 0
             self.context_compressor.compression_count = 0
             self.context_compressor._context_probed = False
             self.context_compressor._context_probe_persistable = False
@@ -1412,6 +1424,7 @@ class AIAgent:
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
+                config_context_length=getattr(self, "_config_context_length", None),
             )
             self.context_compressor.model = self.model
             self.context_compressor.base_url = self.base_url
@@ -3906,7 +3919,6 @@ class AIAgent:
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
-        self._reasoning_deltas_fired = False
         # Accumulate streamed text so we can recover if get_final_response()
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
@@ -4212,7 +4224,7 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif "api.kimi.com" in normalized:
-            self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
+            self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
         elif "portal.qwen.ai" in normalized:
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         else:
@@ -4250,49 +4262,80 @@ class AIAgent:
         *,
         status_code: Optional[int],
         has_retried_429: bool,
+        classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, bool]:
         """Attempt credential recovery via pool rotation.
 
         Returns (recovered, has_retried_429).
-        On 429: first occurrence retries same credential (sets flag True).
-                second consecutive 429 rotates to next credential (resets flag).
-        On 402: immediately rotates (billing exhaustion won't resolve with retry).
-        On 401: attempts token refresh before rotating.
+        On rate limits: first occurrence retries same credential (sets flag True).
+                        second consecutive failure rotates to next credential.
+        On billing exhaustion: immediately rotates.
+        On auth failures: attempts token refresh before rotating.
+
+        `classified_reason` lets the recovery path honor the structured error
+        classifier instead of relying only on raw HTTP codes. This matters for
+        providers that surface billing/rate-limit/auth conditions under a
+        different status code, such as Anthropic returning HTTP 400 for
+        "out of extra usage".
         """
         pool = self._credential_pool
-        if pool is None or status_code is None:
+        if pool is None:
             return False, has_retried_429
 
-        if status_code == 402:
-            next_entry = pool.mark_exhausted_and_rotate(status_code=402, error_context=error_context)
+        effective_reason = classified_reason
+        if effective_reason is None:
+            if status_code == 402:
+                effective_reason = FailoverReason.billing
+            elif status_code == 429:
+                effective_reason = FailoverReason.rate_limit
+            elif status_code == 401:
+                effective_reason = FailoverReason.auth
+
+        if effective_reason == FailoverReason.billing:
+            rotate_status = status_code if status_code is not None else 402
+            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
             if next_entry is not None:
-                logger.info(f"Credential 402 (billing) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
+                logger.info(
+                    "Credential %s (billing) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
                 self._swap_credential(next_entry)
                 return True, False
             return False, has_retried_429
 
-        if status_code == 429:
+        if effective_reason == FailoverReason.rate_limit:
             if not has_retried_429:
                 return False, True
-            next_entry = pool.mark_exhausted_and_rotate(status_code=429, error_context=error_context)
+            rotate_status = status_code if status_code is not None else 429
+            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
             if next_entry is not None:
-                logger.info(f"Credential 429 (rate limit) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
+                logger.info(
+                    "Credential %s (rate limit) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
                 self._swap_credential(next_entry)
                 return True, False
             return False, True
 
-        if status_code == 401:
+        if effective_reason == FailoverReason.auth:
             refreshed = pool.try_refresh_current()
             if refreshed is not None:
-                logger.info(f"Credential 401 — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+                logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
                 self._swap_credential(refreshed)
                 return True, has_retried_429
             # Refresh failed — rotate to next credential instead of giving up.
             # The failed entry is already marked exhausted by try_refresh_current().
-            next_entry = pool.mark_exhausted_and_rotate(status_code=401, error_context=error_context)
+            rotate_status = status_code if status_code is not None else 401
+            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
             if next_entry is not None:
-                logger.info(f"Credential 401 (refresh failed) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
+                logger.info(
+                    "Credential %s (auth refresh failed) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
                 self._swap_credential(next_entry)
                 return True, False
 
@@ -4384,7 +4427,6 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
-        self._reasoning_deltas_fired = True
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -4514,10 +4556,6 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
-            # Reset per-call reasoning tracking so _build_assistant_message
-            # knows whether reasoning was already displayed during streaming.
-            self._reasoning_deltas_fired = False
-
             _first_chunk_seen = False
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
@@ -4685,13 +4723,20 @@ class AIAgent:
             works unchanged.
             """
             has_tool_use = False
-            self._reasoning_deltas_fired = False
 
             # Reset stale-stream timer for this attempt
             last_chunk_time["t"] = time.time()
             # Use the Anthropic SDK's streaming context manager
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                 for event in stream:
+                    # Update stale-stream timer on every event so the
+                    # outer poll loop knows data is flowing.  Without
+                    # this, the detector kills healthy long-running
+                    # Opus streams after 180 s even when events are
+                    # actively arriving (the chat_completions path
+                    # already does this at the top of its chunk loop).
+                    last_chunk_time["t"] = time.time()
+
                     if self._interrupt_requested:
                         break
 
@@ -4715,6 +4760,7 @@ class AIAgent:
                                 if text and not has_tool_use:
                                     _fire_first_delta()
                                     self._fire_stream_delta(text)
+                                    deltas_were_sent["yes"] = True
                             elif delta_type == "thinking_delta":
                                 thinking_text = getattr(delta, "thinking", "")
                                 if thinking_text:
@@ -5005,7 +5051,7 @@ class AIAgent:
             # when no explicit key is in the fallback config.
             if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
                 fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
-            fb_client, _ = resolve_provider_client(
+            fb_client, _resolved_fb_model = resolve_provider_client(
                 fb_provider, model=fb_model, raw_codex=True,
                 explicit_base_url=fb_base_url_hint,
                 explicit_api_key=fb_api_key_hint)
@@ -5014,6 +5060,12 @@ class AIAgent:
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
                 return self._try_activate_fallback()  # try next in chain
+            try:
+                from hermes_cli.model_normalize import normalize_model_for_provider
+
+                fb_model = normalize_model_for_provider(fb_model, fb_provider)
+            except Exception:
+                pass
 
             # Determine api_mode from provider / base URL
             fb_api_mode = "chat_completions"
@@ -5174,6 +5226,7 @@ class AIAgent:
     _TRANSIENT_TRANSPORT_ERRORS = frozenset({
         "ReadTimeout", "ConnectTimeout", "PoolTimeout",
         "ConnectError", "RemoteProtocolError",
+        "APIConnectionError", "APITimeoutError",
     })
 
     def _try_recover_primary_transport(
@@ -5497,6 +5550,7 @@ class AIAgent:
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
                 base_url=getattr(self, "_anthropic_base_url", None),
+                fast_mode=self.request_overrides.get("speed") == "fast",
             )
 
         if self.api_mode == "codex_responses":
@@ -8255,6 +8309,7 @@ class AIAgent:
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
                         has_retried_429=has_retried_429,
+                        classified_reason=classified.reason,
                         error_context=error_context,
                     )
                     if recovered_with_pool:
@@ -8444,6 +8499,10 @@ class AIAgent:
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
                             )
+                            # Compression created a new session — clear history
+                            # so _flush_messages_to_session_db writes compressed
+                            # messages to the new session, not skipping them.
+                            conversation_history = None
                             if len(messages) < original_len or old_ctx > _reduced_ctx:
                                 self._emit_status(
                                     f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
@@ -8501,6 +8560,10 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        # Compression created a new session — clear history
+                        # so _flush_messages_to_session_db writes compressed
+                        # messages to the new session, not skipping them.
+                        conversation_history = None
 
                         if len(messages) < original_len:
                             self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
@@ -8619,6 +8682,10 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        # Compression created a new session — clear history
+                        # so _flush_messages_to_session_db writes compressed
+                        # messages to the new session, not skipping them.
+                        conversation_history = None
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
@@ -9433,7 +9500,6 @@ class AIAgent:
                     # Reset retry counter/signature on successful content
                     if hasattr(self, '_empty_content_retries'):
                         self._empty_content_retries = 0
-                    self._last_empty_content_signature = None
                     self._thinking_prefill_retries = 0
 
                     if (
@@ -9531,7 +9597,6 @@ class AIAgent:
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
                 # Fill in error results for any that weren't answered yet.
-                pending_handled = False
                 for idx in range(len(messages) - 1, -1, -1):
                     msg = messages[idx]
                     if not isinstance(msg, dict):

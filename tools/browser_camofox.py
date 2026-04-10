@@ -587,27 +587,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
-
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-
-def cleanup_all_camofox_sessions() -> None:
-    """Close all active camofox sessions.
-
-    When managed persistence is enabled, only clears local tracking state
-    without destroying server-side browser profiles (cookies, logins, etc.
-    must survive).  Ephemeral sessions are fully deleted on the server.
-    """
-    managed = _managed_persistence_enabled()
-    with _sessions_lock:
-        sessions = list(_sessions.items())
-    if not managed:
-        for _task_id, session in sessions:
-            try:
-                _delete(f"/sessions/{session['user_id']}")
-            except Exception:
-                pass
-    with _sessions_lock:
-        _sessions.clear()

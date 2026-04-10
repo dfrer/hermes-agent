@@ -317,7 +317,7 @@ def load_cli_config() -> Dict[str, Any]:
     # Load from file if exists
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 file_config = yaml.safe_load(f) or {}
             
             _file_has_terminal_config = "terminal" in file_config
@@ -1201,6 +1201,11 @@ def _format_image_attachment_badges(attached_images: list[Path], image_counter: 
     )
 
 
+def _should_auto_attach_clipboard_image_on_paste(pasted_text: str) -> bool:
+    """Auto-attach clipboard images only for image-only paste gestures."""
+    return not pasted_text.strip()
+
+
 def _collect_query_images(query: str | None, image_arg: str | None = None) -> tuple[str, list[Path]]:
     """Collect local image attachments for single-query CLI flows."""
     message = query or ""
@@ -1285,14 +1290,6 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 [#B8860B]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⠈⣡⠞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [#B8860B]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]"""
 
-# Compact banner for smaller terminals (fallback)
-# Note: built dynamically by _build_compact_banner() to fit terminal width
-COMPACT_BANNER = """
-[bold #FFD700]╔══════════════════════════════════════════════════════════════╗[/]
-[bold #FFD700]║[/]  [#FFBF00]⚕ NOUS HERMES[/] [dim #B8860B]- AI Agent Framework[/]              [bold #FFD700]║[/]
-[bold #FFD700]║[/]  [#CD7F32]Messenger of the Digital Gods[/]    [dim #B8860B]Nous Research[/]   [bold #FFD700]║[/]
-[bold #FFD700]╚══════════════════════════════════════════════════════════════╝[/]
-"""
 
 
 def _build_compact_banner() -> str:
@@ -1522,7 +1519,6 @@ class HermesCLI:
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
         self._stream_box_opened = False  # True once the response box header is printed
-        self._reasoning_stream_started = False  # True once live reasoning starts streaming
         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
         self._pending_edit_snapshots = {}
         
@@ -1580,8 +1576,6 @@ class HermesCLI:
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-        self._nous_key_expires_at: Optional[str] = None
-        self._nous_key_source: Optional[str] = None
         # Max turns priority: CLI arg > config file > env var > default
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
@@ -2015,6 +2009,25 @@ class HermesCLI:
         current_model = (self.model or "").strip()
         changed = False
 
+        try:
+            from hermes_cli.model_normalize import (
+                _AGGREGATOR_PROVIDERS,
+                normalize_model_for_provider,
+            )
+
+            if resolved_provider not in _AGGREGATOR_PROVIDERS:
+                normalized_model = normalize_model_for_provider(current_model, resolved_provider)
+                if normalized_model and normalized_model != current_model:
+                    if not self._model_is_default:
+                        self.console.print(
+                            f"[yellow]⚠️  Normalized model '{current_model}' to '{normalized_model}' for {resolved_provider}.[/]"
+                        )
+                    self.model = normalized_model
+                    current_model = normalized_model
+                    changed = True
+        except Exception:
+            pass
+
         if resolved_provider == "copilot":
             try:
                 from hermes_cli.models import copilot_model_api_mode, normalize_copilot_model_id
@@ -2060,7 +2073,7 @@ class HermesCLI:
             return changed
 
         if resolved_provider != "openai-codex":
-            return False
+            return changed
 
         # 1. Strip provider prefix ("openai/gpt-5.4" → "gpt-5.4")
         if "/" in current_model:
@@ -2211,7 +2224,6 @@ class HermesCLI:
         """
         if not text:
             return
-        self._reasoning_stream_started = True
         self._reasoning_shown_this_turn = True
         if getattr(self, "_stream_box_opened", False):
             return
@@ -2472,7 +2484,6 @@ class HermesCLI:
         self._stream_buf = ""
         self._stream_started = False
         self._stream_box_opened = False
-        self._reasoning_stream_started = False
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
         self._in_reasoning_block = False
@@ -3350,22 +3361,22 @@ class HermesCLI:
             pass  # Don't crash on import errors
     
     def _show_status(self):
-        """Show current status bar."""
+        """Show compact startup status line."""
         # Get tool count
         tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
         tool_count = len(tools) if tools else 0
-        
+
         # Format model name (shorten if needed)
         model_short = self.model.split("/")[-1] if "/" in self.model else self.model
         if len(model_short) > 30:
             model_short = model_short[:27] + "..."
-        
+
         # Get API status indicator
         if self.api_key:
             api_indicator = "[green bold]●[/]"
         else:
             api_indicator = "[red bold]●[/]"
-        
+
         # Build status line with proper markup
         toolsets_info = ""
         if self.enabled_toolsets and "all" not in self.enabled_toolsets:
@@ -3380,6 +3391,59 @@ class HermesCLI:
             f"[dim #B8860B]·[/] [bold cyan]{tool_count} tools[/]"
             f"{toolsets_info}{provider_info}"
         )
+
+    def _show_session_status(self):
+        """Show gateway-style status for the current CLI session."""
+        session_meta = {}
+        if self._session_db:
+            try:
+                session_meta = self._session_db.get_session(self.session_id) or {}
+            except Exception:
+                session_meta = {}
+
+        title = (session_meta.get("title") or "").strip()
+
+        created_at = self.session_start
+        started_at = session_meta.get("started_at")
+        if started_at:
+            try:
+                created_at = datetime.fromtimestamp(float(started_at))
+            except Exception:
+                created_at = self.session_start
+
+        updated_at = created_at
+        for field in ("updated_at", "last_updated_at", "last_activity_at"):
+            value = session_meta.get(field)
+            if not value:
+                continue
+            try:
+                updated_at = datetime.fromtimestamp(float(value))
+                break
+            except Exception:
+                pass
+
+        agent = getattr(self, "agent", None)
+        total_tokens = getattr(agent, "session_total_tokens", 0) or 0
+        provider = getattr(self, "provider", None) or "unknown"
+        model = getattr(self, "model", None) or "(unknown)"
+        is_running = bool(getattr(self, "_agent_running", False))
+
+        lines = [
+            "Hermes CLI Status",
+            "",
+            f"Session ID: {self.session_id}",
+            f"Path: {display_hermes_home()}",
+        ]
+        if title:
+            lines.append(f"Title: {title}")
+        lines.extend([
+            f"Model: {model} ({provider})",
+            f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}",
+            f"Last Activity: {updated_at.strftime('%Y-%m-%d %H:%M')}",
+            f"Tokens: {total_tokens:,}",
+            f"Agent Running: {'Yes' if is_running else 'No'}",
+        ])
+        self.console.print("\n".join(lines), highlight=False, markup=False)
     
     def _fast_command_available(self) -> bool:
         try:
@@ -4107,6 +4171,16 @@ class HermesCLI:
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
 
+        user_provs = None
+        custom_provs = None
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            user_provs = cfg.get("providers")
+            custom_provs = cfg.get("custom_providers")
+        except Exception:
+            pass
+
         # No args at all: show available providers + models
         if not model_input and not explicit_provider:
             model_display = self.model or "unknown"
@@ -4116,18 +4190,10 @@ class HermesCLI:
 
             # Show authenticated providers with top models
             try:
-                # Load user providers from config
-                user_provs = None
-                try:
-                    from hermes_cli.config import load_config
-                    cfg = load_config()
-                    user_provs = cfg.get("providers")
-                except Exception:
-                    pass
-
                 providers = list_authenticated_providers(
                     current_provider=self.provider or "",
                     user_providers=user_provs,
+                    custom_providers=custom_provs,
                     max_models=6,
                 )
                 if providers:
@@ -4168,6 +4234,8 @@ class HermesCLI:
             current_api_key=self.api_key or "",
             is_global=persist_global,
             explicit_provider=explicit_provider,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
         )
 
         if not result.success:
@@ -4859,6 +4927,8 @@ class HermesCLI:
                 self._handle_skills_command(cmd_original)
         elif canonical == "platforms":
             self._show_gateway_status()
+        elif canonical == "status":
+            self._show_session_status()
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -5685,15 +5755,24 @@ class HermesCLI:
             _cprint(f"  {_GOLD}✓ Reasoning effort set to '{arg}' (session only){_RST}")
 
     def _handle_fast_command(self, cmd: str):
-        """Handle /fast — toggle OpenAI Priority Processing (service_tier)."""
+        """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
         if not self._fast_command_available():
-            _cprint("  (._.) /fast is only available for OpenAI models that support Priority Processing.")
+            _cprint("  (._.) /fast is only available for models that support fast mode (OpenAI Priority Processing or Anthropic Fast Mode).")
             return
+
+        # Determine the branding for the current model
+        try:
+            from hermes_cli.models import _is_anthropic_fast_model
+            agent = getattr(self, "agent", None)
+            model = getattr(agent, "model", None) or getattr(self, "model", None)
+            feature_name = "Anthropic Fast Mode" if _is_anthropic_fast_model(model) else "Priority Processing"
+        except Exception:
+            feature_name = "Fast mode"
 
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip().lower() == "status":
             status = "fast" if self.service_tier == "priority" else "normal"
-            _cprint(f"  {_GOLD}Priority Processing: {status}{_RST}")
+            _cprint(f"  {_GOLD}{feature_name}: {status}{_RST}")
             _cprint(f"  {_DIM}Usage: /fast [normal|fast|status]{_RST}")
             return
 
@@ -5714,9 +5793,9 @@ class HermesCLI:
 
         self.agent = None  # Force agent re-init with new service-tier config
         if save_config_value("agent.service_tier", saved_value):
-            _cprint(f"  {_GOLD}✓ Priority Processing set to {label} (saved to config){_RST}")
+            _cprint(f"  {_GOLD}✓ {feature_name} set to {label} (saved to config){_RST}")
         else:
-            _cprint(f"  {_GOLD}✓ Priority Processing set to {label} (session only){_RST}")
+            _cprint(f"  {_GOLD}✓ {feature_name} set to {label} (session only){_RST}")
 
     def _on_reasoning(self, reasoning_text: str):
         """Callback for intermediate reasoning display during tool-call loops."""
@@ -5745,7 +5824,7 @@ class HermesCLI:
             approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
             print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
-            compressed, new_system = self.agent._compress_context(
+            compressed, _new_system = self.agent._compress_context(
                 self.conversation_history,
                 self.agent._cached_system_prompt or "",
                 approx_tokens=approx_tokens,
@@ -6261,6 +6340,9 @@ class HermesCLI:
 
             if result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
+                self._attached_images.clear()
+                if hasattr(self, '_app') and self._app:
+                    self._app.invalidate()
                 self._pending_input.put(transcript)
                 submitted = True
             elif result.get("success"):
@@ -7990,8 +8072,9 @@ class HermesCLI:
             """Handle terminal paste — detect clipboard images.
 
             When the terminal supports bracketed paste, Ctrl+V / Cmd+V
-            triggers this with the pasted text.  We also check the
-            clipboard for an image on every paste event.
+            triggers this with the pasted text. We only auto-attach a
+            clipboard image for image-only/empty paste gestures so text
+            pastes and dictation do not accidentally attach stale images.
 
             Large pastes (5+ lines) are collapsed to a file reference
             placeholder while preserving any existing user text in the
@@ -8001,7 +8084,7 @@ class HermesCLI:
             # Normalise line endings — Windows \r\n and old Mac \r both become \n
             # so the 5-line collapse threshold and display are consistent.
             pasted_text = pasted_text.replace('\r\n', '\n').replace('\r', '\n')
-            if self._try_attach_clipboard_image():
+            if _should_auto_attach_clipboard_image_on_paste(pasted_text) and self._try_attach_clipboard_image():
                 event.app.invalidate()
             if pasted_text:
                 line_count = pasted_text.count('\n')

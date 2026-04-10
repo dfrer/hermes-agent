@@ -168,7 +168,7 @@ def _load_config_files() -> List[Dict[str, str]]:
                             "container_path": container_path,
                         })
     except Exception as e:
-        logger.debug("Could not read terminal.credential_files from config: %s", e)
+        logger.warning("Could not read terminal.credential_files from config: %s", e)
 
     _config_files = result
     return _config_files
@@ -405,9 +405,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-
-def reset_config_cache() -> None:
-    """Force re-read of config on next access (for testing)."""
-    global _config_files
-    _config_files = None
