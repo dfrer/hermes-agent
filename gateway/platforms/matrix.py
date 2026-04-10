@@ -1102,7 +1102,15 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Only batch plain text messages — commands dispatch immediately.
         if msg_type == MessageType.TEXT:
-            self._enqueue_text_event(msg_event)
+            text_delay = (
+                self._text_batch_split_delay_seconds
+                if len(msg_event.text or "") >= self._SPLIT_THRESHOLD
+                else self._text_batch_delay_seconds
+            )
+            if text_delay <= 0:
+                await self.handle_message(msg_event)
+            else:
+                self._enqueue_text_event(msg_event)
         else:
             await self.handle_message(msg_event)
 

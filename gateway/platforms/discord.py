@@ -2475,7 +2475,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
         if msg_type == MessageType.TEXT:
-            self._enqueue_text_event(event)
+            text_delay = (
+                self._text_batch_split_delay_seconds
+                if len(event.text or "") >= self._SPLIT_THRESHOLD
+                else self._text_batch_delay_seconds
+            )
+            if text_delay <= 0:
+                await self.handle_message(event)
+            else:
+                self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
