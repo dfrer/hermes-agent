@@ -126,3 +126,79 @@ async def test_data_logs_lane_requires_existing_artifact():
 
     assert result["packets"][0]["status"] == "unavailable"
     assert "artifact_path" in result["packets"][0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_external_docs_lane_extracts_official_candidates():
+    from tools.ability_context_tool import ability_context_tool
+
+    with (
+        patch(
+            "tools.web_tools.web_search_tool",
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "web": [
+                            {"title": "Unofficial", "url": "https://example.com/blog"},
+                            {"title": "Official docs", "url": "https://docs.example.dev/api"},
+                        ]
+                    },
+                }
+            ),
+        ) as mock_search,
+        patch(
+            "tools.web_tools.web_extract_tool",
+            new_callable=AsyncMock,
+        ) as mock_extract,
+    ):
+        mock_extract.return_value = json.dumps({"success": True, "content": "Official API details"})
+        result = json.loads(
+            await ability_context_tool(
+                mode="collect",
+                lanes=["external_docs"],
+                query="example api docs",
+                task_id="ability-tool-docs",
+            )
+        )
+
+    assert result["packets"][0]["status"] == "success"
+    assert mock_search.call_args.args[0] == "example api docs"
+    assert mock_extract.await_args.args[0][0] == "https://docs.example.dev/api"
+    assert "official-doc extract" in result["packets"][0]["findings"][1]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_environment_lane_reports_reusable_managed_server_matches():
+    from tools.ability_context_tool import ability_context_tool
+
+    sessions = [
+        {
+            "session_id": "proc_dev",
+            "status": "running",
+            "command": "npm run dev -- --host 127.0.0.1 --port 5173",
+            "cwd": "/tmp/demo",
+        },
+        {
+            "session_id": "proc_other",
+            "status": "running",
+            "command": "npm run dev -- --host 127.0.0.1 --port 3000",
+            "cwd": "/tmp/other",
+        },
+    ]
+    with patch("tools.process_registry.process_registry.list_sessions", return_value=sessions):
+        result = json.loads(
+            await ability_context_tool(
+                mode="collect",
+                lanes=["environment"],
+                workdir="/tmp/demo",
+                url="http://127.0.0.1:5173",
+                task_id="ability-tool-env",
+            )
+        )
+
+    packet = result["packets"][0]
+    assert packet["status"] == "success"
+    registry_finding = packet["findings"][0]["message"]
+    assert "proc_dev" in registry_finding
+    assert "proc_other" not in registry_finding

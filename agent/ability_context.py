@@ -29,7 +29,7 @@ MAX_HANDOFF_CHARS = 5000
 _VISUAL_RE = re.compile(
     r"(?i)\b("
     r"ui|ux|layout|css|html|canvas|webgl|three\.?js|p5\.?js|animation|animated|"
-    r"screenshot|responsive|viewport|browser|web\s*page|frontend|front-end|"
+    r"screenshot|responsive|viewport|web\s*page|frontend|front-end|"
     r"visual|visually|looks?\s+wrong|render(?:ing|ed)?|scene|game|sprite|"
     r"button|modal|canvas-heavy"
     r")\b"

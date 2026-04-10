@@ -555,6 +555,8 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    os.environ.setdefault("TERMINAL_CWD", os.getcwd())
+
     # Resolve --continue into --resume with the latest CLI session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):

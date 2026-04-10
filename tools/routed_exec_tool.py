@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -109,6 +110,29 @@ def _find_executable(name: str) -> Optional[str]:
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
+    local_candidates: list[Path] = []
+    executable_dir = Path(sys.executable).resolve().parent
+    local_candidates.append(executable_dir / name)
+    if os.name == "nt":
+        local_candidates.extend(
+            [
+                executable_dir / f"{name}.cmd",
+                executable_dir / f"{name}.exe",
+                executable_dir / f"{name}.bat",
+            ]
+        )
+    repo_root = Path(__file__).resolve().parents[1]
+    local_candidates.extend(
+        [
+            repo_root / "venv" / "bin" / name,
+            repo_root / "venv" / "Scripts" / name,
+            repo_root / "venv" / "Scripts" / f"{name}.cmd",
+            repo_root / "venv" / "Scripts" / f"{name}.exe",
+        ]
+    )
+    for candidate in local_candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     return None
 
 
@@ -465,6 +489,7 @@ def _run_hermes(
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env.setdefault("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "1")
+    env["TERMINAL_CWD"] = host_cwd
     env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = (
         f"{env.get('HERMES_EPHEMERAL_SYSTEM_PROMPT', '').strip()}\n\n{_INNER_HERMES_EPHEMERAL_PROMPT}"
     ).strip()

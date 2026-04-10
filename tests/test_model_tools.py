@@ -356,9 +356,24 @@ class TestHandleFunctionCall:
         env = mock_run.call_args.kwargs["env"]
         assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
         assert env["HERMES_DISABLE_DEFAULT_ROUTING_SKILL"] == "1"
+        assert env["TERMINAL_CWD"] == str(tmp_path)
         assert "already-routed implementation executor" in env["HERMES_EPHEMERAL_SYSTEM_PROMPT"]
         assert any("HERMES_ROUTED_RESULT:" in str(item) for item in command)
         assert mock_run.call_args.kwargs["timeout"] == 900
+
+    def test_routed_exec_find_executable_falls_back_to_current_venv_bin(self, tmp_path, monkeypatch):
+        from tools import routed_exec_tool
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        hermes_bin = bin_dir / "hermes"
+        hermes_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hermes_bin.chmod(0o755)
+
+        monkeypatch.setattr(routed_exec_tool.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(routed_exec_tool.sys, "executable", str(bin_dir / "python"))
+
+        assert routed_exec_tool._find_executable("hermes") == str(hermes_bin)
 
     def test_routed_exec_dispatches_minimax_primary_for_quick_edit(self, tmp_path):
         task_id = "guarded-task-minimax-routed-exec"

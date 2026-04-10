@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from agent.ability_context import (
     ABILITY_LANES,
@@ -37,8 +38,7 @@ _SECRET_RE = re.compile(
 _LOCAL_URL_RE = re.compile(r"(?i)^(?:https?://)?(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?(?:/|$)")
 _HEAVY_VISUAL_RE = re.compile(r"(?i)\b(webgl|canvas|animation|animated|video|p5|three\.?js|game|gpu|fps|frame\s*rate)\b")
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
-_LOG_SUFFIXES = {".log", ".txt", ".out", ".err", ".json", ".jsonl", ".csv", ".xml"}
-_MEDIA_SUFFIXES = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov", ".webm", ".mkv", ".avi"}
+_OFFICIAL_DOC_RE = re.compile(r"(?i)(docs?\.|developer\.|developers\.|learn\.|api\.|readthedocs|github\.com|npmjs\.com|pypi\.org)")
 
 
 ABILITY_CONTEXT_SCHEMA = {
@@ -293,8 +293,25 @@ def _collect_environment(task_id: str, workdir: str, url: str, phase: str) -> di
     try:
         from tools.process_registry import process_registry
 
-        sessions = process_registry.list_sessions(task_id=task_id)
-        findings.append({"summary": "Managed process registry", "message": json.dumps(sessions[:8], ensure_ascii=False)})
+        all_sessions = process_registry.list_sessions(task_id=None)
+        active_sessions = [item for item in all_sessions if isinstance(item, dict) and item.get("status") == "running"]
+        target_port = ""
+        parsed = urlparse(url) if url else None
+        if parsed and parsed.port:
+            target_port = str(parsed.port)
+        matching_sessions = []
+        normalized_workdir = str(Path(workdir).resolve()) if workdir and Path(workdir).exists() else str(workdir or "")
+        has_precise_target = bool(normalized_workdir or target_port)
+        for item in active_sessions:
+            cwd = str(item.get("cwd") or "")
+            command = str(item.get("command") or "")
+            cwd_matches = bool(normalized_workdir and cwd and cwd == normalized_workdir)
+            port_matches = bool(target_port and re.search(rf"(?<!\d){re.escape(target_port)}(?!\d)", command))
+            serverish = bool(re.search(r"(?i)\b(vite|next|webpack|http-server|serve|uvicorn|flask|django|python\s+-m\s+http\.server|npm\s+run\s+dev|pnpm\s+dev)\b", command))
+            command_fallback_matches = bool(serverish and not has_precise_target)
+            if cwd_matches or port_matches or command_fallback_matches:
+                matching_sessions.append(item)
+        findings.append({"summary": "Managed process registry matches", "message": json.dumps(matching_sessions[:8], ensure_ascii=False)})
     except Exception as exc:
         findings.append({"summary": "Process registry unavailable", "error": str(exc)})
     ports = _run_readonly(["ss", "-ltnp"], timeout=3)
@@ -336,7 +353,25 @@ def _collect_repo_archaeology(task_id: str, workdir: str, query: str, phase: str
     )
 
 
-def _collect_external_docs(task_id: str, query: str, phase: str) -> dict[str, Any]:
+def _candidate_urls_from_search_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    web_items = data.get("web") if isinstance(data, dict) else None
+    if not isinstance(web_items, list):
+        return []
+    urls: list[str] = []
+    for item in web_items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if url:
+            urls.append(url)
+    official = [url for url in urls if _OFFICIAL_DOC_RE.search(url)]
+    return [*(official[:2]), *[url for url in urls if url not in official][:1]]
+
+
+async def _collect_external_docs(task_id: str, query: str, phase: str) -> dict[str, Any]:
     if not query:
         return make_ability_packet(
             task_id=task_id,
@@ -347,12 +382,18 @@ def _collect_external_docs(task_id: str, query: str, phase: str) -> dict[str, An
             constraints=["No docs/current-facts query was provided."],
         )
     try:
-        from tools.web_tools import web_search_tool
+        from tools.web_tools import web_extract_tool, web_search_tool
 
         payload = _json_or_text(web_search_tool(query, limit=3))
         findings = [{"summary": "web_search results", "message": json.dumps(payload, ensure_ascii=False)}]
         status = "success" if isinstance(payload, dict) and payload.get("success") is True else "unavailable"
         constraints = [] if status == "success" else ["Web search backend returned an unavailable/failed result."]
+        urls = _candidate_urls_from_search_payload(payload)
+        if status == "success" and urls:
+            extract_payload = _json_or_text(
+                await web_extract_tool(urls[:2], format="markdown", use_llm_processing=True)
+            )
+            findings.append({"summary": "official-doc extract candidates", "message": json.dumps(extract_payload, ensure_ascii=False)})
     except Exception as exc:
         findings = []
         constraints = [str(exc)]
@@ -569,7 +610,7 @@ async def ability_context_tool(
         elif lane == "repo_archaeology":
             packet = _collect_repo_archaeology(task_id, workdir, query or task or "", clean_phase)
         elif lane == "external_docs":
-            packet = _collect_external_docs(task_id, query or task or "", clean_phase)
+            packet = await _collect_external_docs(task_id, query or task or "", clean_phase)
         elif lane == "security":
             packet = _collect_security(task_id, workdir, task or user_task or query, clean_phase)
         elif lane == "data_logs":

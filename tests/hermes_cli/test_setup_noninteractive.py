@@ -1,5 +1,6 @@
 """Tests for non-interactive setup and first-run headless behavior."""
 
+import os
 from argparse import Namespace
 from unittest.mock import MagicMock, patch
 
@@ -92,6 +93,26 @@ class TestNonInteractiveSetup:
         mock_setup.assert_not_called()
         out = capsys.readouterr().out
         assert "hermes config set model.provider custom" in out
+
+    def test_chat_sets_terminal_cwd_to_launch_cwd_when_unset(self, tmp_path, monkeypatch):
+        """Single-query chat should carry its launch cwd into file/terminal tools."""
+        from hermes_cli.main import cmd_chat
+
+        args = _make_chat_args()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        with (
+            patch("hermes_cli.main._has_any_provider_configured", return_value=False),
+            patch("hermes_cli.main.cmd_setup"),
+            patch("sys.stdin") as mock_stdin,
+            patch("builtins.input", side_effect=AssertionError("input should not be called")),
+        ):
+            mock_stdin.isatty.return_value = False
+            with pytest.raises(SystemExit):
+                cmd_chat(args)
+
+        assert os.environ["TERMINAL_CWD"] == str(tmp_path)
 
     def test_returning_user_terminal_menu_choice_dispatches_terminal_section(self, tmp_path):
         """Returning-user menu should map Terminal Backend to the terminal setup, not TTS."""

@@ -46,6 +46,15 @@ def test_detects_each_ability_lane_from_task_text():
     assert requirements["post_visual_required"] is True
 
 
+def test_plain_browser_avoidance_does_not_require_visual_lane():
+    requirements = detect_ability_requirements(
+        "Update hello.py and do not open a browser during this plain file edit."
+    )
+
+    assert "visual" not in requirements["lanes"]
+    assert requirements["post_visual_required"] is False
+
+
 def test_ability_cache_hit_and_stale_behavior():
     task_id = "ability-cache-hit"
     activate_for_task(task_id, session_id="s-cache", skills=["routing-layer"])
