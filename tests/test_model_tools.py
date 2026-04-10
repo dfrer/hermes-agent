@@ -101,6 +101,21 @@ class TestHandleFunctionCall:
         assert result == '{"ok":true}'
         assert mock_dispatch.call_args.kwargs["session_id"] == "session-routed-plan-dispatch"
 
+    def test_routing_status_dispatch_receives_session_id(self):
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            result = handle_function_call(
+                "routing_status",
+                {},
+                task_id="task-routing-status-dispatch",
+                session_id="session-routing-status-dispatch",
+            )
+
+        assert result == '{"ok":true}'
+        assert mock_dispatch.call_args.kwargs["session_id"] == "session-routing-status-dispatch"
+
     def test_routing_guard_blocks_mutating_tool_without_decision(self):
         task_id = "guarded-task"
         activate_for_task(task_id, session_id="session-guard", skills=["routing-layer"])
@@ -922,6 +937,9 @@ class TestBackwardCompat:
     def test_get_toolset_for_routed_plan(self):
         assert get_toolset_for_tool("routed_plan") == "routing"
 
+    def test_get_toolset_for_routing_status(self):
+        assert get_toolset_for_tool("routing_status") == "routing"
+
     def test_get_toolset_for_unknown_tool(self):
         result = get_toolset_for_tool("totally_nonexistent_tool")
         assert result is None
@@ -935,8 +953,9 @@ class TestBackwardCompat:
         names = {item["function"]["name"] for item in defs}
         assert "routed_exec" in names
         assert "routed_plan" in names
+        assert "routing_status" in names
 
     def test_routing_toolset_includes_routed_plan(self):
         defs = get_tool_definitions(enabled_toolsets=["routing"], quiet_mode=True)
         names = {item["function"]["name"] for item in defs}
-        assert {"routed_exec", "routed_plan"} <= names
+        assert {"routed_exec", "routed_plan", "routing_status"} <= names

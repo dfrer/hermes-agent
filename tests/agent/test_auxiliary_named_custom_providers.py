@@ -210,11 +210,11 @@ class TestResolveProviderClientModelNormalization:
             from agent.auxiliary_client import resolve_provider_client
 
             client, model = resolve_provider_client(
-                "openrouter", "anthropic/claude-sonnet-4.6"
+                "openrouter", "anthropic/claude-sonnet-4.6:free"
             )
 
         assert client is not None
-        assert model == "anthropic/claude-sonnet-4.6"
+        assert model == "anthropic/claude-sonnet-4.6:free"
 
 
 class TestResolveVisionProviderClientModelNormalization:

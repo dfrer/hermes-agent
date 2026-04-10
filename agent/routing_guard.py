@@ -87,6 +87,10 @@ _GIT_BRANCH_REQUEST_RE = re.compile(
 _GIT_MUTATION_REQUEST_RE = re.compile(
     r"(?i)\b(?:git\s+checkout|git\s+restore|git\s+reset|git\s+clean|discard|revert|restore|reset|clean\s+up\s+unrelated\s+changes)\b"
 )
+_FIXED_CLAIM_RE = re.compile(r"(?i)\b(?:fixed|resolved|shipped)\b")
+_UNVERIFIED_COMPLETION_RE = re.compile(
+    r"(?is)\b(?:unverified|not verified|could not verify|unable to verify|verification\b.*\b(?:not run|did not run|failed|blocked|unavailable)|residual risk)\b"
+)
 _LEADING_ENV_ASSIGNMENTS_RE = re.compile(r"^(?:[a-z_][a-z0-9_]*=\S+\s+)+", re.IGNORECASE)
 _TIMEOUT_PREFIX_RE = re.compile(r"^timeout\s+\d+\s+", re.IGNORECASE)
 _VERIFICATION_OUTPUT_PIPE_RE = re.compile(r"(?i)\|\s*(?:tail|head|select-object)\b")
@@ -494,6 +498,7 @@ def _new_task_state(
         "session_provider": str(session_provider or "").strip(),
         "session_lane_label": _format_session_lane_label(session_model, session_provider),
         "user_message": str(user_message or ""),
+        "latest_user_message": str(user_message or ""),
         "skills": active_skills,
         "active_skill_hints": normalized_hints,
         "task_class": _derive_task_class(normalized_hints),
@@ -504,7 +509,9 @@ def _new_task_state(
         "visual_verification_required": bool(ability_requirements.get("post_visual_required")),
         "visual_verification_pending": False,
         "final_response_guard_attempts": 0,
+        "completion_guard_attempts": 0,
         "last_mutation_class": None,
+        "routed_mutation_succeeded": False,
         "enforced": True,
         "routed": False,
         "decision": None,
@@ -514,8 +521,71 @@ def _new_task_state(
         "route_attempts": _initial_route_attempts(),
         "verification_attempts": [],
         "git_permissions": _derive_git_permissions(user_message),
+        "blocked_tool_attempts": {},
+        "last_blocked_tool": None,
+        "last_block_reason": None,
         "updated_at": time.time(),
     }
+
+
+def _deep_copy_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _refresh_task_state(
+    existing: Optional[dict[str, Any]],
+    *,
+    session_id: str = "",
+    skills: Optional[list[str]] = None,
+    active_skill_hints: Optional[list[dict[str, Any]]] = None,
+    user_message: str = "",
+    session_model: str = "",
+    session_provider: str = "",
+) -> dict[str, Any]:
+    refreshed = _new_task_state(
+        session_id=session_id,
+        skills=skills,
+        active_skill_hints=active_skill_hints,
+        user_message=user_message,
+        session_model=session_model,
+        session_provider=session_provider,
+    )
+    if not isinstance(existing, dict):
+        return refreshed
+
+    preserve_live_route = bool(existing.get("routed")) or isinstance(existing.get("routed_plan"), dict)
+    if not preserve_live_route:
+        return refreshed
+
+    for key in (
+        "ability_packets",
+        "ability_cache",
+        "ability_last_mutation_at",
+        "visual_verification_pending",
+        "last_mutation_class",
+        "routed",
+        "decision",
+        "decision_line",
+        "decision_error",
+        "routed_plan",
+        "route_attempts",
+        "verification_attempts",
+        "policy_version",
+        "selected_route",
+        "routed_mutation_succeeded",
+    ):
+        if key in existing:
+            refreshed[key] = _deep_copy_jsonable(existing.get(key))
+    refreshed["visual_verification_required"] = bool(
+        existing.get("visual_verification_required") or refreshed.get("visual_verification_required")
+    )
+    refreshed["final_response_guard_attempts"] = 0
+    refreshed["completion_guard_attempts"] = 0
+    refreshed["blocked_tool_attempts"] = {}
+    refreshed["last_blocked_tool"] = None
+    refreshed["last_block_reason"] = None
+    refreshed["updated_at"] = time.time()
+    return refreshed
 
 
 def _purge_expired(now: Optional[float] = None) -> None:
@@ -539,7 +609,9 @@ def activate_for_task(
         return
     with _task_state_lock:
         _purge_expired()
-        _task_state[task_id] = _new_task_state(
+        existing = _task_state.get(task_id)
+        _task_state[task_id] = _refresh_task_state(
+            existing,
             session_id=session_id,
             skills=skills,
             active_skill_hints=active_skill_hints,
@@ -1009,6 +1081,82 @@ def get_verification_attempts(task_id: str) -> list[dict[str, Any]]:
         return [dict(item) for item in attempts if isinstance(item, dict)]
 
 
+def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
+    if not task_id:
+        return {
+            "task_id": "",
+            "active": False,
+            "route_locked": False,
+            "decision": None,
+            "decision_error": None,
+            "git_permissions": {},
+            "route_attempts": _initial_route_attempts(),
+            "verification_attempts": [],
+            "routed_plan": None,
+        }
+
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not isinstance(state, dict):
+            return {
+                "task_id": task_id,
+                "active": False,
+                "route_locked": False,
+                "decision": None,
+                "decision_error": None,
+                "git_permissions": {},
+                "route_attempts": _initial_route_attempts(),
+                "verification_attempts": [],
+                "routed_plan": None,
+            }
+        snapshot = {
+            "task_id": task_id,
+            "active": bool(state.get("enforced")),
+            "enforced": bool(state.get("enforced")),
+            "session_id": str(state.get("session_id", "") or ""),
+            "session_lane": {
+                "model": str(state.get("session_model", "") or ""),
+                "provider": str(state.get("session_provider", "") or ""),
+                "label": str(state.get("session_lane_label", "") or ""),
+            },
+            "latest_user_message": str(state.get("latest_user_message", "") or state.get("user_message", "") or ""),
+            "route_locked": bool(state.get("routed")),
+            "decision": _deep_copy_jsonable(state.get("decision")) if isinstance(state.get("decision"), dict) else None,
+            "decision_error": str(state.get("decision_error", "") or "") or None,
+            "git_permissions": dict(state.get("git_permissions") or {}),
+            "blocked_tool_attempts": dict(state.get("blocked_tool_attempts") or {}),
+            "last_blocked_tool": str(state.get("last_blocked_tool", "") or "") or None,
+            "last_block_reason": str(state.get("last_block_reason", "") or "") or None,
+            "route_attempts": _deep_copy_jsonable(state.get("route_attempts") or _initial_route_attempts()),
+            "verification_attempts": [
+                dict(item) for item in state.get("verification_attempts", []) if isinstance(item, dict)
+            ],
+            "visual_verification_required": bool(state.get("visual_verification_required")),
+            "visual_verification_pending": bool(state.get("visual_verification_pending")),
+            "routed_mutation_succeeded": bool(state.get("routed_mutation_succeeded")),
+            "expires_at": float(state.get("updated_at") or 0.0) + _TASK_STATE_TTL_SECONDS,
+        }
+        plan = state.get("routed_plan")
+    if isinstance(plan, dict):
+        try:
+            from agent.routing_plan import public_plan_state
+
+            public = public_plan_state(plan)
+            snapshot["routed_plan"] = {
+                "plan_id": public.get("plan_id"),
+                "status": public.get("status"),
+                "next_node": public.get("next_node"),
+                "node_statuses": public.get("node_statuses"),
+            }
+        except Exception:
+            snapshot["routed_plan"] = {"plan_id": plan.get("plan_id"), "status": plan.get("status")}
+    else:
+        snapshot["routed_plan"] = None
+    snapshot["seconds_until_expiry"] = max(0.0, round(float(snapshot["expires_at"]) - time.time(), 3))
+    return snapshot
+
+
 def get_ability_requirements(task_id: str) -> dict[str, Any]:
     if not task_id:
         return {"lanes": {}, "post_visual_required": False}
@@ -1163,6 +1311,7 @@ def mark_routed_plan_node_success(task_id: str) -> None:
         if not state:
             return
         _mark_visual_verification_pending_locked(state, reason="routed_plan node succeeded")
+        state["routed_mutation_succeeded"] = True
         state["updated_at"] = time.time()
 
 
@@ -1212,35 +1361,56 @@ def _record_ability_tool_payload(task_id: str, payload: dict[str, Any], *, fallb
 def final_response_block_reason(task_id: str, assistant_text: str) -> Optional[str]:
     if not task_id or not is_active_for_task(task_id):
         return None
+    text = str(assistant_text or "")
     with _task_state_lock:
         _purge_expired()
         state = _task_state.get(task_id)
         if not state:
             return None
-        if not state.get("visual_verification_pending"):
+        if state.get("visual_verification_pending"):
+            packets = [dict(item) for item in state.get("ability_packets", []) if isinstance(item, dict)]
+            if visual_post_verified(packets):
+                state["visual_verification_pending"] = False
+                state["updated_at"] = time.time()
+            else:
+                explicit_unavailable = re.search(r"(?is)\bvisual verification\b.*\b(unavailable|blocked|could not|unable)\b", text)
+                cites_blocker = re.search(r"(?is)\b(browser|vision|screenshot|webgl|local|ssrf|expensive|cpu|gpu|unavailable|blocked)\b", text)
+                if explicit_unavailable and cites_blocker:
+                    state["visual_verification_pending"] = False
+                    state["updated_at"] = time.time()
+                else:
+                    attempts = int(state.get("final_response_guard_attempts") or 0)
+                    if attempts < 2:
+                        state["final_response_guard_attempts"] = attempts + 1
+                        state["updated_at"] = time.time()
+                        return (
+                            "Routing guard requires a post-fix visual verification packet before a fixed/complete final answer. "
+                            "Call `ability_context` with `phase=\"post\"` for the visual lane, or explicitly state that visual "
+                            "verification was unavailable and cite the concrete blocker."
+                        )
+
+        if not state.get("routed_mutation_succeeded"):
             return None
-        packets = [dict(item) for item in state.get("ability_packets", []) if isinstance(item, dict)]
-        if visual_post_verified(packets):
-            state["visual_verification_pending"] = False
+        attempts = [dict(item) for item in state.get("verification_attempts", []) if isinstance(item, dict)]
+        if any(bool(item.get("success")) for item in attempts):
+            state["completion_guard_attempts"] = 0
             state["updated_at"] = time.time()
             return None
-        text = str(assistant_text or "")
-        explicit_unavailable = re.search(r"(?is)\bvisual verification\b.*\b(unavailable|blocked|could not|unable)\b", text)
-        cites_blocker = re.search(r"(?is)\b(browser|vision|screenshot|webgl|local|ssrf|expensive|cpu|gpu|unavailable|blocked)\b", text)
-        if explicit_unavailable and cites_blocker:
-            state["visual_verification_pending"] = False
+        if not _FIXED_CLAIM_RE.search(text):
+            return None
+        if _UNVERIFIED_COMPLETION_RE.search(text):
+            state["completion_guard_attempts"] = 0
             state["updated_at"] = time.time()
             return None
-        attempts = int(state.get("final_response_guard_attempts") or 0)
-        if attempts >= 2:
+        completion_attempts = int(state.get("completion_guard_attempts") or 0)
+        if completion_attempts >= 2:
             return None
-        state["final_response_guard_attempts"] = attempts + 1
+        state["completion_guard_attempts"] = completion_attempts + 1
         state["updated_at"] = time.time()
-    return (
-        "Routing guard requires a post-fix visual verification packet before a fixed/complete final answer. "
-        "Call `ability_context` with `phase=\"post\"` for the visual lane, or explicitly state that visual "
-        "verification was unavailable and cite the concrete blocker."
-    )
+        return (
+            "Routing guard requires successful local verification before you claim the task is fixed/resolved/shipped. "
+            "Run an approved local verification command, or explicitly state that verification could not be completed and describe the residual risk."
+        )
 
 
 def _normalize_route_model(model: str) -> str:
@@ -1528,34 +1698,109 @@ def _validate_terminal_route_command(command: str, task_id: str) -> Optional[str
     return None
 
 
-def _validate_git_terminal_command(command: str, task_id: str) -> Optional[str]:
+def _record_blocked_tool(task_id: str, tool_name: str, reason: str) -> str:
+    if not task_id or not reason:
+        return reason
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not isinstance(state, dict):
+            return reason
+        attempts = state.setdefault("blocked_tool_attempts", {})
+        if not isinstance(attempts, dict):
+            attempts = {}
+            state["blocked_tool_attempts"] = attempts
+        count = int(attempts.get(tool_name, 0) or 0) + 1
+        attempts[tool_name] = count
+        state["last_blocked_tool"] = str(tool_name or "")
+        state["last_block_reason"] = str(reason or "")
+        state["updated_at"] = time.time()
+
+    if count < 2:
+        return reason
+
+    next_step = "follow the routing guard guidance in the blocker."
+    if tool_name in {"patch", "write_file", "delegate_task"}:
+        next_step = "use `routed_exec` or `routed_plan` for implementation work."
+    elif tool_name in {"routed_exec", "routed_plan"} and "emit a routing decision" in reason.lower():
+        next_step = "emit the routing decision line before routed execution."
+    elif tool_name == "terminal":
+        lowered = reason.lower()
+        if "git " in lowered:
+            next_step = "inspect `routing_status` and obtain an explicit user request for the blocked git action."
+        elif "before a routing decision" in lowered:
+            next_step = "stay read-only or emit the routing decision line."
+        else:
+            next_step = "use `routed_exec`/`routed_plan` for implementation, or run an approved local verification command."
+    elif tool_name == "execute_code":
+        next_step = "stay on the routed path: use `routed_exec` for implementation and approved local `terminal` commands for verification."
+
+    return (
+        f"{reason} Repeated block ({count}x) on `{tool_name}`. "
+        f"Stop retrying the same path. Next valid action: {next_step}"
+    )
+
+
+def _format_git_permission_summary(permissions: dict[str, Any]) -> str:
+    labels = {
+        "commit": "commit",
+        "push": "push",
+        "branch": "branch-create/switch",
+        "mutate": "history/worktree-mutate",
+    }
+    allowed = [label for key, label in labels.items() if permissions.get(key)]
+    if allowed:
+        return "Allowed git actions for this task: " + ", ".join(allowed) + "."
+    return "No mutating git actions are currently allowed for this task."
+
+
+def _validate_git_terminal_command(command: str, task_id: str, *, session_id: str = "") -> Optional[str]:
     raw = (command or "").strip()
     if not raw:
         return None
 
     with _task_state_lock:
         _purge_expired()
-        permissions = dict(_task_state.get(task_id, {}).get("git_permissions") or {})
+        state = _task_state.get(task_id, {})
+        permissions = dict(state.get("git_permissions") or {})
+        recorded_session_id = str(state.get("session_id", "") or "")
+        latest_user_message = str(state.get("latest_user_message", "") or state.get("user_message", "") or "")
+
+    stale_state = bool(session_id and recorded_session_id and recorded_session_id != session_id)
+    source_note = (
+        f"Block source: stale task state recorded for session `{recorded_session_id}` while the current session is `{session_id}`."
+        if stale_state
+        else "Block source: the latest user turn did not explicitly authorize that git action."
+    )
+    permission_summary = _format_git_permission_summary(permissions)
+    latest_message_hint = ""
+    if latest_user_message:
+        latest_message_hint = f" Latest recorded user turn: {latest_user_message[:160]!r}."
 
     if _GIT_COMMIT_RE.search(raw) and not permissions.get("commit"):
         return (
             "Routing guard blocked `git commit`: commits require an explicit user request. "
-            "Do not grant yourself commit authority."
+            f"{permission_summary} {source_note}{latest_message_hint} "
+            "Inspect `routing_status` if this looks wrong."
         )
     if _GIT_PUSH_RE.search(raw) and not permissions.get("push"):
         return (
-            "Routing guard blocked `git push`: pushes require an explicit user request."
+            "Routing guard blocked `git push`: pushes require an explicit user request. "
+            f"{permission_summary} {source_note}{latest_message_hint} "
+            "Inspect `routing_status` if this looks wrong."
         )
     if _GIT_BRANCH_CREATE_RE.search(raw) and not permissions.get("branch"):
         return (
             "Routing guard blocked branch creation/switching: creating or switching branches "
-            "requires an explicit user request."
+            f"requires an explicit user request. {permission_summary} {source_note}{latest_message_hint} "
+            "Inspect `routing_status` if this looks wrong."
         )
     if _GIT_MUTATION_RE.search(raw) and not permissions.get("mutate"):
         return (
             "Routing guard blocked git history/worktree mutation: `git checkout`/`restore`/`reset`/"
             "`clean`/merge-style commands require an explicit user request and must not be used "
-            "to clean up unrelated changes."
+            f"to clean up unrelated changes. {permission_summary} {source_note}{latest_message_hint} "
+            "Inspect `routing_status` if this looks wrong."
         )
     return None
 
@@ -1722,6 +1967,7 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
                     attempts["3b_primary_failure_kind"] = failure_kind if failed else None
                 if not failed:
                     _mark_visual_verification_pending_locked(state, reason="routed_exec mutation succeeded")
+                    state["routed_mutation_succeeded"] = True
             state["updated_at"] = time.time()
         return
 
@@ -1773,6 +2019,7 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
             )
             if len(attempts) > 20:
                 del attempts[:-20]
+            state["completion_guard_attempts"] = 0
             state["updated_at"] = time.time()
             return
         attempts = state.setdefault("route_attempts", _initial_route_attempts())
@@ -1787,6 +2034,8 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
             attempts["3b_primary_attempted"] = True
             attempts["3b_primary_failed"] = failed
             attempts["3b_primary_failure_kind"] = failure_kind if failed else None
+        if not failed:
+            state["routed_mutation_succeeded"] = True
         state["updated_at"] = time.time()
 
 
@@ -2223,21 +2472,25 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
     routing_task = is_routing_enforced_task(task_id)
     decision_error = _get_decision_error(task_id)
 
+    def _block(reason: str) -> str:
+        return _record_blocked_tool(task_id, tool_name, reason)
+
     if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec", "routed_plan", "execute_code"}:
-        return decision_error
+        return _block(decision_error)
 
     if tool_name == "execute_code":
         if not routing_task:
             return None
         if routed:
-            return (
+            return _block(
                 f"Routing guard blocked `execute_code` for task {task_id}: "
                 "stay on the routed model path for implementation. Use `routed_exec` for routed coding work, "
                 "and use approved local verification commands through `terminal` when you need tests/build/lint checks."
             )
-        return (
+        return _block(
             f"Routing guard blocked `execute_code` for task {task_id}: "
-            "do not use code execution to bypass routing. Before route lock, only read-only inspection tools are allowed."
+            "do not use code execution to bypass routing. Before route lock, only read-only inspection tools are allowed. "
+            "Emit the routing decision line first."
         )
 
     if tool_name in {"patch", "write_file"}:
@@ -2246,19 +2499,19 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
         if not routed and _is_allowed_docs_text_mutation(mutation, task_id):
             return None
         if routed and routing_task:
-            return (
+            return _block(
                 f"Routing guard blocked native `{tool_name}` for task {task_id}: "
                 "stay on the routed model path and do not fall back to native file mutation."
             )
         detail = _describe_mutation_block_reason(mutation)
-        return (
+        return _block(
             f"Routing guard blocked `{tool_name}` for task {task_id}: "
             f"{detail}. Emit a routing decision line before mutating files."
         )
 
     if tool_name == "routed_exec":
         if not routing_task:
-            return (
+            return _block(
                 "Routing guard blocked `routed_exec`: this tool is reserved for routing-layer controlled "
                 "coding tasks."
             )
@@ -2267,21 +2520,21 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             missing = preflight_missing_lanes(requirements, get_ability_packets(task_id))
             if missing:
                 lanes = ", ".join(missing)
-                return (
+                return _block(
                     f"Routing guard blocked `routed_exec` for task {task_id}: "
                     f"required ability preflight lane(s) missing: {lanes}. "
                     "Call `ability_context` with `mode=\"auto\"` or `mode=\"collect\"` and `phase=\"pre\"`; "
                     "if a lane is unavailable, record an unavailable packet with the concrete blocker."
                 )
             return None
-        return (
+        return _block(
             f"Routing guard blocked `routed_exec` for task {task_id}: "
             "emit a routing decision line before starting routed execution."
         )
 
     if tool_name == "routed_plan":
         if not routing_task:
-            return (
+            return _block(
                 "Routing guard blocked `routed_plan`: this tool is reserved for routing-layer controlled "
                 "coding tasks."
             )
@@ -2299,14 +2552,14 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             missing = preflight_missing_lanes(requirements, get_ability_packets(task_id))
             if missing:
                 lanes = ", ".join(missing)
-                return (
+                return _block(
                     f"Routing guard blocked `routed_plan` for task {task_id}: "
                     f"required ability preflight lane(s) missing: {lanes}. "
                     "Call `ability_context` with `mode=\"auto\"` or `mode=\"collect\"` and `phase=\"pre\"`; "
                     "if a lane is unavailable, record an unavailable packet with the concrete blocker."
                 )
             return None
-        return (
+        return _block(
             f"Routing guard blocked `routed_plan` for task {task_id}: "
             "emit a routing decision line before submitting or running a routed plan."
         )
@@ -2315,15 +2568,15 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
         command = ""
         if isinstance(args, dict):
             command = str(args.get("command", "") or "")
-        git_issue = _validate_git_terminal_command(command, task_id)
+        git_issue = _validate_git_terminal_command(command, task_id, session_id=session_id)
         if git_issue:
-            return git_issue
+            return _block(git_issue)
         if routed and routing_task:
             if _is_explicitly_permitted_git_terminal_command(command, task_id):
                 return None
             route_kind = _classify_routed_terminal_command(command)
             if route_kind is not None:
-                return (
+                return _block(
                     f"Routing guard blocked routed model execution through `terminal` for task {task_id}: "
                     "use `routed_exec` for routed Codex/Hermes execution. "
                     "`terminal` remains available only for approved verification commands, read-only inspection, "
@@ -2331,14 +2584,14 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                 )
             verification_issue = _verification_terminal_block_reason(command)
             if verification_issue:
-                return verification_issue
+                return _block(verification_issue)
             if _is_verification_terminal_command(command):
                 return None
             if _classify_visual_verification_command(command) is not None:
                 return None
             if _is_read_only_terminal_command(command):
                 return None
-            return (
+            return _block(
                 f"Routing guard blocked native `terminal` execution for task {task_id}: "
                 "after a routing decision, non-read-only shell work must stay on the routed model path. "
                 "Only routed model execution via `routed_exec`, approved verification commands, localhost-only visual preview commands, and read-only inspection commands are allowed."
@@ -2349,20 +2602,21 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             return None
         if _is_read_only_terminal_command(command):
             return None
-        return (
+        return _block(
             f"Routing guard blocked `terminal` for task {task_id}: "
-            "only read-only inspection commands and localhost-only visual preview commands are allowed before a routing decision."
+            "only read-only inspection commands and localhost-only visual preview commands are allowed before a routing decision. "
+            "Emit the routing decision line before non-read-only terminal work."
         )
 
     if tool_name == "delegate_task":
         if routed and routing_task and _is_implementation_delegate(args if isinstance(args, dict) else {}):
-            return (
+            return _block(
                 f"Routing guard blocked native `delegate_task` for task {task_id}: "
                 "stay on the routed model path instead of falling back to ordinary delegation."
             )
         if not isinstance(args, dict) or not _is_implementation_delegate(args):
             return None
-        return (
+        return _block(
             f"Routing guard blocked `delegate_task` for task {task_id}: "
             "implementation-oriented delegation requires a routing decision first."
         )

@@ -98,8 +98,12 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         )
 
 
-def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch, tmp_path):
     _patch_agent_bootstrap(monkeypatch)
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setattr(run_agent, "_hermes_home", hermes_home)
+    monkeypatch.setattr(cron_scheduler, "_hermes_home", hermes_home)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
     monkeypatch.setattr(
@@ -129,8 +133,13 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
 
 
-def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch, tmp_path):
     _patch_agent_bootstrap(monkeypatch)
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setattr(run_agent, "_hermes_home", hermes_home)
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
     monkeypatch.setattr(
@@ -162,6 +171,7 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    runner._session_model_overrides = {}
     # Ensure model resolution returns the codex model even if xdist
     # leaked env vars cleared HERMES_MODEL.
     monkeypatch.setattr(

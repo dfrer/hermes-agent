@@ -102,6 +102,7 @@ def _make_runner(adapter):
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._session_db = None
+    runner._session_model_overrides = {}
     runner._running_agents = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     return runner
@@ -144,7 +145,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert adapter.sent == [
         {
             "chat_id": "-1001",
-            "content": '⚙️ terminal: "pwd"',
+            "content": '💻 terminal: "pwd"',
             "reply_to": None,
             "metadata": {"thread_id": "17585"},
         }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 from agent.ability_context import (
@@ -160,6 +161,12 @@ def test_routed_success_requires_post_visual_verification_before_final_fixed_cla
             summary="Screenshot confirms layout is fixed.",
         )
         record_ability_packet(task_id, post_packet)
+        record_tool_result(
+            task_id,
+            "terminal",
+            {"command": "pytest tests/ui/test_layout.py -q"},
+            json.dumps({"status": "success", "output": "1 passed", "exit_code": 0}),
+        )
         assert final_response_block_reason(task_id, "Fixed.") is None
     finally:
         deactivate_for_task(task_id)

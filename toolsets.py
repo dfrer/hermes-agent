@@ -55,7 +55,7 @@ _HERMES_CORE_TOOLS = [
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Structured routed execution
-    "routed_exec", "routed_plan",
+    "routed_exec", "routed_plan", "routing_status",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -202,7 +202,7 @@ TOOLSETS = {
 
     "routing": {
         "description": "Structured routed execution for routing-layer controlled coding work",
-        "tools": ["routed_exec", "routed_plan"],
+        "tools": ["routed_exec", "routed_plan", "routing_status"],
         "includes": []
     },
     
@@ -257,7 +257,7 @@ TOOLSETS = {
             "browser_vision", "browser_console",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task", "routed_exec", "routed_plan",
+            "execute_code", "delegate_task", "routed_exec", "routed_plan", "routing_status",
         ],
         "includes": []
     },
@@ -285,7 +285,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task", "routed_exec", "routed_plan",
+            "execute_code", "delegate_task", "routed_exec", "routed_plan", "routing_status",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

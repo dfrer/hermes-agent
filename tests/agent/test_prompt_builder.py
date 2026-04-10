@@ -16,6 +16,7 @@ from agent.prompt_builder import (
     _find_git_root,
     _strip_yaml_frontmatter,
     build_routing_session_prompt,
+    build_environment_context_prompt,
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
@@ -53,6 +54,25 @@ class TestGuidanceConstants:
         assert "Current Hermes session model for the local/main lane" in prompt
         assert "`xiaomi/mimo-v2-pro via nous`" in prompt
         assert "Routed implementation paths are separate" in prompt
+
+    def test_build_environment_context_prompt_includes_repo_cwd_home_and_branch(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+        (repo_root / ".git" / "HEAD").write_text("ref: refs/heads/codex/self-maintenance\n", encoding="utf-8")
+        nested = repo_root / "src" / "feature"
+        nested.mkdir(parents=True)
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        monkeypatch.setattr("agent.prompt_builder.get_hermes_home", lambda: hermes_home)
+
+        prompt = build_environment_context_prompt(cwd=str(nested))
+
+        assert f"`{nested.resolve()}`" in prompt
+        assert f"`{repo_root.resolve()}`" in prompt
+        assert f"`{hermes_home.resolve()}`" in prompt
+        assert "`codex/self-maintenance`" in prompt
 
 
 # =========================================================================

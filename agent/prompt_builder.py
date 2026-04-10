@@ -86,6 +86,39 @@ def _find_git_root(start: Path) -> Optional[Path]:
     return None
 
 
+def _resolve_git_dir(repo_root: Path) -> Optional[Path]:
+    git_path = repo_root / ".git"
+    if git_path.is_dir():
+        return git_path
+    if git_path.is_file():
+        try:
+            first_line = git_path.read_text(encoding="utf-8").splitlines()[0].strip()
+        except Exception:
+            return None
+        if first_line.lower().startswith("gitdir:"):
+            return (repo_root / first_line.split(":", 1)[1].strip()).resolve()
+    return None
+
+
+def _read_git_head_branch(repo_root: Path) -> Optional[str]:
+    git_dir = _resolve_git_dir(repo_root)
+    if git_dir is None:
+        return None
+    head_path = git_dir / "HEAD"
+    try:
+        head_text = head_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if head_text.startswith("ref: "):
+        ref = head_text.split("ref: ", 1)[1].strip()
+        if ref.startswith("refs/heads/"):
+            return ref.split("refs/heads/", 1)[1]
+        return ref
+    if head_text:
+        return "detached"
+    return None
+
+
 _HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
 
 
@@ -282,6 +315,10 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- After route lock, use `terminal` only for approved local verification commands (tests/build/lint/artifact checks), read-only inspection, or explicitly permitted git actions.\n"
     "- Do not invent fake route labels such as `MODEL: local execution` for verification; verification is a local lane within the active routed task.\n"
     "- Do not use `execute_code` to bypass the routing layer. For routed coding work, use `routed_exec`; for verification, use approved local `terminal` commands.\n"
+    "- For CI-fix work, follow this ladder: read CI logs through `gh`/API/browser if available; if logs are unavailable, reproduce locally immediately; route before non-read-only verification; rerun the originally failing tests before broader suites.\n"
+    "- Do not speculate about causes without evidence. Do not claim leftover merge markers, import drift, or sandbox-only failures unless you actually found them.\n"
+    "- Do not clear internal routing state outside the public routed flow. Use `routing_status` to inspect the blocker, then use the valid routed next step.\n"
+    "- Once the route is locked, do not fall back to native `terminal`, `patch`, or `write_file` for implementation.\n"
     "</routing_discipline>\n"
     "\n"
     "<git_authority>\n"
@@ -307,6 +344,26 @@ def build_routing_session_prompt(model: str = "", provider: str = "") -> str:
         "- Routed implementation paths are separate and must still follow the routing-layer matrix and fallback rules.\n"
         "</routing_session_context>"
     )
+
+
+def build_environment_context_prompt(cwd: Optional[str] = None) -> str:
+    cwd_path = Path(cwd or os.getcwd()).resolve()
+    repo_root = _find_git_root(cwd_path)
+    hermes_home = get_hermes_home().resolve()
+    lines = [
+        "<environment_context>",
+        f"- Current working directory: `{cwd_path}`.",
+        f"- HERMES_HOME: `{hermes_home}`.",
+    ]
+    if repo_root is not None:
+        lines.append(f"- Repo root: `{repo_root}`.")
+        branch = _read_git_head_branch(repo_root)
+        if branch:
+            lines.append(f"- Active git branch: `{branch}`.")
+    else:
+        lines.append("- Repo root: unavailable (cwd is not inside a git repository).")
+    lines.append("</environment_context>")
+    return "\n".join(lines)
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.

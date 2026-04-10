@@ -168,7 +168,7 @@ class TestProviderModelNormalization:
             patch("run_agent.OpenAI"),
         ):
             agent = AIAgent(
-                model="anthropic/claude-sonnet-4.6",
+                model="anthropic/claude-sonnet-4.6:free",
                 provider="openrouter",
                 base_url="https://openrouter.ai/api/v1",
                 api_key="test-key-1234567890",
@@ -177,7 +177,7 @@ class TestProviderModelNormalization:
                 skip_memory=True,
             )
 
-        assert agent.model == "anthropic/claude-sonnet-4.6"
+        assert agent.model == "anthropic/claude-sonnet-4.6:free"
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +656,18 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"
         assert "Conversation started:" in prompt
+
+    def test_includes_environment_context(self, agent, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            run_agent,
+            "build_environment_context_prompt",
+            lambda cwd=None: "<environment_context>\n- runtime context injected.\n</environment_context>",
+        )
+
+        prompt = agent._build_system_prompt()
+
+        assert "<environment_context>" in prompt
+        assert "runtime context injected" in prompt
 
     def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")

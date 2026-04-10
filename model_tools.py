@@ -140,6 +140,7 @@ def _discover_tools():
         "tools.terminal_tool",
         "tools.routed_exec_tool",
         "tools.routed_plan_tool",
+        "tools.routing_status_tool",
         "tools.file_tools",
         "tools.vision_tools",
         "tools.visual_context_tool",
@@ -548,7 +549,7 @@ def handle_function_call(
                 "task_id": task_id,
                 "user_task": user_task,
             }
-            if function_name == "routed_plan":
+            if function_name in {"routed_plan", "routing_status"}:
                 dispatch_kwargs["session_id"] = session_id or ""
             result = registry.dispatch(function_name, function_args, **dispatch_kwargs)
 

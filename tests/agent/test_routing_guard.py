@@ -5,9 +5,11 @@ import json
 from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
+    final_response_block_reason,
     get_active_skill_hints,
     get_routed_execution_plan,
     get_routing_decision,
+    get_routing_status_snapshot,
     get_session_lane_context,
     get_selected_route,
     get_task_class,
@@ -1352,5 +1354,189 @@ def test_allows_git_commit_and_push_when_user_explicitly_requests_it():
             {"command": "git push"},
             task_id,
         ) is None
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_activate_for_task_refreshes_git_permissions_and_preserves_live_route():
+    task_id = "task-routing-refresh-git"
+    activate_for_task(
+        task_id,
+        session_id="session-routing-refresh-git",
+        skills=["routing-layer"],
+        user_message="Please implement the fix and add tests.",
+    )
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small fix | CONFIDENCE: high",
+            session_id="session-routing-refresh-git",
+        )
+        activate_for_task(
+            task_id,
+            session_id="session-routing-refresh-git",
+            skills=["routing-layer"],
+            user_message="Please commit and push the branch when you're done.",
+        )
+        snapshot = get_routing_status_snapshot(task_id)
+        assert snapshot["route_locked"] is True
+        assert snapshot["decision"]["tier"] == "3C"
+        assert snapshot["git_permissions"]["commit"] is True
+        assert snapshot["git_permissions"]["push"] is True
+        assert snapshot["latest_user_message"] == "Please commit and push the branch when you're done."
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_git_block_reports_stale_state_and_current_permissions():
+    task_id = "task-routing-stale-git-state"
+    activate_for_task(
+        task_id,
+        session_id="session-old",
+        skills=["routing-layer"],
+        user_message="Please inspect the branch.",
+    )
+    try:
+        reason = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "git commit -m \"ship it\""},
+            task_id,
+            session_id="session-new",
+        )
+        assert reason is not None
+        assert "stale task state" in reason
+        assert "Allowed git actions" in reason or "No mutating git actions" in reason
+        assert "routing_status" in reason
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_repeated_terminal_block_escalates_after_second_attempt():
+    task_id = "task-routing-repeated-terminal-block"
+    activate_for_task(task_id, session_id="session-repeated-terminal-block", skills=["routing-layer"])
+    try:
+        first = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "python scripts/mutate.py"},
+            task_id,
+        )
+        second = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "python scripts/mutate.py"},
+            task_id,
+        )
+        assert first is not None
+        assert second is not None
+        assert "Repeated block (2x)" in second
+        assert "Next valid action" in second
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_routing_status_tool_reports_hydrated_persisted_plan(tmp_path):
+    from tools.routing_status_tool import routing_status_tool
+
+    task_id = "task-routing-status-hydrated"
+    session_id = "session-routing-status-hydrated"
+    session_db = SessionDB(tmp_path / "routing_status_guard.db")
+    set_plan_store_db(session_db)
+    decision = {
+        "tier": "3C",
+        "path": "quick-edit",
+        "model": "Codex CLI (gpt-5.4-mini)",
+        "reason": "resume persisted plan",
+        "confidence": "high",
+    }
+    plan = {
+        "plan_id": "routing-status-plan",
+        "summary": "resume plan",
+        "workdir": str(tmp_path),
+        "nodes": [
+            {
+                "id": "node-a",
+                "goal": "resume",
+                "tier": "3C",
+                "path": "quick-edit",
+                "model": "Codex CLI (gpt-5.4-mini)",
+                "workdir": str(tmp_path),
+                "write_scope": ["src/a.py"],
+                "depends_on": [],
+                "status": "pending",
+                "result": None,
+            }
+        ],
+    }
+    try:
+        session_db.save_routed_plan(
+            plan_id="routing-status-plan",
+            session_id=session_id,
+            task_id=task_id,
+            status="submitted",
+            parent_decision=decision,
+            plan=plan,
+        )
+        activate_for_task(task_id, session_id=session_id, skills=["routing-layer"])
+
+        payload = json.loads(
+            routing_status_tool(
+                task_id=task_id,
+                session_id=session_id,
+                plan_id="routing-status-plan",
+            )
+        )
+
+        assert payload["success"] is True
+        status = payload["status"]
+        assert status["hydrated_from_persistence"] is True
+        assert status["route_locked"] is True
+        assert status["decision"]["path"] == "quick-edit"
+        assert status["routed_plan"]["plan_id"] == "routing-status-plan"
+        assert "seconds_until_expiry" in status
+    finally:
+        deactivate_for_task(task_id)
+        set_plan_store_db(None)
+        session_db.close()
+
+
+def test_final_response_guard_blocks_fixed_claim_without_verification():
+    task_id = "task-routing-final-response-verification"
+    activate_for_task(
+        task_id,
+        session_id="session-routing-final-response-verification",
+        skills=["routing-layer"],
+        user_message="Fix the failing unit test.",
+    )
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: targeted fix | CONFIDENCE: high",
+            session_id="session-routing-final-response-verification",
+        )
+        record_tool_result(
+            task_id,
+            "routed_exec",
+            {"task": "apply fix", "workdir": "."},
+            json.dumps(
+                {
+                    "success": True,
+                    "attempts": [
+                        {"kind": "codex_gpt54mini", "status": "success", "summary": "applied fix"}
+                    ],
+                }
+            ),
+        )
+
+        blocked = final_response_block_reason(task_id, "Fixed.")
+        assert blocked is not None
+        assert "successful local verification" in blocked
+
+        record_tool_result(
+            task_id,
+            "terminal",
+            {"command": "pytest tests/example.py -q"},
+            json.dumps({"status": "success", "output": "1 passed", "exit_code": 0}),
+        )
+
+        assert final_response_block_reason(task_id, "Fixed.") is None
     finally:
         deactivate_for_task(task_id)
