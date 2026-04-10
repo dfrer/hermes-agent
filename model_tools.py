@@ -141,6 +141,7 @@ def _discover_tools():
         "tools.routed_exec_tool",
         "tools.file_tools",
         "tools.vision_tools",
+        "tools.visual_context_tool",
         "tools.mixture_of_agents_tool",
         "tools.image_generation_tool",
         "tools.skills_tool",

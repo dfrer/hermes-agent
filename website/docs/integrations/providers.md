@@ -938,36 +938,17 @@ Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-a
 Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).
 :::
 
-## Smart Model Routing
+## Routing Policy
 
-Optional cheap-vs-strong routing lets Hermes keep your main model for complex work while sending very short/simple turns to a cheaper model.
+Hermes now uses a canonical routing policy for guarded coding work. The built-in defaults are used unless you add an advanced `routing.routes` override.
 
 ```yaml
-smart_model_routing:
-  enabled: true
-  max_simple_chars: 160
-  max_simple_words: 28
-  cheap_model:
-    provider: openrouter
-    model: google/gemini-2.5-flash
-    # base_url: http://localhost:8000/v1  # optional custom endpoint
-    # api_key_env: MY_CUSTOM_KEY          # optional env var name for that endpoint's API key
+routing:
+  policy_version: "3.0.0"
+  routes: {}
 ```
 
-How it works:
-- If a turn is short, single-line, and does not look code/tool/debug heavy, Hermes may route it to `cheap_model`
-- If the turn looks complex, Hermes stays on your primary model/provider
-- If the cheap route cannot be resolved cleanly, Hermes falls back to the primary model automatically
-
-This is intentionally conservative. It is meant for quick, low-stakes turns like:
-- short factual questions
-- quick rewrites
-- lightweight summaries
-
-It will avoid routing prompts that look like:
-- coding/debugging work
-- tool-heavy requests
-- long or multi-line analysis asks
+The legacy `smart_model_routing` block is tolerated for old config files but no longer changes runtime behavior. Remove it after confirming `hermes doctor` is clean.
 
 Use this when you want lower latency or cost without fully changing your default model.
 

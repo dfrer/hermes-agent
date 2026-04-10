@@ -2692,6 +2692,16 @@ def cmd_auth(args):
     auth_command(args)
 
 
+def cmd_routing(args):
+    """Routing policy and updater commands."""
+    if getattr(args, "routing_command", None) == "update":
+        from hermes_cli.routing_auto_update import routing_status_command
+        if getattr(args, "routing_update_command", None) == "status":
+            routing_status_command(args)
+            return
+    print("Usage: hermes routing update status")
+
+
 def cmd_status(args):
     """Show status of all components."""
     from hermes_cli.status import show_status
@@ -4677,7 +4687,29 @@ For more help on a command:
     auth_remove.add_argument("target", help="Credential index, entry id, or exact label")
     auth_reset = auth_subparsers.add_parser("reset", help="Clear exhaustion status for all credentials for a provider")
     auth_reset.add_argument("provider", help="Provider id")
+    auth_migrate = auth_subparsers.add_parser(
+        "migrate-config-keys",
+        help="Move inline config API keys into the credential pool",
+    )
+    auth_migrate_group = auth_migrate.add_mutually_exclusive_group()
+    auth_migrate_group.add_argument("--dry-run", action="store_true", help="Preview migration without changing files")
+    auth_migrate_group.add_argument("--apply", action="store_true", help="Import keys and remove inline secrets from config")
     auth_parser.set_defaults(func=cmd_auth)
+
+    routing_parser = subparsers.add_parser(
+        "routing",
+        help="Routing policy and updater commands",
+    )
+    routing_subparsers = routing_parser.add_subparsers(dest="routing_command")
+    routing_update = routing_subparsers.add_parser("update", help="Routing integration updater")
+    routing_update_subparsers = routing_update.add_subparsers(dest="routing_update_command")
+    routing_update_status = routing_update_subparsers.add_parser(
+        "status",
+        help="Summarize the latest guarded routing update report",
+    )
+    routing_update_status.add_argument("--report-root", default="", help="Override report directory")
+    routing_update_status.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_parser.set_defaults(func=cmd_routing)
 
     # =========================================================================
     # status command

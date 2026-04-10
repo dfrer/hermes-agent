@@ -9,6 +9,7 @@ from agent.routing_guard import (
     get_routed_execution_plan,
     get_routing_decision,
     get_session_lane_context,
+    get_selected_route,
     get_task_class,
     get_verification_attempts,
     has_route_lock,
@@ -16,6 +17,13 @@ from agent.routing_guard import (
     record_tool_result,
     record_routing_decision,
 )
+
+
+def _plan_kind_labels(task_id: str) -> list[dict[str, str]]:
+    return [
+        {"kind": item["kind"], "label": item["label"]}
+        for item in get_routed_execution_plan(task_id)
+    ]
 
 
 def test_blocks_file_mutation_before_routing_decision():
@@ -389,7 +397,7 @@ def test_records_explicit_route_path_for_long_context():
         decision = get_routing_decision(task_id)
         assert decision is not None
         assert decision["path"] == "long-context"
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "hermes_nous_mimo_v2_pro", "label": "Hermes CLI (xiaomi/mimo-v2-pro via nous)"},
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
         ]
@@ -410,7 +418,7 @@ def test_records_quick_edit_route_for_minimax_primary():
         decision = get_routing_decision(task_id)
         assert decision is not None
         assert decision["path"] == "quick-edit"
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "hermes_minimax_m27", "label": "Hermes CLI (MiniMax-M2.7 via minimax)"},
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
         ]
@@ -435,6 +443,29 @@ def test_blocks_model_path_mismatch_for_long_context_route():
         )
         assert blocked is not None
         assert "does not match the allowed models for path `long-context`" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_invalid_quick_edit_tier_gets_corrective_hint():
+    task_id = "task-routing-quick-edit-tier-mismatch"
+    activate_for_task(task_id, session_id="session-quick-edit-tier-mismatch", skills=["routing-layer"])
+    try:
+        recorded = record_routing_decision(
+            task_id,
+            "TIER: 3B | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small fix | CONFIDENCE: high",
+            session_id="session-quick-edit-tier-mismatch",
+        )
+        assert recorded is False
+        blocked = pre_tool_call_block_reason(
+            "routed_exec",
+            {"task": "Do the work", "workdir": "/home/hunter/societies"},
+            task_id,
+        )
+        assert blocked is not None
+        assert "`quick-edit` is not allowed for 3B" in blocked
+        assert "`quick-edit` belongs to 3C" in blocked
+        assert "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax)" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -801,6 +832,10 @@ def test_route_stays_frozen_without_explicit_reclassification():
         assert decision is not None
         assert decision["tier"] == "3A"
         assert decision["model"] == "Codex CLI (gpt-5.4)"
+        selected = get_selected_route(task_id)
+        assert selected["policy_version"] == "3.0.0"
+        assert selected["tier"] == "3A"
+        assert selected["path"] == "high-risk"
         blocked = pre_tool_call_block_reason(
             "terminal",
             {
@@ -832,6 +867,9 @@ def test_explicit_reclassification_updates_route():
         assert decision is not None
         assert decision["tier"] == "3B"
         assert decision["model"] == "Hermes CLI (glm-5.1 via zai)"
+        selected = get_selected_route(task_id)
+        assert selected["tier"] == "3B"
+        assert selected["path"] == "marathon"
     finally:
         deactivate_for_task(task_id)
 
@@ -881,7 +919,7 @@ def test_tier_3b_reclassified_to_codex_backup_requires_codex_route():
             "RECLASSIFY: TIER: 3B | MODEL: Codex CLI (gpt-5.4-mini) | REASON: primary route failed; using backup | CONFIDENCE: high",
             session_id="session-3b-reclassified-backup",
         )
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
         ]
     finally:
@@ -897,7 +935,7 @@ def test_tier_3b_requires_primary_before_codex_backup():
             "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
             session_id="session-3b-primary",
         )
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
         ]
@@ -925,7 +963,7 @@ def test_tier_3b_requires_primary_before_codex_backup():
             ),
         )
 
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
         ]
     finally:
@@ -963,7 +1001,7 @@ def test_tier_3b_does_not_unlock_backup_when_primary_reports_structured_success(
                 }
             ),
         )
-        assert get_routed_execution_plan(task_id) == [
+        assert _plan_kind_labels(task_id) == [
             {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
             {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}
         ]

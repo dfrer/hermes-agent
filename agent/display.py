@@ -146,7 +146,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "search_files": "pattern", "browser_navigate": "url",
         "browser_click": "ref", "browser_type": "text",
         "image_generate": "prompt", "text_to_speech": "text",
-        "vision_analyze": "question", "mixture_of_agents": "user_prompt",
+        "vision_analyze": "question", "visual_context": "question",
+        "mixture_of_agents": "user_prompt",
         "skill_view": "name", "skills_list": "category",
         "cronjob": "action",
         "execute_code": "code", "delegate_task": "goal",
@@ -894,6 +895,8 @@ def get_cute_tool_message(
         return _wrap(f"┊ 🖼️  images    extracting  {dur}")
     if tool_name == "browser_vision":
         return _wrap(f"┊ 👁️  vision    analyzing page  {dur}")
+    if tool_name == "visual_context":
+        return _wrap(f"┊ 👁️  vision    context scout  {dur}")
     if tool_name == "todo":
         todos_arg = args.get("todos")
         merge = args.get("merge", False)

@@ -9,6 +9,17 @@ import threading
 import time
 from typing import Any, Optional
 
+from agent.routing_policy import (
+    ROUTING_POLICY_VERSION,
+    DEFAULT_ROUTE_PATHS,
+    get_allowed_route_models,
+    get_primary_model_path_by_tier,
+    get_route_matrix,
+    load_routing_policy,
+    normalize_route_model,
+    normalize_route_path,
+)
+
 
 DEFAULT_ROUTING_SKILL = "routing-layer"
 
@@ -298,53 +309,10 @@ _ROUTED_QUOTA_EXHAUSTED_RE = re.compile(
 _ROUTED_FAILURE_OUTPUT_RE = re.compile(
     r"(?is)\b(?:429|rate[- ]limit(?:ed)?|too many requests|insufficient balance|no resource package|resource package|quota exhausted|credits? exhausted|please recharge|remoteprotocolerror|provider dropped|transport failure|http failure|auth failure|authentication failure|model not found|write failure|patch rejection|failed to execute|timed out|timeout)\b"
 )
-_ROUTE_MATRIX: dict[str, dict[str, dict[str, Any]]] = {
-    "3A": {
-        "high-risk": {
-            "primary": {"kind": "codex_gpt54", "label": "Codex CLI (gpt-5.4)"},
-            "fallbacks": [],
-        }
-    },
-    "3B": {
-        "marathon": {
-            "primary": {"kind": "hermes_glm_zai", "label": "Hermes CLI (glm-5.1 via zai)"},
-            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
-        },
-        "long-context": {
-            "primary": {"kind": "hermes_nous_mimo_v2_pro", "label": "Hermes CLI (xiaomi/mimo-v2-pro via nous)"},
-            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
-        },
-    },
-    "3C": {
-        "quick-edit": {
-            "primary": {"kind": "hermes_minimax_m27", "label": "Hermes CLI (MiniMax-M2.7 via minimax)"},
-            "fallbacks": [{"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"}],
-        }
-    },
-}
-
-_PRIMARY_MODEL_PATH_BY_TIER: dict[str, dict[str, str]] = {}
-for _tier_key, _paths in _ROUTE_MATRIX.items():
-    _PRIMARY_MODEL_PATH_BY_TIER[_tier_key] = {}
-    for _path_key, _profile in _paths.items():
-        _PRIMARY_MODEL_PATH_BY_TIER[_tier_key][" ".join(_profile["primary"]["label"].strip().lower().split())] = _path_key
-
-_ALLOWED_ROUTE_MODELS = {
-    tier: tuple(
-        dict.fromkeys(
-            target["label"]
-            for profile in paths.values()
-            for target in [profile["primary"], *profile.get("fallbacks", [])]
-        )
-    )
-    for tier, paths in _ROUTE_MATRIX.items()
-}
-
-_DEFAULT_ROUTE_PATHS = {
-    "3A": "high-risk",
-    "3B": "marathon",
-    "3C": "quick-edit",
-}
+_ROUTE_MATRIX: dict[str, dict[str, dict[str, Any]]] = get_route_matrix()
+_PRIMARY_MODEL_PATH_BY_TIER: dict[str, dict[str, str]] = get_primary_model_path_by_tier()
+_ALLOWED_ROUTE_MODELS = get_allowed_route_models()
+_DEFAULT_ROUTE_PATHS = dict(DEFAULT_ROUTE_PATHS)
 
 _task_state_lock = threading.Lock()
 _task_state: dict[str, dict[str, Any]] = {}
@@ -847,6 +815,17 @@ def get_routing_decision(task_id: str) -> Optional[dict[str, str]]:
         return dict(decision)
 
 
+def get_selected_route(task_id: str) -> dict[str, Any]:
+    if not task_id:
+        return {}
+    with _task_state_lock:
+        _purge_expired()
+        selected = _task_state.get(task_id, {}).get("selected_route")
+        if not isinstance(selected, dict):
+            return {}
+        return dict(selected)
+
+
 def get_session_lane_context(task_id: str) -> dict[str, str]:
     if not task_id:
         return {"model": "", "provider": "", "label": ""}
@@ -924,15 +903,15 @@ def get_verification_attempts(task_id: str) -> list[dict[str, Any]]:
 
 
 def _normalize_route_model(model: str) -> str:
-    return " ".join((model or "").strip().lower().split())
+    return normalize_route_model(model)
 
 
 def _normalize_route_path(path: str) -> str:
-    return "-".join((path or "").strip().lower().split())
+    return normalize_route_path(path)
 
 
 def _infer_route_path(tier: str, normalized_model: str) -> str:
-    inferred = _PRIMARY_MODEL_PATH_BY_TIER.get((tier or "").upper(), {}).get(normalized_model)
+    inferred = get_primary_model_path_by_tier().get((tier or "").upper(), {}).get(normalized_model)
     if inferred:
         return inferred
     return _DEFAULT_ROUTE_PATHS.get(tier, "")
@@ -943,7 +922,7 @@ def _get_route_profile(tier: str, path: str, normalized_model: str = "") -> Opti
     normalized_path = _normalize_route_path(path)
     if not normalized_path:
         normalized_path = _infer_route_path(normalized_tier, normalized_model)
-    return _ROUTE_MATRIX.get(normalized_tier, {}).get(normalized_path)
+    return get_route_matrix().get(normalized_tier, {}).get(normalized_path)
 
 
 def _format_route_label(tier: str, model: str) -> str:
@@ -958,13 +937,54 @@ def _format_route_label_with_path(tier: str, path: str, model: str) -> str:
 
 
 def _format_allowed_route_models(tier: str) -> str:
-    labels = _ALLOWED_ROUTE_MODELS.get((tier or "").upper(), ())
+    labels = get_allowed_route_models().get((tier or "").upper(), ())
     return ", ".join(f"`{label}`" for label in labels)
 
 
 def _format_allowed_route_paths(tier: str) -> str:
-    labels = tuple(_ROUTE_MATRIX.get((tier or "").upper(), {}).keys())
+    labels = tuple(get_route_matrix().get((tier or "").upper(), {}).keys())
     return ", ".join(f"`{label}`" for label in labels)
+
+
+def _format_route_correction_hint(tier: str, path: str, normalized_model: str) -> str:
+    route_matrix = get_route_matrix()
+    hints: list[str] = []
+    normalized_path = _normalize_route_path(path)
+    normalized_tier = (tier or "").upper()
+
+    if normalized_path:
+        for candidate_tier, paths in route_matrix.items():
+            profile = paths.get(normalized_path)
+            if not profile or candidate_tier == normalized_tier:
+                continue
+            primary_label = str(profile.get("primary", {}).get("label", "") or "")
+            if primary_label:
+                hints.append(
+                    f"`{normalized_path}` belongs to {candidate_tier}; use "
+                    f"`{_format_route_label_with_path(candidate_tier, normalized_path, primary_label)}`."
+                )
+
+    if normalized_model:
+        for candidate_tier, paths in route_matrix.items():
+            for candidate_path, profile in paths.items():
+                targets = [profile.get("primary", {}), *list(profile.get("fallbacks", []) or [])]
+                for target in targets:
+                    label = str(target.get("label", "") or "")
+                    if normalized_model != _normalize_route_model(label):
+                        continue
+                    hints.append(
+                        f"`{label}` is valid on {candidate_tier}/{candidate_path}; use "
+                        f"`{_format_route_label_with_path(candidate_tier, candidate_path, label)}`."
+                    )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        if hint in seen:
+            continue
+        seen.add(hint)
+        deduped.append(hint)
+    return f" Correction: {' '.join(deduped)}" if deduped else ""
 
 
 def _set_decision_error(state: dict[str, Any], message: str) -> None:
@@ -1013,24 +1033,33 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
                 decision["path"] = _normalize_route_path(str(current.get("path", "")))
             else:
                 decision["path"] = _infer_route_path(decision["tier"], normalized_model)
-        if decision["path"] not in _ROUTE_MATRIX.get(decision["tier"], {}):
+        policy = load_routing_policy()
+        route_matrix = {
+            tier: {path: profile.to_dict() for path, profile in paths.items()}
+            for tier, paths in policy.routes.items()
+        }
+        if decision["path"] not in route_matrix.get(decision["tier"], {}):
+            correction = _format_route_correction_hint(decision["tier"], decision["path"], normalized_model)
             _set_decision_error(
                 state,
                 (
                     f"Routing guard blocked invalid routing path for task {task_id}: "
                     f"`{decision['path']}` is not allowed for {decision['tier']}. "
                     f"Allowed paths for {decision['tier']} are: {_format_allowed_route_paths(decision['tier'])}."
+                    f"{correction}"
                 ),
             )
             return False
-        allowed_models = _ALLOWED_ROUTE_MODELS.get(decision["tier"], ())
+        allowed_models = get_allowed_route_models().get(decision["tier"], ())
         if normalized_model not in {_normalize_route_model(label) for label in allowed_models}:
+            correction = _format_route_correction_hint(decision["tier"], decision["path"], normalized_model)
             _set_decision_error(
                 state,
                 (
                     f"Routing guard blocked invalid routing decision for task {task_id}: "
                     f"`{_format_route_label(decision['tier'], decision['model'])}` is not allowed. "
                     f"Allowed model labels for {decision['tier']} are: {_format_allowed_route_models(decision['tier'])}."
+                    f"{correction}"
                 ),
             )
             return False
@@ -1050,12 +1079,14 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
             *(_normalize_route_model(item["label"]) for item in profile.get("fallbacks", [])),
         }
         if normalized_model not in profile_models:
+            correction = _format_route_correction_hint(decision["tier"], decision["path"], normalized_model)
             _set_decision_error(
                 state,
                 (
                     f"Routing guard blocked invalid routing decision for task {task_id}: "
                     f"`{_format_route_label_with_path(decision['tier'], decision['path'], decision['model'])}` "
                     f"does not match the allowed models for path `{decision['path']}`."
+                    f"{correction}"
                 ),
             )
             return False
@@ -1078,6 +1109,14 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
         state["session_id"] = session_id or state.get("session_id", "")
         state["routed"] = True
         state["decision"] = decision
+        state["policy_version"] = policy.version or ROUTING_POLICY_VERSION
+        state["selected_route"] = {
+            "policy_version": policy.version or ROUTING_POLICY_VERSION,
+            "tier": decision["tier"],
+            "path": decision["path"],
+            "model": decision["model"],
+            "profile": profile,
+        }
         state["decision_line"] = raw_line
         state["decision_error"] = None
         state["updated_at"] = time.time()

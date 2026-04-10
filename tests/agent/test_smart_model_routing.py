@@ -1,61 +1,88 @@
-from agent.smart_model_routing import choose_cheap_model_route
+from agent.routing_policy import (
+    ROUTING_POLICY_VERSION,
+    get_allowed_route_models,
+    load_routing_policy,
+    resolve_primary_turn_route,
+)
 
 
-_BASE_CONFIG = {
-    "enabled": True,
-    "cheap_model": {
+def test_default_matrix_resolves_current_routes():
+    policy = load_routing_policy({})
+
+    assert policy.valid
+    assert policy.version == ROUTING_POLICY_VERSION
+    assert policy.profile("3A", "high-risk").primary.model == "gpt-5.4"
+    assert policy.profile("3B", "marathon").primary.model == "glm-5.1"
+    assert policy.profile("3B", "marathon").primary.provider == "zai"
+    assert policy.profile("3B", "marathon").fallbacks[0].model == "gpt-5.4-mini"
+    assert policy.profile("3B", "long-context").primary.model == "xiaomi/mimo-v2-pro"
+    assert policy.profile("3B", "long-context").primary.provider == "nous"
+    assert policy.profile("3C", "quick-edit").primary.model == "MiniMax-M2.7"
+    assert policy.profile("3C", "quick-edit").primary.provider == "minimax"
+
+
+def test_config_override_validates_and_applies():
+    cfg = {
+        "routing": {
+            "policy_version": "test-policy",
+            "routes": {
+                "3A": {"high-risk": {"primary": "codex_gpt54", "fallbacks": [], "default_timeout": 111}},
+                "3B": {
+                    "marathon": {"primary": "hermes_glm_zai", "fallbacks": ["codex_gpt54mini"]},
+                    "long-context": {"primary": "hermes_nous_mimo_v2_pro", "fallbacks": ["codex_gpt54mini"]},
+                },
+                "3C": {"quick-edit": {"primary": "hermes_minimax_m27", "fallbacks": ["codex_gpt54mini"]}},
+            },
+        }
+    }
+
+    policy = load_routing_policy(cfg)
+
+    assert policy.valid
+    assert policy.version == "test-policy"
+    assert policy.profile("3A", "high-risk").default_timeout == 111
+
+
+def test_invalid_override_fails_closed_to_defaults():
+    cfg = {
+        "routing": {
+            "routes": {
+                "3A": {"high-risk": {"primary": "unknown", "fallbacks": []}},
+                "3B": {"marathon": {"primary": "hermes_glm_zai", "fallbacks": []}},
+                "3C": {"quick-edit": {"primary": "hermes_minimax_m27", "fallbacks": []}},
+            }
+        }
+    }
+
+    policy = load_routing_policy(cfg)
+
+    assert not policy.valid
+    assert policy.profile("3A", "high-risk").primary.model == "gpt-5.4"
+    assert any("unknown routed executor" in error for error in policy.errors)
+
+
+def test_allowed_route_models_come_from_policy():
+    allowed = get_allowed_route_models({})
+
+    assert allowed["3A"] == ("Codex CLI (gpt-5.4)",)
+    assert "Hermes CLI (glm-5.1 via zai)" in allowed["3B"]
+    assert "Codex CLI (gpt-5.4-mini)" in allowed["3C"]
+
+
+def test_resolve_primary_turn_route_ignores_deprecated_smart_routing():
+    primary = {
+        "model": "anthropic/claude-sonnet-4",
         "provider": "openrouter",
-        "model": "google/gemini-2.5-flash",
-    },
-}
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+        "api_key": "sk-primary",
+        "credential_pool": object(),
+    }
 
+    result = resolve_primary_turn_route(primary)
 
-def test_returns_none_when_disabled():
-    cfg = {**_BASE_CONFIG, "enabled": False}
-    assert choose_cheap_model_route("what time is it in tokyo?", cfg) is None
-
-
-def test_routes_short_simple_prompt():
-    result = choose_cheap_model_route("what time is it in tokyo?", _BASE_CONFIG)
-    assert result is not None
-    assert result["provider"] == "openrouter"
-    assert result["model"] == "google/gemini-2.5-flash"
-    assert result["routing_reason"] == "simple_turn"
-
-
-def test_skips_long_prompt():
-    prompt = "please summarize this carefully " * 20
-    assert choose_cheap_model_route(prompt, _BASE_CONFIG) is None
-
-
-def test_skips_code_like_prompt():
-    prompt = "debug this traceback: ```python\nraise ValueError('bad')\n```"
-    assert choose_cheap_model_route(prompt, _BASE_CONFIG) is None
-
-
-def test_skips_tool_heavy_prompt_keywords():
-    prompt = "implement a patch for this docker error"
-    assert choose_cheap_model_route(prompt, _BASE_CONFIG) is None
-
-
-def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_resolved(monkeypatch):
-    from agent.smart_model_routing import resolve_turn_route
-
-    monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad route")),
-    )
-    result = resolve_turn_route(
-        "what time is it in tokyo?",
-        _BASE_CONFIG,
-        {
-            "model": "anthropic/claude-sonnet-4",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_mode": "chat_completions",
-            "api_key": "sk-primary",
-        },
-    )
     assert result["model"] == "anthropic/claude-sonnet-4"
     assert result["runtime"]["provider"] == "openrouter"
+    assert result["runtime"]["api_key"] == "sk-primary"
+    assert result["runtime"]["credential_pool"] is primary["credential_pool"]
     assert result["label"] is None

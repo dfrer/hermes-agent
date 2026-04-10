@@ -80,7 +80,7 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         type(self).refresh_attempts += 1
         return True
 
-    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None, **kwargs):
         calls = {"api": 0}
 
         def _fake_api_call(api_kwargs):
@@ -90,7 +90,12 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
             return _codex_message_response("Recovered via refresh")
 
         self._interruptible_api_call = _fake_api_call
-        return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
+        return super().run_conversation(
+            user_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            **kwargs,
+        )
 
 
 def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
@@ -152,7 +157,6 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._running_agents = {}
-    runner._smart_model_routing = {}
     from unittest.mock import MagicMock, AsyncMock
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()

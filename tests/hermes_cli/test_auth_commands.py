@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+import yaml
 
 
 def _write_auth_store(tmp_path, payload: dict) -> None:
@@ -657,3 +658,127 @@ def test_auth_remove_manual_entry_does_not_touch_env(tmp_path, monkeypatch):
 
     # .env should be untouched
     assert env_path.read_text() == "SOME_KEY=some-value\n"
+
+
+def test_auth_migrate_config_keys_dry_run_redacts_values(tmp_path, monkeypatch, capsys):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "model": {
+                "provider": "custom",
+                "base_url": "https://chutes.example/v1",
+                "api_key": "sk-model-secret",
+            },
+            "custom_providers": [
+                {
+                    "name": "Chutes AI",
+                    "base_url": "https://chutes.example/v1",
+                    "api_key": "sk-custom-secret",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth_commands import auth_migrate_config_keys_command
+
+    class _Args:
+        dry_run = True
+        apply = False
+
+    auth_migrate_config_keys_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "model.api_key -> custom:chutes-ai: would_import" in out
+    assert "custom_providers[0].api_key -> custom:chutes-ai: would_import" in out
+    assert "sk-model-secret" not in out
+    assert "sk-custom-secret" not in out
+
+
+def test_auth_migrate_config_keys_apply_imports_and_removes_inline_secrets(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({
+            "providers": {
+                "zai": {
+                    "api_key": "sk-zai-secret",
+                    "base_url": "https://api.z.ai/api/paas/v4",
+                }
+            },
+            "custom_providers": [
+                {
+                    "name": "Chutes AI",
+                    "base_url": "https://chutes.example/v1",
+                    "api_key": "sk-custom-secret",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth_commands import auth_migrate_config_keys_command
+
+    class _Args:
+        dry_run = False
+        apply = True
+
+    auth_migrate_config_keys_command(_Args())
+
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    assert payload["credential_pool"]["zai"][0]["access_token"] == "sk-zai-secret"
+    assert payload["credential_pool"]["custom:chutes-ai"][0]["access_token"] == "sk-custom-secret"
+
+    updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "api_key" not in updated["providers"]["zai"]
+    assert "api_key" not in updated["custom_providers"][0]
+    assert updated["providers"]["zai"]["base_url"] == "https://api.z.ai/api/paas/v4"
+    assert updated["custom_providers"][0]["base_url"] == "https://chutes.example/v1"
+
+
+def test_auth_migrate_config_keys_does_not_overwrite_existing_pool_entry(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "existing",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-existing",
+                    }
+                ]
+            },
+        },
+    )
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"model": {"provider": "openrouter", "api_key": "sk-existing"}}),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth_commands import migrate_config_keys
+
+    result = migrate_config_keys(apply=True)
+
+    assert result[0]["status"] == "already_present"
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    entries = payload["credential_pool"]["openrouter"]
+    assert len(entries) == 1
+    assert entries[0]["label"] == "existing"
+    updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "api_key" not in updated["model"]

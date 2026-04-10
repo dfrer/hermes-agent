@@ -356,13 +356,21 @@ def _resolve_named_custom_runtime(
     if pool_result:
         return pool_result
 
-    api_key_candidates = [
-        (explicit_api_key or "").strip(),
-        str(custom_provider.get("api_key", "") or "").strip(),
-        os.getenv("OPENAI_API_KEY", "").strip(),
-        os.getenv("OPENROUTER_API_KEY", "").strip(),
-    ]
-    api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
+    api_key = ""
+    for source, candidate in (
+        ("explicit", (explicit_api_key or "").strip()),
+        ("config", str(custom_provider.get("api_key", "") or "").strip()),
+        ("env:OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "").strip()),
+        ("env:OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "").strip()),
+    ):
+        if has_usable_secret(candidate):
+            api_key = candidate
+            if source == "config":
+                logger.warning(
+                    "Using deprecated inline custom provider api_key from config.yaml; "
+                    "run `hermes auth migrate-config-keys --apply`."
+                )
+            break
 
     return {
         "provider": "custom",
@@ -421,9 +429,9 @@ def _resolve_openrouter_runtime(
     _is_openrouter_url = "openrouter.ai" in base_url
     if _is_openrouter_url:
         api_key_candidates = [
-            explicit_api_key,
-            os.getenv("OPENROUTER_API_KEY"),
-            os.getenv("OPENAI_API_KEY"),
+            ("explicit", explicit_api_key),
+            ("env:OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY")),
+            ("env:OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
@@ -431,16 +439,25 @@ def _resolve_openrouter_runtime(
         # the canonical env var for ollama.com authentication.
         _is_ollama_url = "ollama.com" in base_url.lower()
         api_key_candidates = [
-            explicit_api_key,
-            (cfg_api_key if use_config_base_url else ""),
-            (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
-            os.getenv("OPENAI_API_KEY"),
-            os.getenv("OPENROUTER_API_KEY"),
+            ("explicit", explicit_api_key),
+            ("config", (cfg_api_key if use_config_base_url else "")),
+            ("env:OLLAMA_API_KEY", (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else "")),
+            ("env:OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
+            ("env:OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY")),
         ]
-    api_key = next(
-        (str(candidate or "").strip() for candidate in api_key_candidates if has_usable_secret(candidate)),
-        "",
-    )
+    api_key = ""
+    api_key_source = ""
+    for source, candidate in api_key_candidates:
+        candidate_text = str(candidate or "").strip()
+        if has_usable_secret(candidate_text):
+            api_key = candidate_text
+            api_key_source = source
+            break
+    if api_key_source == "config":
+        logger.warning(
+            "Using deprecated inline model api_key from config.yaml; "
+            "run `hermes auth migrate-config-keys --apply`."
+        )
 
     source = "explicit" if (explicit_api_key or explicit_base_url) else "env/config"
 

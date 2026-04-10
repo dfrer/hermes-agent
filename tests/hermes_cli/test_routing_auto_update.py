@@ -156,6 +156,70 @@ def test_run_routing_auto_update_noop_writes_report(tmp_path, tmp_hermes_home, m
     assert (report_root / "latest.md").exists()
 
 
+def test_ahead_behind_parses_git_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rau,
+        "_git",
+        lambda repo, *args, cwd=None, check=True: subprocess.CompletedProcess(args, 0, stdout="4\t31\n", stderr=""),
+    )
+
+    assert rau._ahead_behind(tmp_path, rau.UPSTREAM_REF, "HEAD") == (4, 31)
+
+
+def test_verification_suite_runs_smoke_after_targeted_tests(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_pytest(repo_root, tests):
+        calls.append(("pytest", tuple(tests)))
+        return "pytest " + tests[0]
+
+    def fake_smoke(repo_root):
+        calls.append(("smoke", ()))
+        return "python -m py_compile"
+
+    monkeypatch.setattr(rau, "_run_pytest", fake_pytest)
+    monkeypatch.setattr(rau, "_run_smoke_checks", fake_smoke)
+
+    executed = rau._run_verification_suite(tmp_path)
+
+    assert calls == [
+        ("pytest", rau.ROUTING_CONTRACT_TESTS),
+        ("pytest", rau.TARGETED_REGRESSION_TESTS),
+        ("smoke", ()),
+    ]
+    assert executed[-1] == "python -m py_compile"
+
+
+def test_routing_update_status_reads_latest_report(tmp_path):
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    (report_root / "latest.json").write_text(
+        json.dumps({
+            "status": "merge_conflict",
+            "finished_at": "2026-04-09T21:00:00+00:00",
+            "message": "conflict in routing guard",
+            "upstream_behind_count": 2,
+            "upstream_ahead_count": 31,
+            "fork_behind_count": 0,
+            "fork_ahead_count": 1,
+            "retained_failed_worktree": "/tmp/hermes-update",
+            "gateway_running": True,
+            "telegram_connected": False,
+        }),
+        encoding="utf-8",
+    )
+
+    status = rau.routing_update_status(report_root)
+
+    assert status["status"] == "merge_conflict"
+    assert status["last_error"] == "conflict in routing guard"
+    assert status["branch_drift"]["upstream_behind"] == 2
+    assert status["branch_drift"]["upstream_ahead"] == 31
+    assert status["retained_worktree"] == "/tmp/hermes-update"
+    assert status["gateway_running"] is True
+    assert status["telegram_connected"] is False
+
+
 def test_run_routing_auto_update_dirty_worktree_short_circuits(tmp_path, tmp_hermes_home, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

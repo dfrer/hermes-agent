@@ -313,11 +313,11 @@ DEFAULT_CONFIG = {
         "summary_provider": "auto",
         "summary_base_url": None,
     },
-    "smart_model_routing": {
-        "enabled": False,
-        "max_simple_chars": 160,
-        "max_simple_words": 28,
-        "cheap_model": {},
+    "routing": {
+        "policy_version": "3.0.0",
+        # Optional advanced overrides for the guarded routed-exec matrix.
+        # Empty means use the built-in canonical defaults.
+        "routes": {},
     },
     
     # Auxiliary model config — provider:model for each side task.
@@ -606,11 +606,11 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "OPENROUTER_API_KEY": {
-        "description": "OpenRouter API key (for vision, web scraping helpers, and MoA)",
+        "description": "OpenRouter API key (for vision, visual context, web scraping helpers, and MoA)",
         "prompt": "OpenRouter API key",
         "url": "https://openrouter.ai/keys",
         "password": True,
-        "tools": ["vision_analyze", "mixture_of_agents"],
+        "tools": ["vision_analyze", "visual_context", "mixture_of_agents"],
         "category": "provider",
         "advanced": True,
     },
@@ -1397,7 +1397,9 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "memory", "gateway",
+    "auxiliary", "custom_providers", "memory", "gateway", "routing",
+    # Deprecated but tolerated so older config files do not hard-fail.
+    "smart_model_routing",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -2038,18 +2040,13 @@ _FALLBACK_COMMENT = """
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
 #
-# ── Smart Model Routing ────────────────────────────────────────────────
-# Optional cheap-vs-strong routing for simple turns.
-# Keeps the primary model for complex work, but can route short/simple
-# messages to a cheaper model across providers.
+# ── Routing Policy ────────────────────────────────────────────────────
+# Advanced guarded-routing overrides. Leave routes empty to use the
+# canonical Hermes routing defaults.
 #
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
+# routing:
+#   policy_version: "3.0.0"
+#   routes: {}
 """
 
 
@@ -2081,18 +2078,13 @@ _COMMENTED_SECTIONS = """
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
 #
-# ── Smart Model Routing ────────────────────────────────────────────────
-# Optional cheap-vs-strong routing for simple turns.
-# Keeps the primary model for complex work, but can route short/simple
-# messages to a cheaper model across providers.
+# ── Routing Policy ────────────────────────────────────────────────────
+# Advanced guarded-routing overrides. Leave routes empty to use the
+# canonical Hermes routing defaults.
 #
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
+# routing:
+#   policy_version: "3.0.0"
+#   routes: {}
 """
 
 

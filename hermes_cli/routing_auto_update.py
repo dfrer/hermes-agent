@@ -65,6 +65,14 @@ TARGETED_REGRESSION_TESTS: tuple[str, ...] = (
     "tests/tools/test_terminal_none_command_guard.py",
 )
 
+FAST_SMOKE_FILES: tuple[str, ...] = (
+    "agent/routing_policy.py",
+    "agent/routing_guard.py",
+    "tools/routed_exec_tool.py",
+    "hermes_cli/auth_commands.py",
+    "hermes_cli/routing_auto_update.py",
+)
+
 CRON_PROMPT_TEMPLATE = """You are running the daily Hermes routing-preserving updater.
 
 Do not implement Git update logic yourself. The deterministic script is authoritative.
@@ -99,6 +107,10 @@ class UpdateReport:
     pre_update_head: str = ""
     upstream_head: str = ""
     post_update_head: str = ""
+    upstream_behind_count: int = 0
+    upstream_ahead_count: int = 0
+    fork_behind_count: int = 0
+    fork_ahead_count: int = 0
     update_branch: str = ""
     update_worktree: str = ""
     backup_dir: str = ""
@@ -190,6 +202,8 @@ def _render_markdown_report(report: UpdateReport) -> str:
         f"- Repo: `{report.repo_root}`",
         f"- Branch: `{report.live_branch}`",
         f"- Upstream: `{report.upstream_ref}` at `{report.upstream_head or 'n/a'}`",
+        f"- Upstream drift: behind `{report.upstream_behind_count}`, ahead `{report.upstream_ahead_count}`",
+        f"- Fork drift: behind `{report.fork_behind_count}`, ahead `{report.fork_ahead_count}`",
         f"- Pre-update HEAD: `{report.pre_update_head or 'n/a'}`",
         f"- Post-update HEAD: `{report.post_update_head or report.pre_update_head or 'n/a'}`",
         f"- Push remote: `{report.push_remote}` ({report.push_status})",
@@ -274,6 +288,19 @@ def _git(
 def _git_output(repo_root: Path, *args: str, cwd: Path | None = None) -> str:
     result = _git(repo_root, *args, cwd=cwd, check=True)
     return (result.stdout or "").strip()
+
+
+def _ahead_behind(repo_root: Path, left_ref: str, right_ref: str) -> tuple[int, int]:
+    result = _git(repo_root, "rev-list", "--left-right", "--count", f"{left_ref}...{right_ref}", check=False)
+    if result.returncode != 0:
+        return 0, 0
+    parts = (result.stdout or "").replace("\t", " ").split()
+    if len(parts) < 2:
+        return 0, 0
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
 
 
 def _ensure_safe_directory(path: Path) -> None:
@@ -478,10 +505,17 @@ def _run_pytest(repo_root: Path, tests: Sequence[str]) -> str:
     return " ".join(cmd)
 
 
+def _run_smoke_checks(repo_root: Path) -> str:
+    cmd = [sys.executable, "-m", "py_compile", *FAST_SMOKE_FILES]
+    _run_subprocess(cmd, cwd=repo_root)
+    return " ".join(cmd)
+
+
 def _run_verification_suite(worktree: Path) -> list[str]:
     executed: list[str] = []
     executed.append(_run_pytest(worktree, ROUTING_CONTRACT_TESTS))
     executed.append(_run_pytest(worktree, TARGETED_REGRESSION_TESTS))
+    executed.append(_run_smoke_checks(worktree))
     return [item for item in executed if item]
 
 
@@ -700,12 +734,14 @@ def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | N
 
         report.pre_update_head = _git_output(repo_root, "rev-parse", "HEAD")
         report.upstream_head = _git_output(repo_root, "rev-parse", UPSTREAM_REF)
+        report.upstream_behind_count, report.upstream_ahead_count = _ahead_behind(repo_root, UPSTREAM_REF, "HEAD")
 
         upstream_missing = not _git_is_ancestor(repo_root, UPSTREAM_REF, "HEAD")
         push_needed = True
         if _git_branch_exists(repo_root, PUSH_REF):
             remote_head = _git_output(repo_root, "rev-parse", PUSH_REF)
             push_needed = remote_head != report.pre_update_head
+            report.fork_behind_count, report.fork_ahead_count = _ahead_behind(repo_root, PUSH_REF, "HEAD")
 
         if not upstream_missing:
             report.post_update_head = report.pre_update_head
@@ -819,6 +855,85 @@ def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | N
         )
 
 
+def read_latest_update_report(report_root: Path | str | None = None) -> dict[str, Any]:
+    hermes_home = _normalize_path(get_hermes_home())
+    root = _normalize_path(report_root or _default_report_root(hermes_home))
+    latest = root / "latest.json"
+    if not latest.exists():
+        return {}
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def routing_update_status(report_root: Path | str | None = None) -> dict[str, Any]:
+    latest = read_latest_update_report(report_root)
+    if not latest:
+        return {
+            "status": "missing",
+            "message": "No routing auto-update report has been written yet.",
+            "last_run": "",
+            "branch_drift": {},
+            "last_error": "",
+            "retained_worktree": "",
+            "gateway_running": None,
+            "telegram_connected": None,
+        }
+
+    status = str(latest.get("status") or "")
+    message = str(latest.get("message") or "")
+    last_error = "" if status in {"noop", "updated"} else message
+    return {
+        "status": status,
+        "message": message,
+        "last_run": latest.get("finished_at") or latest.get("started_at") or "",
+        "repo_root": latest.get("repo_root") or "",
+        "live_branch": latest.get("live_branch") or LIVE_BRANCH,
+        "upstream_ref": latest.get("upstream_ref") or UPSTREAM_REF,
+        "branch_drift": {
+            "upstream_behind": int(latest.get("upstream_behind_count") or 0),
+            "upstream_ahead": int(latest.get("upstream_ahead_count") or 0),
+            "fork_behind": int(latest.get("fork_behind_count") or 0),
+            "fork_ahead": int(latest.get("fork_ahead_count") or 0),
+        },
+        "last_error": last_error,
+        "retained_worktree": latest.get("retained_failed_worktree") or "",
+        "gateway_running": latest.get("gateway_running"),
+        "gateway_service_installed": latest.get("gateway_service_installed"),
+        "telegram_connected": latest.get("telegram_connected"),
+        "push_status": latest.get("push_status") or "",
+    }
+
+
+def routing_status_command(args) -> None:
+    summary = routing_update_status(getattr(args, "report_root", "") or None)
+    if getattr(args, "json", False):
+        print(json.dumps(summary, indent=2))
+        return
+
+    drift = summary.get("branch_drift") or {}
+    print(f"Routing update status: {summary.get('status')}")
+    if summary.get("last_run"):
+        print(f"Last run: {summary['last_run']}")
+    if summary.get("message"):
+        print(f"Message: {summary['message']}")
+    print(
+        "Branch drift: "
+        f"upstream behind {drift.get('upstream_behind', 0)}, "
+        f"upstream ahead {drift.get('upstream_ahead', 0)}, "
+        f"fork behind {drift.get('fork_behind', 0)}, "
+        f"fork ahead {drift.get('fork_ahead', 0)}"
+    )
+    if summary.get("last_error"):
+        print(f"Last error: {summary['last_error']}")
+    if summary.get("retained_worktree"):
+        print(f"Retained worktree: {summary['retained_worktree']}")
+    print(f"Gateway running: {summary.get('gateway_running')}")
+    print(f"Telegram connected: {summary.get('telegram_connected')}")
+
+
 def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     install_parser = subparsers.add_parser("install", help="Install or update the routing auto-update cron job")
     install_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
@@ -828,6 +943,10 @@ def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     run_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
     run_parser.add_argument("--report-root", default="")
     run_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
+
+    status_parser = subparsers.add_parser("status", help="Summarize the latest routing auto-update report")
+    status_parser.add_argument("--report-root", default="")
+    status_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -843,6 +962,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(result.message)
             print(f"job_id={result.job_id}")
+        return 0
+
+    if args.command == "status":
+        routing_status_command(args)
         return 0
 
     report = run_routing_auto_update(args.repo_root, args.report_root or None)

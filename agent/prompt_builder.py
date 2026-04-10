@@ -264,9 +264,14 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "<routing_discipline>\n"
     "- Prefer the explicit routing format `TIER: ... | PATH: ... | MODEL: ... | REASON: ... | CONFIDENCE: ...`.\n"
     "- The main/local lane always runs on the current Hermes session model/provider for this session; do not assume a fixed main model.\n"
+    "- `visual_context`, `browser_vision`, and `vision_analyze` are read-only local-lane context tools, not route archetypes or routed implementation paths.\n"
+    "- For UI, web, screenshot, canvas, layout, responsive, or visual QA work, use visual context before implementation or final verification when text/DOM inspection is likely insufficient.\n"
     "- If a routing decision has already been emitted for the current coding task, keep that route stable.\n"
     "- Do not silently change from `3A` to `3B`/`3C` or vice versa during ordinary investigation.\n"
+    "- If a completed routed execution reveals a distinct follow-up coding fix that needs a different route in the same turn, use an explicit `RECLASSIFY:` routing line before the next `routed_exec` call.\n"
     "- Use route archetypes intentionally: `quick-edit` for simple low-risk edit loops, `marathon` for long autonomous build/test/fix work, `long-context` for very large-context analysis, and `high-risk` for dangerous or expensive-to-unwind changes.\n"
+    "- Valid route table: `3A | high-risk | Codex CLI (gpt-5.4)`; `3B | marathon | Hermes CLI (glm-5.1 via zai)`; `3B | long-context | Hermes CLI (xiaomi/mimo-v2-pro via nous)`; `3C | quick-edit | Hermes CLI (MiniMax-M2.7 via minimax)`.\n"
+    "- Never pair `PATH: quick-edit` with `TIER: 3B`; quick-edit is always the `3C` MiniMax route.\n"
     "- After emitting the routing decision, use the structured `routed_exec` tool for routed Codex/Hermes execution. Do not build raw `codex exec` or `hermes chat` shell commands yourself.\n"
     "- For `3B / marathon`, `routed_exec` must try `Hermes CLI (glm-5.1 via zai)` first and use the Codex backup only after the Hermes primary actually fails.\n"
     "- For `3B / long-context`, prefer `Hermes CLI (xiaomi/mimo-v2-pro via nous)`.\n"
@@ -295,7 +300,7 @@ def build_routing_session_prompt(model: str = "", provider: str = "") -> str:
     return (
         "<routing_session_context>\n"
         f"- Current Hermes session model for the local/main lane: `{label}`.\n"
-        "- Keep planning, diagnosis, read-only inspection, review, local verification, and final synthesis on this current session model unless the routing policy says to delegate implementation.\n"
+        "- Keep planning, diagnosis, read-only inspection, visual context gathering, review, local verification, and final synthesis on this current session model unless the routing policy says to delegate implementation.\n"
         "- Routed implementation paths are separate and must still follow the routing-layer matrix and fallback rules.\n"
         "</routing_session_context>"
     )
@@ -811,6 +816,7 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
     relevant_tool_names = {
         "web_search",
         "web_extract",
+        "visual_context",
         "browser_navigate",
         "browser_snapshot",
         "browser_click",

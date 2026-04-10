@@ -484,7 +484,6 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
-        self._smart_model_routing = self._load_smart_model_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -781,7 +780,7 @@ class GatewayRunner:
         )
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        from agent.smart_model_routing import resolve_turn_route
+        from agent.routing_policy import resolve_primary_turn_route
 
         primary = {
             "model": model,
@@ -793,7 +792,7 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        return resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+        return resolve_primary_turn_route(primary)
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -1028,20 +1027,6 @@ class GatewayRunner:
         except Exception:
             pass
         return None
-
-    @staticmethod
-    def _load_smart_model_routing() -> dict:
-        """Load optional smart cheap-vs-strong model routing config."""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("smart_model_routing", {}) or {}
-        except Exception:
-            pass
-        return {}
 
     async def start(self) -> bool:
         """
@@ -2928,6 +2913,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                event_routing_skill_hints=getattr(event, "_routing_skill_hints", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -6303,6 +6289,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        event_routing_skill_hints: Optional[list[dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -6962,7 +6949,7 @@ class GatewayRunner:
                 turn_skill_hints = list(session_preloaded_skill_hints)
                 turn_skill_hints.extend(
                     hint
-                    for hint in getattr(event, "_routing_skill_hints", []) or []
+                    for hint in event_routing_skill_hints or []
                     if isinstance(hint, dict)
                 )
                 result = agent.run_conversation(

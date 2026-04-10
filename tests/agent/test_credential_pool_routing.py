@@ -1,7 +1,7 @@
-"""Tests for credential pool preservation through smart routing and 429 recovery.
+"""Tests for credential pool preservation through turn routing and 429 recovery.
 
 Covers:
-1. credential_pool flows through resolve_turn_route (no-route and fallback paths)
+1. credential_pool flows through primary turn-route resolution
 2. CLI _resolve_turn_agent_config passes credential_pool to primary dict
 3. Gateway _resolve_turn_agent_config passes credential_pool to primary dict
 4. Eager fallback deferred when credential pool has credentials
@@ -9,22 +9,14 @@ Covers:
 6. Full 429 rotation cycle: retry-same → rotate → exhaust → fallback
 """
 
-import os
-import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
-import pytest
+from agent.routing_policy import resolve_primary_turn_route
 
 
-# ---------------------------------------------------------------------------
-# 1. smart_model_routing: credential_pool preserved in no-route path
-# ---------------------------------------------------------------------------
-
-class TestSmartRoutingPoolPreservation:
-    def test_no_route_preserves_credential_pool(self):
-        from agent.smart_model_routing import resolve_turn_route
-
+class TestTurnRoutePoolPreservation:
+    def test_primary_route_preserves_credential_pool(self):
         fake_pool = MagicMock(name="CredentialPool")
         primary = {
             "model": "gpt-5.4",
@@ -36,13 +28,10 @@ class TestSmartRoutingPoolPreservation:
             "args": [],
             "credential_pool": fake_pool,
         }
-        # routing disabled
-        result = resolve_turn_route("hello", None, primary)
+        result = resolve_primary_turn_route(primary)
         assert result["runtime"]["credential_pool"] is fake_pool
 
-    def test_no_route_none_pool(self):
-        from agent.smart_model_routing import resolve_turn_route
-
+    def test_primary_route_none_pool(self):
         primary = {
             "model": "gpt-5.4",
             "api_key": "sk-test",
@@ -52,57 +41,8 @@ class TestSmartRoutingPoolPreservation:
             "command": None,
             "args": [],
         }
-        result = resolve_turn_route("hello", None, primary)
+        result = resolve_primary_turn_route(primary)
         assert result["runtime"]["credential_pool"] is None
-
-    def test_routing_disabled_preserves_pool(self):
-        from agent.smart_model_routing import resolve_turn_route
-
-        fake_pool = MagicMock(name="CredentialPool")
-        primary = {
-            "model": "gpt-5.4",
-            "api_key": "sk-test",
-            "base_url": None,
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "command": None,
-            "args": [],
-            "credential_pool": fake_pool,
-        }
-        # routing explicitly disabled
-        result = resolve_turn_route("hello", {"enabled": False}, primary)
-        assert result["runtime"]["credential_pool"] is fake_pool
-
-    def test_route_fallback_on_resolve_error_preserves_pool(self, monkeypatch):
-        """When smart routing picks a cheap model but resolve_runtime_provider
-        fails, the fallback to primary must still include credential_pool."""
-        from agent.smart_model_routing import resolve_turn_route
-
-        fake_pool = MagicMock(name="CredentialPool")
-        primary = {
-            "model": "gpt-5.4",
-            "api_key": "sk-test",
-            "base_url": None,
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "command": None,
-            "args": [],
-            "credential_pool": fake_pool,
-        }
-        routing_config = {
-            "enabled": True,
-            "cheap_model": "openai/gpt-4.1-mini",
-            "cheap_provider": "openrouter",
-            "max_tokens": 200,
-            "patterns": ["^(hi|hello|hey)"],
-        }
-        # Force resolve_runtime_provider to fail so it falls back to primary
-        monkeypatch.setattr(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            MagicMock(side_effect=RuntimeError("no credentials")),
-        )
-        result = resolve_turn_route("hi", routing_config, primary)
-        assert result["runtime"]["credential_pool"] is fake_pool
 
 
 # ---------------------------------------------------------------------------
@@ -112,15 +52,14 @@ class TestSmartRoutingPoolPreservation:
 class TestCliTurnRoutePool:
     def test_resolve_turn_includes_pool(self, monkeypatch, tmp_path):
         """CLI's _resolve_turn_agent_config must pass credential_pool to primary."""
-        from agent.smart_model_routing import resolve_turn_route
         captured = {}
 
-        def spy_resolve(user_message, routing_config, primary):
+        def spy_resolve(primary):
             captured["primary"] = primary
-            return resolve_turn_route(user_message, routing_config, primary)
+            return resolve_primary_turn_route(primary)
 
         monkeypatch.setattr(
-            "agent.smart_model_routing.resolve_turn_route", spy_resolve
+            "agent.routing_policy.resolve_primary_turn_route", spy_resolve
         )
 
         # Build a minimal HermesCLI-like object with the method
@@ -133,7 +72,6 @@ class TestCliTurnRoutePool:
             acp_command=None,
             acp_args=[],
             _credential_pool=MagicMock(name="FakePool"),
-            _smart_model_routing={"enabled": False},
         )
 
         # Import and bind the real method
@@ -148,22 +86,19 @@ class TestCliTurnRoutePool:
 class TestGatewayTurnRoutePool:
     def test_resolve_turn_includes_pool(self, monkeypatch):
         """Gateway's _resolve_turn_agent_config must pass credential_pool."""
-        from agent.smart_model_routing import resolve_turn_route
         captured = {}
 
-        def spy_resolve(user_message, routing_config, primary):
+        def spy_resolve(primary):
             captured["primary"] = primary
-            return resolve_turn_route(user_message, routing_config, primary)
+            return resolve_primary_turn_route(primary)
 
         monkeypatch.setattr(
-            "agent.smart_model_routing.resolve_turn_route", spy_resolve
+            "agent.routing_policy.resolve_primary_turn_route", spy_resolve
         )
 
         from gateway.run import GatewayRunner
 
-        runner = SimpleNamespace(
-            _smart_model_routing={"enabled": False},
-        )
+        runner = SimpleNamespace()
 
         runtime_kwargs = {
             "api_key": "sk-test",

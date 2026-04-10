@@ -614,7 +614,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
-        smart_routing = _cfg.get("smart_model_routing", {}) or {}
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -631,10 +630,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        from agent.smart_model_routing import resolve_turn_route
-        turn_route = resolve_turn_route(
-            prompt,
-            smart_routing,
+        from agent.routing_policy import resolve_primary_turn_route
+        turn_route = resolve_primary_turn_route(
             {
                 "model": model,
                 "api_key": runtime.get("api_key"),
@@ -643,7 +640,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "api_mode": runtime.get("api_mode"),
                 "command": runtime.get("command"),
                 "args": list(runtime.get("args") or []),
-            },
+            }
         )
 
         agent = AIAgent(

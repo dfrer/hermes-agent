@@ -227,11 +227,9 @@ def load_cli_config() -> Dict[str, Any]:
             "threshold": 0.50,    # Compress at 50% of model's context limit
             "summary_model": "",  # Model for summaries (empty = use main model)
         },
-        "smart_model_routing": {
-            "enabled": False,
-            "max_simple_chars": 160,
-            "max_simple_words": 28,
-            "cheap_model": {},
+        "routing": {
+            "policy_version": "3.0.0",
+            "routes": {},
         },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
@@ -1480,8 +1478,6 @@ class HermesCLI:
             fb = [fb] if fb.get("provider") and fb.get("model") else []
         self._fallback_model = fb
 
-        # Optional cheap-vs-strong routing for simple turns
-        self._smart_model_routing = CLI_CONFIG.get("smart_model_routing", {}) or {}
         self._active_agent_route_signature = None
 
         # Agent will be initialized on first use
@@ -2334,11 +2330,9 @@ class HermesCLI:
 
     def _resolve_turn_agent_config(self, user_message: str) -> dict:
         """Resolve model/runtime overrides for a single user turn."""
-        from agent.smart_model_routing import resolve_turn_route
+        from agent.routing_policy import resolve_primary_turn_route
 
-        return resolve_turn_route(
-            user_message,
-            self._smart_model_routing,
+        return resolve_primary_turn_route(
             {
                 "model": self.model,
                 "api_key": self.api_key,
@@ -2348,7 +2342,7 @@ class HermesCLI:
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
-            },
+            }
         )
 
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, route_label: str = None) -> bool:

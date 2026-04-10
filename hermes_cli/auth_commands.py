@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from getpass import getpass
 import math
 import time
@@ -20,6 +21,7 @@ from agent.credential_pool import (
     STRATEGY_LEAST_USED,
     PooledCredential,
     _exhausted_until,
+    get_custom_provider_pool_key,
     _normalize_custom_pool_name,
     get_pool_strategy,
     label_from_token,
@@ -33,6 +35,277 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Providers that support OAuth login in addition to API keys.
 _OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "qwen-oauth"}
+
+
+def _format_config_path(path: list[object]) -> str:
+    parts: list[str] = []
+    for item in path:
+        if isinstance(item, int):
+            if parts:
+                parts[-1] = f"{parts[-1]}[{item}]"
+            else:
+                parts.append(f"[{item}]")
+            continue
+        parts.append(str(item))
+    return ".".join(parts)
+
+
+def _base_url_from_mapping(mapping: dict) -> str:
+    base_url = str(mapping.get("base_url") or "").strip()
+    if base_url:
+        return base_url
+    api_value = str(mapping.get("api") or "").strip()
+    return api_value if "://" in api_value else ""
+
+
+def _pool_for_inline_secret(provider: str, base_url: str, fallback_name: str) -> str | None:
+    normalized = (provider or "").strip().lower()
+    if normalized in {"or", "open-router"}:
+        normalized = "openrouter"
+    if normalized.startswith(CUSTOM_POOL_PREFIX):
+        return normalized
+    if normalized in PROVIDER_REGISTRY or normalized == "openrouter":
+        return normalized
+
+    base_url = (base_url or "").strip().rstrip("/")
+    if base_url:
+        matched = get_custom_provider_pool_key(base_url)
+        if matched:
+            return matched
+
+    if normalized == "custom":
+        name = fallback_name or "custom"
+        return f"{CUSTOM_POOL_PREFIX}{_normalize_custom_pool_name(name)}"
+    if normalized and normalized != "auto":
+        return f"{CUSTOM_POOL_PREFIX}{_normalize_custom_pool_name(normalized)}"
+    if base_url and fallback_name:
+        return f"{CUSTOM_POOL_PREFIX}{_normalize_custom_pool_name(fallback_name)}"
+    return None
+
+
+def _append_secret_candidate(
+    candidates: list[dict],
+    *,
+    config_path: list[object],
+    token: object,
+    provider: str,
+    base_url: str = "",
+    fallback_name: str = "",
+    label: str = "",
+    source: str = "",
+) -> None:
+    if not auth_mod.has_usable_secret(token):
+        return
+    pool = _pool_for_inline_secret(provider, base_url, fallback_name)
+    candidates.append({
+        "path": list(config_path),
+        "path_label": _format_config_path(config_path),
+        "token": str(token).strip(),
+        "provider": provider or "",
+        "pool": pool or "",
+        "base_url": (base_url or "").strip().rstrip("/"),
+        "label": label or _format_config_path(config_path),
+        "source": source or "config",
+        "status": "pending" if pool else "skipped",
+        "reason": "" if pool else "no credential-pool mapping",
+    })
+
+
+def _collect_provider_secret_candidates(node: object, path: list[object], candidates: list[dict]) -> None:
+    if isinstance(node, dict):
+        if "api_key" in node:
+            suffix_parts = [str(part) for part in path[1:] if not isinstance(part, int)]
+            inferred_name = str(node.get("provider") or node.get("name") or ".".join(suffix_parts) or "provider")
+            _append_secret_candidate(
+                candidates,
+                config_path=[*path, "api_key"],
+                token=node.get("api_key"),
+                provider=inferred_name,
+                base_url=_base_url_from_mapping(node),
+                fallback_name=inferred_name,
+                label=f"{inferred_name} config import",
+                source="providers",
+            )
+        for key, value in node.items():
+            if key == "api_key":
+                continue
+            _collect_provider_secret_candidates(value, [*path, key], candidates)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            _collect_provider_secret_candidates(value, [*path, index], candidates)
+
+
+def _collect_config_secret_candidates(config: dict) -> list[dict]:
+    candidates: list[dict] = []
+
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        for key in ("api_key", "api"):
+            _append_secret_candidate(
+                candidates,
+                config_path=["model", key],
+                token=model_cfg.get(key),
+                provider=provider,
+                base_url=base_url,
+                fallback_name="model",
+                label="model config import",
+                source="model",
+            )
+
+    providers = config.get("providers")
+    if isinstance(providers, (dict, list)):
+        _collect_provider_secret_candidates(providers, ["providers"], candidates)
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for index, entry in enumerate(custom_providers):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or f"custom-{index + 1}").strip()
+            _append_secret_candidate(
+                candidates,
+                config_path=["custom_providers", index, "api_key"],
+                token=entry.get("api_key"),
+                provider=f"{CUSTOM_POOL_PREFIX}{_normalize_custom_pool_name(name)}",
+                base_url=str(entry.get("base_url") or "").strip(),
+                fallback_name=name,
+                label=f"{name} config import",
+                source="custom_providers",
+            )
+
+    auxiliary = config.get("auxiliary")
+    if isinstance(auxiliary, dict):
+        for task_name, task_cfg in auxiliary.items():
+            if not isinstance(task_cfg, dict):
+                continue
+            provider = str(task_cfg.get("provider") or "").strip()
+            base_url = str(task_cfg.get("base_url") or "").strip()
+            fallback_name = f"auxiliary-{task_name}"
+            _append_secret_candidate(
+                candidates,
+                config_path=["auxiliary", task_name, "api_key"],
+                token=task_cfg.get("api_key"),
+                provider=provider,
+                base_url=base_url,
+                fallback_name=fallback_name,
+                label=f"auxiliary {task_name} config import",
+                source=f"auxiliary:{task_name}",
+            )
+
+    return candidates
+
+
+def _public_migration_item(item: dict) -> dict:
+    return {key: value for key, value in item.items() if key not in {"token", "path"}}
+
+
+def preview_config_key_migration(config: dict | None = None) -> list[dict]:
+    if config is None:
+        from hermes_cli.config import read_raw_config
+
+        config = read_raw_config()
+    if not isinstance(config, dict):
+        return []
+    return [_public_migration_item(item) for item in _collect_config_secret_candidates(config)]
+
+
+def _remove_config_path(config: dict, path: list[object]) -> bool:
+    current: object = config
+    for part in path[:-1]:
+        if isinstance(part, int):
+            if not isinstance(current, list) or part < 0 or part >= len(current):
+                return False
+            current = current[part]
+        else:
+            if not isinstance(current, dict) or part not in current:
+                return False
+            current = current[part]
+    leaf = path[-1]
+    if isinstance(current, dict) and isinstance(leaf, str) and leaf in current:
+        current.pop(leaf, None)
+        return True
+    if isinstance(current, list) and isinstance(leaf, int) and 0 <= leaf < len(current):
+        current.pop(leaf)
+        return True
+    return False
+
+
+def _persist_imported_config_key(item: dict) -> str:
+    pool_key = item.get("pool") or ""
+    token = item.get("token") or ""
+    if not pool_key or not token:
+        return "skipped"
+
+    entries = auth_mod.read_credential_pool(pool_key)
+    for existing in entries:
+        if not isinstance(existing, dict):
+            continue
+        if existing.get("access_token") == token or existing.get("agent_key") == token:
+            return "already_present"
+
+    priority = max(
+        (int(entry.get("priority", -1)) for entry in entries if isinstance(entry, dict)),
+        default=-1,
+    ) + 1
+    entry = PooledCredential(
+        provider=pool_key,
+        id=uuid.uuid4().hex[:6],
+        label=str(item.get("label") or "config import"),
+        auth_type=AUTH_TYPE_API_KEY,
+        priority=priority,
+        source=f"{SOURCE_MANUAL}:config-import",
+        access_token=token,
+        base_url=str(item.get("base_url") or "").strip() or None,
+    )
+    auth_mod.write_credential_pool(pool_key, [*entries, entry.to_dict()])
+    return "imported"
+
+
+def migrate_config_keys(*, apply: bool = False, config: dict | None = None) -> list[dict]:
+    from hermes_cli.config import read_raw_config, save_config
+
+    raw_config = copy.deepcopy(config if config is not None else read_raw_config())
+    if not isinstance(raw_config, dict):
+        return []
+
+    candidates = _collect_config_secret_candidates(raw_config)
+    if not apply:
+        return [_public_migration_item(item) for item in candidates]
+
+    removed_any = False
+    for item in candidates:
+        if not item.get("pool"):
+            item["status"] = "skipped"
+            continue
+        item["status"] = _persist_imported_config_key(item)
+        if item["status"] in {"imported", "already_present"}:
+            removed_any = _remove_config_path(raw_config, item["path"]) or removed_any
+
+    if removed_any:
+        save_config(raw_config)
+    return [_public_migration_item(item) for item in candidates]
+
+
+def auth_migrate_config_keys_command(args) -> None:
+    apply_changes = bool(getattr(args, "apply", False))
+    dry_run = bool(getattr(args, "dry_run", False)) or not apply_changes
+    if apply_changes and bool(getattr(args, "dry_run", False)):
+        raise SystemExit("Choose either --dry-run or --apply, not both.")
+
+    results = migrate_config_keys(apply=apply_changes)
+    if not results:
+        print("No inline config API keys found.")
+        return
+
+    mode = "dry-run" if dry_run else "applied"
+    print(f"Config key migration ({mode}):")
+    for item in results:
+        status = "would_import" if dry_run and item.get("pool") else item.get("status", "skipped")
+        pool = item.get("pool") or "unmapped"
+        reason = f" ({item['reason']})" if item.get("reason") else ""
+        print(f"  - {item['path_label']} -> {pool}: {status}{reason}")
 
 
 def _get_custom_provider_names() -> list:
@@ -539,6 +812,9 @@ def auth_command(args) -> None:
         return
     if action == "reset":
         auth_reset_command(args)
+        return
+    if action == "migrate-config-keys":
+        auth_migrate_config_keys_command(args)
         return
     # No subcommand — launch interactive mode
     _interactive_auth()

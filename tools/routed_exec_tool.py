@@ -19,8 +19,10 @@ from agent.routing_guard import (
     _classify_routed_failure_kind,
     get_routed_execution_plan,
     get_routing_decision,
+    get_selected_route,
     get_session_lane_context,
 )
+from agent.routing_policy import load_routing_policy
 from hermes_cli.auth import resolve_api_key_provider_credentials
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error, tool_result
@@ -153,6 +155,9 @@ def _output_excerpt(text: str) -> str:
 def _default_timeout_for_route(decision: dict[str, Any]) -> int:
     tier = str(decision.get("tier", "")).upper()
     path = str(decision.get("path", "") or "").strip().lower()
+    profile = load_routing_policy().profile(tier, path)
+    if profile is not None:
+        return int(profile.default_timeout)
     return _ROUTE_TIMEOUT_SECONDS.get((tier, path), _DEFAULT_TIMEOUT_SECONDS)
 
 
@@ -348,7 +353,19 @@ def _command_preview(kind: str, workdir: str) -> str:
     return kind
 
 
-def _run_codex(*, executable: str, model: str, workdir: str, host_cwd: str, prompt: str, timeout: int) -> dict[str, Any]:
+def _run_codex(
+    *,
+    executable: str,
+    model: str,
+    workdir: str,
+    host_cwd: str,
+    prompt: str,
+    timeout: int,
+    kind: str = "",
+    label: str = "",
+) -> dict[str, Any]:
+    target_kind = kind or ("codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini")
+    executor_label = label or f"Codex CLI ({model})"
     command = [
         executable,
         "exec",
@@ -373,36 +390,27 @@ def _run_codex(*, executable: str, model: str, workdir: str, host_cwd: str, prom
             cwd=host_cwd,
         )
         return _finalize_attempt(
-            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            executor=f"Codex CLI ({model})",
-            command_preview=_command_preview(
-                "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-                workdir,
-            ),
+            kind=target_kind,
+            executor=executor_label,
+            command_preview=_command_preview(target_kind, workdir),
             raw_output=_combine_output(result.stdout, result.stderr),
             exit_code=int(result.returncode),
             timed_out=False,
         )
     except subprocess.TimeoutExpired as exc:
         return _finalize_attempt(
-            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            executor=f"Codex CLI ({model})",
-            command_preview=_command_preview(
-                "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-                workdir,
-            ),
+            kind=target_kind,
+            executor=executor_label,
+            command_preview=_command_preview(target_kind, workdir),
             raw_output=_combine_output(exc.stdout or "", exc.stderr or ""),
             exit_code=124,
             timed_out=True,
         )
     except FileNotFoundError:
         return _finalize_attempt(
-            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            executor=f"Codex CLI ({model})",
-            command_preview=_command_preview(
-                "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-                workdir,
-            ),
+            kind=target_kind,
+            executor=executor_label,
+            command_preview=_command_preview(target_kind, workdir),
             raw_output="",
             exit_code=-1,
             timed_out=False,
@@ -410,12 +418,9 @@ def _run_codex(*, executable: str, model: str, workdir: str, host_cwd: str, prom
         )
     except Exception as exc:
         return _finalize_attempt(
-            kind="codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-            executor=f"Codex CLI ({model})",
-            command_preview=_command_preview(
-                "codex_gpt54" if model == "gpt-5.4" else "codex_gpt54mini",
-                workdir,
-            ),
+            kind=target_kind,
+            executor=executor_label,
+            command_preview=_command_preview(target_kind, workdir),
             raw_output="",
             exit_code=-1,
             timed_out=False,
@@ -432,6 +437,7 @@ def _run_hermes(
     kind: str,
     model: str,
     provider: str,
+    label: str = "",
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env.setdefault("HERMES_DISABLE_DEFAULT_ROUTING_SKILL", "1")
@@ -475,7 +481,7 @@ def _run_hermes(
         )
         return _finalize_attempt(
             kind=kind,
-            executor={
+            executor=label or {
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
@@ -492,7 +498,7 @@ def _run_hermes(
     except subprocess.TimeoutExpired as exc:
         return _finalize_attempt(
             kind=kind,
-            executor={
+            executor=label or {
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
@@ -509,7 +515,7 @@ def _run_hermes(
     except FileNotFoundError:
         return _finalize_attempt(
             kind=kind,
-            executor={
+            executor=label or {
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
@@ -527,7 +533,7 @@ def _run_hermes(
     except Exception as exc:
         return _finalize_attempt(
             kind=kind,
-            executor={
+            executor=label or {
                 "hermes_glm_zai": "Hermes CLI (glm-5.1 via zai)",
                 "hermes_minimax_m27": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "hermes_nous_mimo_v2_pro": "Hermes CLI (xiaomi/mimo-v2-pro via nous)",
@@ -580,54 +586,32 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
     hermes_executable = _find_executable("hermes")
 
     for attempt_index, target in enumerate(plan, start=1):
-        kind = target["kind"]
-        if kind == "hermes_glm_zai":
+        kind = str(target.get("kind", "") or "")
+        executor = str(target.get("executor", "") or "")
+        model = str(target.get("model", "") or "")
+        provider = str(target.get("provider", "") or "")
+        label = str(target.get("label", "") or "")
+        if executor == "hermes":
             attempt = _run_hermes(
                 executable=hermes_executable or "hermes",
                 host_cwd=resolved_workdir,
                 prompt=routed_prompt,
                 timeout=effective_timeout,
-                kind="hermes_glm_zai",
-                model="glm-5.1",
-                provider="zai",
+                kind=kind,
+                model=model,
+                provider=provider,
+                label=label,
             )
-        elif kind == "hermes_minimax_m27":
-            attempt = _run_hermes(
-                executable=hermes_executable or "hermes",
-                host_cwd=resolved_workdir,
-                prompt=routed_prompt,
-                timeout=effective_timeout,
-                kind="hermes_minimax_m27",
-                model="MiniMax-M2.7",
-                provider="minimax",
-            )
-        elif kind == "hermes_nous_mimo_v2_pro":
-            attempt = _run_hermes(
-                executable=hermes_executable or "hermes",
-                host_cwd=resolved_workdir,
-                prompt=routed_prompt,
-                timeout=effective_timeout,
-                kind="hermes_nous_mimo_v2_pro",
-                model="xiaomi/mimo-v2-pro",
-                provider="nous",
-            )
-        elif kind == "codex_gpt54":
+        elif executor == "codex":
             attempt = _run_codex(
                 executable=codex_executable or "codex",
-                model="gpt-5.4",
+                model=model,
                 workdir=resolved_workdir,
                 host_cwd=resolved_workdir,
                 prompt=routed_prompt,
                 timeout=effective_timeout,
-            )
-        elif kind == "codex_gpt54mini":
-            attempt = _run_codex(
-                executable=codex_executable or "codex",
-                model="gpt-5.4-mini",
-                workdir=resolved_workdir,
-                host_cwd=resolved_workdir,
-                prompt=routed_prompt,
-                timeout=effective_timeout,
+                kind=kind,
+                label=label,
             )
         else:
             attempt = {
@@ -654,6 +638,7 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
     success = bool(final_attempt) and not bool(final_attempt.get("failed"))
     attempt_summary = _summarize_attempts(attempts)
     failure_guidance = _failure_guidance(attempts, default_timeout_used, effective_timeout)
+    fallback_exhausted = (not success) and bool(attempts) and len(attempts) >= len(plan)
 
     return tool_result(
         {
@@ -661,14 +646,21 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
             "tier": decision.get("tier"),
             "route_path": decision.get("path"),
             "route_model": decision.get("model"),
+            "selected_route": get_selected_route(task_id),
             "session_lane": get_session_lane_context(task_id),
             "workdir": requested_workdir,
             "requested_workdir": requested_workdir,
             "resolved_workdir": resolved_workdir,
             "timeout_seconds": effective_timeout,
             "timeout_source": "route-default" if default_timeout_used else "explicit",
+            "executors_attempted": [str(item.get("executor") or item.get("kind") or "") for item in attempts],
             "attempt_summary": attempt_summary,
             "attempts": attempts,
+            "verification_expectations": (
+                "Child executor must report concrete verification in the final "
+                f"{_ROUTED_RESULT_MARKER} JSON line."
+            ),
+            "fallback_exhausted": fallback_exhausted,
             "output": str(final_attempt.get("output", "") if final_attempt else ""),
             "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
             "status": str(final_attempt.get("status", "failed") if final_attempt else "failed"),

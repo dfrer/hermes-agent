@@ -337,6 +337,42 @@ def run_doctor(args):
         except Exception:
             pass
 
+        # Routing and secret migration diagnostics.
+        try:
+            from hermes_cli.config import read_raw_config
+
+            raw_config = read_raw_config()
+            smart_routing = raw_config.get("smart_model_routing")
+            if isinstance(smart_routing, dict) and smart_routing.get("enabled"):
+                check_warn(
+                    "smart_model_routing is deprecated",
+                    "(runtime now uses the canonical routing policy; remove this block)",
+                )
+                issues.append("Remove deprecated smart_model_routing.enabled from config.yaml")
+
+            from agent.routing_policy import load_routing_policy
+
+            routing_policy = load_routing_policy(raw_config)
+            if routing_policy.errors:
+                print()
+                print(color("◆ Routing Policy", Colors.CYAN, Colors.BOLD))
+                for routing_error in routing_policy.errors:
+                    check_warn(routing_error, "(default routing policy is active)")
+                    issues.append(f"Routing policy warning: {routing_error}")
+
+            from hermes_cli.auth_commands import preview_config_key_migration
+
+            migration_items = preview_config_key_migration(raw_config)
+            actionable = [item for item in migration_items if item.get("pool")]
+            if actionable:
+                check_warn(
+                    "Inline config API keys detected",
+                    "(run: hermes auth migrate-config-keys --apply)",
+                )
+                issues.append("Migrate inline config API keys into the credential pool")
+        except Exception:
+            pass
+
     # =========================================================================
     # Check: Auth providers
     # =========================================================================
