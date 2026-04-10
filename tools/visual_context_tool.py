@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Awaitable, Dict, Optional
 
 from tools.registry import registry
@@ -10,6 +11,8 @@ from tools.vision_tools import check_vision_requirements, vision_analyze_tool
 
 
 _MAX_EMBEDDED_TEXT_CHARS = 6000
+_LOCAL_VISUAL_SOURCE_RE = re.compile(r"(?i)^(?:file:|/|https?://(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?(?:/|$))")
+_HEAVY_VISUAL_RE = re.compile(r"(?i)\b(webgl|canvas|animation|animated|video|p5|three\.?js|game|gpu|fps|frame\s*rate)\b")
 
 
 def _json_or_text(value: str) -> Any:
@@ -120,6 +123,16 @@ VISUAL_CONTEXT_SCHEMA = {
                     "so they do not keep consuming CPU/GPU after visual inspection."
                 ),
             },
+            "cleanup_policy": {
+                "type": "string",
+                "enum": ["auto", "always", "never"],
+                "default": "auto",
+                "description": (
+                    "Browser cleanup policy. 'auto' closes after local heavy animated/WebGL/video/canvas pages; "
+                    "'always' always closes after browser capture; 'never' leaves cleanup to the caller. "
+                    "Explicit cleanup_after=true still forces cleanup."
+                ),
+            },
         },
         "required": ["source", "question"],
     },
@@ -136,6 +149,7 @@ async def visual_context_tool(
     include_snapshot: bool = True,
     include_console: bool = True,
     cleanup_after: bool = False,
+    cleanup_policy: str = "auto",
     task_id: Optional[str] = None,
     user_task: Optional[str] = None,
 ) -> str:
@@ -162,6 +176,10 @@ async def visual_context_tool(
             },
             ensure_ascii=False,
         )
+
+    normalized_cleanup_policy = str(cleanup_policy or "auto").strip().lower()
+    if normalized_cleanup_policy not in {"auto", "always", "never"}:
+        normalized_cleanup_policy = "auto"
 
     if normalized_source == "image":
         clean_image_url = str(image_url or url or "").strip()
@@ -238,8 +256,19 @@ async def visual_context_tool(
 
     browser_details: dict[str, Any] = {}
 
+    clean_url = str(url or "").strip()
+    effective_cleanup_after = bool(cleanup_after)
+    if normalized_cleanup_policy == "always":
+        effective_cleanup_after = True
+    elif (
+        normalized_cleanup_policy == "auto"
+        and _LOCAL_VISUAL_SOURCE_RE.search(clean_url)
+        and _HEAVY_VISUAL_RE.search("\n".join([clean_question, clean_url, str(user_task or "")]))
+    ):
+        effective_cleanup_after = True
+
     def _browser_result(result: dict[str, Any]) -> str:
-        if cleanup_after:
+        if effective_cleanup_after:
             try:
                 result.setdefault("browser", {})["cleanup"] = _json_or_text(
                     browser_close(task_id=task_id)
@@ -250,7 +279,6 @@ async def visual_context_tool(
                 )
         return json.dumps(result, ensure_ascii=False)
 
-    clean_url = str(url or "").strip()
     if clean_url:
         navigation_payload = _json_or_text(
             browser_navigate(clean_url, task_id=task_id)
@@ -298,6 +326,8 @@ async def visual_context_tool(
         "question": clean_question,
         "url": clean_url,
         "annotated": bool(annotate),
+        "cleanup_after": effective_cleanup_after,
+        "cleanup_policy": normalized_cleanup_policy,
         "visual_summary": _analysis_from_payload(vision_payload),
         "browser": browser_details,
         "vision": vision_payload,
@@ -318,6 +348,7 @@ def _handle_visual_context(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         include_snapshot=args.get("include_snapshot", True),
         include_console=args.get("include_console", True),
         cleanup_after=args.get("cleanup_after", False),
+        cleanup_policy=args.get("cleanup_policy", "auto"),
         task_id=kw.get("task_id"),
         user_task=kw.get("user_task"),
     )

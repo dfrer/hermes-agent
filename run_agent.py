@@ -9434,6 +9434,32 @@ class AIAgent:
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
+
+                    if _routing_guard_active:
+                        try:
+                            from agent.routing_guard import final_response_block_reason
+
+                            ability_gate_reason = final_response_block_reason(
+                                effective_task_id,
+                                final_response,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to evaluate final response routing guard for task %s",
+                                effective_task_id,
+                                exc_info=True,
+                            )
+                            ability_gate_reason = None
+                        if ability_gate_reason:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": f"[Routing guard: {ability_gate_reason}]",
+                                }
+                            )
+                            self._session_messages = messages
+                            self._save_session_log(messages)
+                            continue
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 

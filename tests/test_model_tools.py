@@ -9,8 +9,10 @@ from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
     get_verification_attempts,
+    record_ability_packet,
     record_routing_decision,
 )
+from agent.ability_context import make_ability_packet
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
@@ -253,6 +255,55 @@ class TestHandleFunctionCall:
         assert command[:3] == ["codex", "exec", "--skip-git-repo-check"]
         assert command[-1] == "-"
         assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
+    def test_routed_exec_includes_ability_and_explicit_evidence(self, tmp_path):
+        task_id = "guarded-task-routed-exec-evidence"
+        activate_for_task(task_id, session_id="session-guard-evidence", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-guard-evidence",
+        )
+        record_ability_packet(
+            task_id,
+            make_ability_packet(
+                task_id=task_id,
+                lanes=["visual"],
+                phase="pre",
+                summary="Screenshot shows a clipped button.",
+                screenshot_path="/tmp/screen.png",
+            ),
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="done", stderr=""),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", return_value="codex"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                            "evidence": "Caller saw the same clipping at mobile width.",
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["ability_evidence_included"] is True
+        prompt = mock_run.call_args.kwargs["input"]
+        assert "Ability evidence handoff" in prompt
+        assert "clipped button" in prompt
+        assert "/tmp/screen.png" in prompt
+        assert "Caller saw the same clipping" in prompt
 
     def test_routed_exec_dispatches_hermes_primary_for_tier_3b(self, tmp_path):
         task_id = "guarded-task-hermes-routed-exec"

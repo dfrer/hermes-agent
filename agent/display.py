@@ -147,6 +147,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "browser_click": "ref", "browser_type": "text",
         "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question", "visual_context": "question",
+        "ability_context": "query",
         "mixture_of_agents": "user_prompt",
         "skill_view": "name", "skills_list": "category",
         "cronjob": "action",
@@ -899,6 +900,8 @@ def get_cute_tool_message(
         return _wrap(f"┊ 👁️  vision    analyzing page  {dur}")
     if tool_name == "visual_context":
         return _wrap(f"┊ 👁️  vision    context scout  {dur}")
+    if tool_name == "ability_context":
+        return _wrap(f"┊ 🧭 ability   {args.get('mode', 'auto')}  {dur}")
     if tool_name == "todo":
         todos_arg = args.get("todos")
         merge = args.get("merge", False)

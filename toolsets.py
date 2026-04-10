@@ -36,7 +36,7 @@ _HERMES_CORE_TOOLS = [
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
-    "vision_analyze", "visual_context", "image_generate",
+    "vision_analyze", "visual_context", "ability_context", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -90,6 +90,12 @@ TOOLSETS = {
     "visual_context": {
         "description": "Read-only visual context scouting for browser pages and images",
         "tools": ["visual_context"],
+        "includes": []
+    },
+
+    "ability_context": {
+        "description": "Read-only ability-lane preflight and verification context for routed tasks",
+        "tools": ["ability_context"],
         "includes": []
     },
     
@@ -243,7 +249,7 @@ TOOLSETS = {
             "web_search", "web_extract",
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
-            "vision_analyze", "visual_context",
+            "vision_analyze", "visual_context", "ability_context",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -266,7 +272,7 @@ TOOLSETS = {
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
-            "vision_analyze", "visual_context", "image_generate",
+            "vision_analyze", "visual_context", "ability_context", "image_generate",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation
@@ -400,8 +406,9 @@ def ensure_skill_required_toolsets(
 ) -> Optional[List[str]]:
     """Augment explicit toolsets with any required by active skills.
 
-    Today the routing-layer skill depends on the dedicated `routing` toolset so
-    `routed_exec` is always exposed whenever strict routing is active.
+    Today the routing-layer skill depends on the dedicated `routing` and
+    `ability_context` toolsets so routed execution and evidence preflight are
+    always exposed whenever strict routing is active.
     """
     active_skills = {str(skill).strip() for skill in (skills or []) if str(skill).strip()}
     if "routing-layer" not in active_skills:
@@ -415,6 +422,8 @@ def ensure_skill_required_toolsets(
         return normalized
     if "routing" not in normalized:
         normalized.append("routing")
+    if "ability_context" not in normalized:
+        normalized.append("ability_context")
     return normalized
 
 

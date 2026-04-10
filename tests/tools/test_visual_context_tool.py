@@ -163,6 +163,47 @@ async def test_browser_source_can_cleanup_after_capture():
 
 
 @pytest.mark.asyncio
+async def test_browser_source_auto_cleanup_policy_for_local_heavy_page():
+    from tools.visual_context_tool import visual_context_tool
+
+    with (
+        patch("tools.visual_context_tool._vision_capability_error", return_value=None),
+        patch("tools.browser_tool.check_browser_requirements", return_value=True),
+        patch(
+            "tools.browser_tool.browser_navigate",
+            return_value=json.dumps({"success": True, "url": "http://127.0.0.1:3000"}),
+        ),
+        patch(
+            "tools.browser_tool.browser_snapshot",
+            return_value=json.dumps({"success": True, "content": "canvas"}),
+        ),
+        patch(
+            "tools.browser_tool.browser_console",
+            return_value=json.dumps({"success": True, "total_errors": 0}),
+        ),
+        patch(
+            "tools.browser_tool.browser_vision",
+            return_value=json.dumps({"success": True, "analysis": "Looks stable."}),
+        ),
+        patch("tools.browser_tool.browser_close") as mock_browser_close,
+    ):
+        mock_browser_close.return_value = json.dumps({"success": True, "closed": True})
+        result = json.loads(
+            await visual_context_tool(
+                "browser",
+                "Check the WebGL canvas animation.",
+                url="http://127.0.0.1:3000",
+                cleanup_policy="auto",
+                task_id="task-visual-heavy-auto",
+            )
+        )
+
+    assert result["cleanup_after"] is True
+    assert result["browser"]["cleanup"]["closed"] is True
+    mock_browser_close.assert_called_once_with(task_id="task-visual-heavy-auto")
+
+
+@pytest.mark.asyncio
 async def test_browser_source_stops_when_navigation_fails():
     from tools.visual_context_tool import visual_context_tool
 

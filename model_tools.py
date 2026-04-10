@@ -142,6 +142,7 @@ def _discover_tools():
         "tools.file_tools",
         "tools.vision_tools",
         "tools.visual_context_tool",
+        "tools.ability_context_tool",
         "tools.mixture_of_agents_tool",
         "tools.image_generation_tool",
         "tools.skills_tool",

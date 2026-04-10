@@ -17,6 +17,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from agent.routing_guard import (
     _classify_routed_failure_kind,
+    get_ability_handoff,
     get_routed_execution_plan,
     get_routing_decision,
     get_selected_route,
@@ -161,15 +162,38 @@ def _default_timeout_for_route(decision: dict[str, Any]) -> int:
     return _ROUTE_TIMEOUT_SECONDS.get((tier, path), _DEFAULT_TIMEOUT_SECONDS)
 
 
-def _build_routed_prompt(task: str, *, requested_workdir: str, resolved_workdir: str) -> str:
+def _compact_explicit_evidence(evidence: str) -> str:
+    clean = redact_sensitive_text(str(evidence or "").strip())
+    if len(clean) <= 3000:
+        return clean
+    return f"{clean[:3000]}\n[explicit evidence truncated {len(clean) - 3000} chars]"
+
+
+def _build_routed_prompt(
+    task: str,
+    *,
+    requested_workdir: str,
+    resolved_workdir: str,
+    ability_evidence: str = "",
+    explicit_evidence: str = "",
+) -> str:
     requested = str(requested_workdir or "").strip() or resolved_workdir
     resolved = str(resolved_workdir or "").strip() or requested
+    evidence_sections: list[str] = []
+    if ability_evidence:
+        evidence_sections.append(f"Stored ability evidence packet:\n{ability_evidence}")
+    if explicit_evidence:
+        evidence_sections.append(f"Caller-provided evidence notes:\n{_compact_explicit_evidence(explicit_evidence)}")
+    evidence_text = ""
+    if evidence_sections:
+        evidence_text = "\nAbility evidence handoff:\n" + "\n\n".join(evidence_sections) + "\n"
     return (
         f"{str(task or '').strip()}\n\n"
         "Execution context:\n"
         f"- Requested target workdir: {requested}\n"
         f"- Existing launch workdir: {resolved}\n"
         "- If the requested target workdir does not exist yet, create it first and then work there.\n\n"
+        f"{evidence_text}"
         "Completion contract:\n"
         f"- Emit exactly one final line beginning with `{_ROUTED_RESULT_MARKER}` followed by compact JSON.\n"
         '- JSON schema: {"status":"success|failed|timeout","summary":"...","verification":"...","warnings":["..."]}\n'
@@ -550,7 +574,14 @@ def _run_hermes(
         )
 
 
-def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, task_id: str = "") -> str:
+def routed_exec_tool(
+    task: str,
+    workdir: str,
+    timeout: Optional[int] = None,
+    *,
+    task_id: str = "",
+    evidence: str = "",
+) -> str:
     prompt = str(task or "").strip()
     if not prompt:
         return tool_error("`task` is required for routed_exec.")
@@ -575,6 +606,8 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
         prompt,
         requested_workdir=requested_workdir,
         resolved_workdir=resolved_workdir,
+        ability_evidence=get_ability_handoff(task_id),
+        explicit_evidence=str(evidence or ""),
     )
 
     default_timeout = _default_timeout_for_route(decision)
@@ -660,6 +693,7 @@ def routed_exec_tool(task: str, workdir: str, timeout: Optional[int] = None, *, 
                 "Child executor must report concrete verification in the final "
                 f"{_ROUTED_RESULT_MARKER} JSON line."
             ),
+            "ability_evidence_included": bool(get_ability_handoff(task_id) or str(evidence or "").strip()),
             "fallback_exhausted": fallback_exhausted,
             "output": str(final_attempt.get("output", "") if final_attempt else ""),
             "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
@@ -713,6 +747,10 @@ ROUTED_EXEC_SCHEMA = {
                 "description": "Per-attempt timeout in seconds. Defaults to a route-aware value (3B marathon/long-context 900, 3A high-risk 1200, 3C quick-edit 300).",
                 "minimum": 1,
             },
+            "evidence": {
+                "type": "string",
+                "description": "Optional compact caller-provided evidence notes to include in the routed child prompt. Do not inline full logs or screenshots.",
+            },
         },
         "required": ["task", "workdir"],
     },
@@ -724,6 +762,7 @@ def _handle_routed_exec(args, **kw):
         task=args.get("task", ""),
         workdir=args.get("workdir", ""),
         timeout=args.get("timeout"),
+        evidence=args.get("evidence", ""),
         task_id=kw.get("task_id", ""),
     )
 

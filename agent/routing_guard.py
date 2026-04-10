@@ -19,6 +19,16 @@ from agent.routing_policy import (
     normalize_route_model,
     normalize_route_path,
 )
+from agent.ability_context import (
+    VISUAL_CACHE_TTL_SECONDS,
+    compact_packets_for_handoff,
+    detect_ability_requirements,
+    make_ability_packet,
+    normalize_lanes,
+    preflight_missing_lanes,
+    required_lanes,
+    visual_post_verified,
+)
 
 
 DEFAULT_ROUTING_SKILL = "routing-layer"
@@ -471,14 +481,27 @@ def _new_task_state(
     session_provider: str = "",
 ) -> dict[str, Any]:
     normalized_hints = _normalize_active_skill_hints(active_skill_hints)
+    active_skills = list(skills or [])
+    if DEFAULT_ROUTING_SKILL in active_skills:
+        ability_requirements = detect_ability_requirements(user_message, normalized_hints)
+    else:
+        ability_requirements = {"lanes": {}, "post_visual_required": False, "detected_at": time.time()}
     return {
         "session_id": session_id or "",
         "session_model": str(session_model or "").strip(),
         "session_provider": str(session_provider or "").strip(),
         "session_lane_label": _format_session_lane_label(session_model, session_provider),
-        "skills": list(skills or []),
+        "user_message": str(user_message or ""),
+        "skills": active_skills,
         "active_skill_hints": normalized_hints,
         "task_class": _derive_task_class(normalized_hints),
+        "ability_requirements": ability_requirements,
+        "ability_packets": [],
+        "ability_cache": {},
+        "ability_last_mutation_at": None,
+        "visual_verification_required": bool(ability_requirements.get("post_visual_required")),
+        "visual_verification_pending": False,
+        "final_response_guard_attempts": 0,
         "last_mutation_class": None,
         "enforced": True,
         "routed": False,
@@ -902,6 +925,211 @@ def get_verification_attempts(task_id: str) -> list[dict[str, Any]]:
         return [dict(item) for item in attempts if isinstance(item, dict)]
 
 
+def get_ability_requirements(task_id: str) -> dict[str, Any]:
+    if not task_id:
+        return {"lanes": {}, "post_visual_required": False}
+    with _task_state_lock:
+        _purge_expired()
+        requirements = _task_state.get(task_id, {}).get("ability_requirements")
+        if not isinstance(requirements, dict):
+            return {"lanes": {}, "post_visual_required": False}
+        return json.loads(json.dumps(requirements, ensure_ascii=False))
+
+
+def get_ability_packets(task_id: str, *, include_stale: bool = False) -> list[dict[str, Any]]:
+    if not task_id:
+        return []
+    with _task_state_lock:
+        _purge_expired()
+        packets = _task_state.get(task_id, {}).get("ability_packets")
+        if not isinstance(packets, list):
+            return []
+        result = [dict(item) for item in packets if isinstance(item, dict)]
+        if include_stale:
+            return result
+        return [item for item in result if not item.get("stale")]
+
+
+def get_cached_ability_packet(
+    task_id: str,
+    cache_key: str,
+    *,
+    ttl_seconds: int = VISUAL_CACHE_TTL_SECONDS,
+) -> Optional[dict[str, Any]]:
+    if not task_id or not cache_key:
+        return None
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return None
+        cache = state.get("ability_cache")
+        if not isinstance(cache, dict):
+            return None
+        packet = cache.get(cache_key)
+        if not isinstance(packet, dict) or packet.get("stale"):
+            return None
+        generated_at = float(packet.get("generated_at") or 0.0)
+        if ttl_seconds > 0 and generated_at and (time.time() - generated_at) > ttl_seconds:
+            packet["stale"] = True
+            return None
+        cached = dict(packet)
+        cached["cached"] = True
+        return cached
+
+
+def record_ability_packet(task_id: str, packet: dict[str, Any]) -> None:
+    if not task_id or not isinstance(packet, dict):
+        return
+    normalized = dict(packet)
+    normalized.setdefault("task_id", task_id)
+    normalized["lanes"] = normalize_lanes(normalized.get("lanes") or [])
+    normalized.setdefault("phase", "pre")
+    normalized.setdefault("status", "success" if normalized.get("success") else "unavailable")
+    normalized.setdefault("generated_at", time.time())
+    normalized.setdefault("stale", False)
+    cache_key = str(normalized.get("cache_key") or "")
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        packets = state.setdefault("ability_packets", [])
+        if cache_key:
+            packets[:] = [
+                item for item in packets
+                if not (isinstance(item, dict) and str(item.get("cache_key") or "") == cache_key)
+            ]
+        packets.append(normalized)
+        if len(packets) > 30:
+            del packets[:-30]
+        if cache_key:
+            cache = state.setdefault("ability_cache", {})
+            if isinstance(cache, dict):
+                cache[cache_key] = dict(normalized)
+        state["updated_at"] = time.time()
+
+
+def clear_ability_cache(task_id: str) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        state["ability_packets"] = []
+        state["ability_cache"] = {}
+        state["updated_at"] = time.time()
+
+
+def mark_ability_evidence_stale(task_id: str, *, reason: str = "") -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        state["ability_last_mutation_at"] = time.time()
+        for bucket_name in ("ability_packets",):
+            bucket = state.get(bucket_name)
+            if not isinstance(bucket, list):
+                continue
+            for packet in bucket:
+                if not isinstance(packet, dict):
+                    continue
+                if "visual" in normalize_lanes(packet.get("lanes") or []):
+                    packet["stale"] = True
+                    if reason:
+                        packet["stale_reason"] = reason
+        cache = state.get("ability_cache")
+        if isinstance(cache, dict):
+            for packet in cache.values():
+                if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
+                    packet["stale"] = True
+                    if reason:
+                        packet["stale_reason"] = reason
+        state["updated_at"] = time.time()
+
+
+def get_ability_handoff(task_id: str) -> str:
+    return compact_packets_for_handoff(get_ability_packets(task_id))
+
+
+def _record_ability_tool_payload(task_id: str, payload: dict[str, Any], *, fallback_lane: str = "") -> None:
+    packets = payload.get("packets") if isinstance(payload, dict) else None
+    if isinstance(packets, list):
+        for packet in packets:
+            if isinstance(packet, dict):
+                record_ability_packet(task_id, packet)
+        return
+    if fallback_lane:
+        console_errors: list[Any] = []
+        browser_payload = payload.get("browser") if isinstance(payload, dict) else None
+        if isinstance(browser_payload, dict):
+            console = browser_payload.get("console")
+            if isinstance(console, dict):
+                errors = console.get("errors") or console.get("messages") or []
+                if isinstance(errors, list):
+                    console_errors = errors
+                elif console.get("total_errors"):
+                    console_errors = [console]
+        packet = make_ability_packet(
+            task_id=task_id,
+            lanes=[fallback_lane],
+            phase=str(payload.get("phase") or "pre"),
+            status="success" if payload.get("success") else "unavailable",
+            summary=str(payload.get("visual_summary") or payload.get("summary") or payload.get("error") or ""),
+            findings=[],
+            constraints=[payload.get("error")] if payload.get("error") else [],
+            url_or_path=str(payload.get("url") or payload.get("image_url") or ""),
+            screenshot_path=str(payload.get("screenshot_path") or ""),
+            console_errors=console_errors,
+            artifact_paths=[str(payload.get("screenshot_path"))] if payload.get("screenshot_path") else [],
+            health={},
+            cache_key=str(payload.get("cache_key") or ""),
+            cached=bool(payload.get("cached")),
+            stale=bool(payload.get("stale")),
+            generated_at=time.time(),
+        )
+        record_ability_packet(task_id, packet)
+
+
+def final_response_block_reason(task_id: str, assistant_text: str) -> Optional[str]:
+    if not task_id or not is_active_for_task(task_id):
+        return None
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return None
+        if not state.get("visual_verification_pending"):
+            return None
+        packets = [dict(item) for item in state.get("ability_packets", []) if isinstance(item, dict)]
+        if visual_post_verified(packets):
+            state["visual_verification_pending"] = False
+            state["updated_at"] = time.time()
+            return None
+        text = str(assistant_text or "")
+        explicit_unavailable = re.search(r"(?is)\bvisual verification\b.*\b(unavailable|blocked|could not|unable)\b", text)
+        cites_blocker = re.search(r"(?is)\b(browser|vision|screenshot|webgl|local|ssrf|expensive|cpu|gpu|unavailable|blocked)\b", text)
+        if explicit_unavailable and cites_blocker:
+            state["visual_verification_pending"] = False
+            state["updated_at"] = time.time()
+            return None
+        attempts = int(state.get("final_response_guard_attempts") or 0)
+        if attempts >= 2:
+            return None
+        state["final_response_guard_attempts"] = attempts + 1
+        state["updated_at"] = time.time()
+    return (
+        "Routing guard requires a post-fix visual verification packet before a fixed/complete final answer. "
+        "Call `ability_context` with `phase=\"post\"` for the visual lane, or explicitly state that visual "
+        "verification was unavailable and cite the concrete blocker."
+    )
+
+
 def _normalize_route_model(model: str) -> str:
     return normalize_route_model(model)
 
@@ -1269,11 +1497,34 @@ def _normalize_recorded_attempt(entry: dict[str, Any]) -> tuple[bool, Optional[s
 
 def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], result: Any) -> None:
     if (
-        tool_name not in {"terminal", "routed_exec", "skill_view"}
+        tool_name not in {"terminal", "routed_exec", "skill_view", "visual_context", "patch", "write_file"}
         or not task_id
         or not isinstance(args, dict)
         or not is_active_for_task(task_id)
     ):
+        return
+
+    if tool_name == "visual_context":
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            _record_ability_tool_payload(
+                task_id,
+                payload,
+                fallback_lane="visual",
+            )
+        return
+
+    if tool_name in {"patch", "write_file"}:
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            return
+        mark_ability_evidence_stale(task_id, reason=f"{tool_name} mutation completed")
         return
 
     if tool_name == "skill_view":
@@ -1309,6 +1560,14 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
             merged = _normalize_active_skill_hints([*(state.get("active_skill_hints") or []), hint])
             state["active_skill_hints"] = merged
             state["task_class"] = _derive_task_class(merged)
+            if DEFAULT_ROUTING_SKILL in (state.get("skills") or []):
+                state["ability_requirements"] = detect_ability_requirements(
+                    str(state.get("user_message", "") or ""),
+                    merged,
+                )
+                state["visual_verification_required"] = bool(
+                    state["ability_requirements"].get("post_visual_required")
+                )
             state["updated_at"] = time.time()
         return
 
@@ -1353,6 +1612,19 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
                     attempts["3b_primary_attempted"] = True
                     attempts["3b_primary_failed"] = failed
                     attempts["3b_primary_failure_kind"] = failure_kind if failed else None
+                if not failed and state.get("visual_verification_required"):
+                    state["visual_verification_pending"] = True
+                    state["final_response_guard_attempts"] = 0
+                    for packet in state.get("ability_packets", []):
+                        if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
+                            packet["stale"] = True
+                            packet["stale_reason"] = "routed_exec mutation succeeded"
+                    cache = state.get("ability_cache")
+                    if isinstance(cache, dict):
+                        for packet in cache.values():
+                            if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
+                                packet["stale"] = True
+                                packet["stale_reason"] = "routed_exec mutation succeeded"
             state["updated_at"] = time.time()
         return
 
@@ -1894,6 +2166,16 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
                 "coding tasks."
             )
         if routed:
+            requirements = get_ability_requirements(task_id)
+            missing = preflight_missing_lanes(requirements, get_ability_packets(task_id))
+            if missing:
+                lanes = ", ".join(missing)
+                return (
+                    f"Routing guard blocked `routed_exec` for task {task_id}: "
+                    f"required ability preflight lane(s) missing: {lanes}. "
+                    "Call `ability_context` with `mode=\"auto\"` or `mode=\"collect\"` and `phase=\"pre\"`; "
+                    "if a lane is unavailable, record an unavailable packet with the concrete blocker."
+                )
             return None
         return (
             f"Routing guard blocked `routed_exec` for task {task_id}: "
