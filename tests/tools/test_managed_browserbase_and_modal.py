@@ -140,13 +140,11 @@ def test_browser_use_explicit_local_mode_stays_local_even_when_managed_gateway_i
 
 def test_browserbase_does_not_use_gateway_only_configuration():
     _install_fake_tools_package()
-    env = os.environ.copy()
-    env.pop("BROWSERBASE_API_KEY", None)
-    env.pop("BROWSERBASE_PROJECT_ID", None)
-    env.update({
+    env = {
+        "HERMES_ENABLE_NOUS_MANAGED_TOOLS": "1",
         "TOOL_GATEWAY_USER_TOKEN": "nous-token",
         "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
-    })
+    }
 
     with patch.dict(os.environ, env, clear=True):
         browserbase_module = _load_tool_module(
@@ -154,8 +152,7 @@ def test_browserbase_does_not_use_gateway_only_configuration():
             "browser_providers/browserbase.py",
         )
         provider = browserbase_module.BrowserbaseProvider()
-
-    assert provider.is_configured() is False
+        assert provider.is_configured() is False
 
 
 def test_browser_use_managed_gateway_adds_idempotency_key_and_persists_external_call_id():

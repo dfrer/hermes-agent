@@ -99,8 +99,10 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
 async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
     """An internal event should skip _is_user_authorized entirely."""
     import gateway.run as gateway_run
+    import gateway.pairing as pairing
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(pairing, "PAIRING_DIR", tmp_path / "pairing")
     (tmp_path / "config.yaml").write_text("", encoding="utf-8")
 
     runner = GatewayRunner(GatewayConfig())
@@ -127,14 +129,15 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
         return original_auth(self, src)
 
     monkeypatch.setattr(GatewayRunner, "_is_user_authorized", tracking_auth)
+    monkeypatch.setattr(
+        runner,
+        "_handle_message_with_agent",
+        AsyncMock(return_value="internal-ok"),
+    )
 
-    # _handle_message will proceed past auth check and eventually fail on
-    # downstream logic. We just need to verify auth is skipped.
-    try:
-        await runner._handle_message(event)
-    except Exception:
-        pass  # Expected — downstream code needs more setup
+    result = await runner._handle_message(event)
 
+    assert result == "internal-ok"
     assert not auth_called, (
         "_is_user_authorized should NOT be called for internal events"
     )
@@ -174,12 +177,15 @@ async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
         return original_generate(*args, **kwargs)
 
     runner.pairing_store.generate_code = tracking_generate
+    monkeypatch.setattr(
+        runner,
+        "_handle_message_with_agent",
+        AsyncMock(return_value="internal-ok"),
+    )
 
-    try:
-        await runner._handle_message(event)
-    except Exception:
-        pass  # Expected — downstream code needs more setup
+    result = await runner._handle_message(event)
 
+    assert result == "internal-ok"
     assert not generate_called, (
         "Pairing code should NOT be generated for internal events"
     )
@@ -189,8 +195,10 @@ async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
 async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp_path):
     """Verify the normal (non-internal) path still triggers pairing for unknown users."""
     import gateway.run as gateway_run
+    import gateway.pairing as pairing
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(pairing, "PAIRING_DIR", tmp_path / "pairing")
     (tmp_path / "config.yaml").write_text("", encoding="utf-8")
 
     # Clear env vars that could let all users through (loaded by

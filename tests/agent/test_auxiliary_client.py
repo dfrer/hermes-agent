@@ -22,6 +22,7 @@ from agent.auxiliary_client import (
     _try_payment_fallback,
     _resolve_forced_provider,
     _resolve_auto,
+    _OPENROUTER_MODEL,
 )
 
 
@@ -38,6 +39,7 @@ def _clean_env(monkeypatch):
         "AUXILIARY_WEB_EXTRACT_PROVIDER", "AUXILIARY_WEB_EXTRACT_MODEL",
         "AUXILIARY_WEB_EXTRACT_BASE_URL", "AUXILIARY_WEB_EXTRACT_API_KEY",
         "CONTEXT_COMPRESSION_PROVIDER", "CONTEXT_COMPRESSION_MODEL",
+        "HERMES_AUXILIARY_ALLOW_OPENROUTER_FALLBACK",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -329,7 +331,8 @@ class TestExpiredCodexFallback:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
 
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
@@ -470,6 +473,14 @@ class TestExplicitProviderRouting:
             mock_openai.return_value = MagicMock()
             client, model = resolve_provider_client("openrouter")
             assert client is not None
+            assert model == _OPENROUTER_MODEL
+
+    def test_explicit_openrouter_rejects_paid_model(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-explicit")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            with pytest.raises(RuntimeError, match="restricted to free"):
+                resolve_provider_client("openrouter", model="google/gemini-3-flash-preview")
 
     def test_explicit_kimi(self, monkeypatch):
         """provider='kimi-coding' should use KIMI_API_KEY."""
@@ -531,9 +542,10 @@ class TestGetTextAuxiliaryClient:
 
     def test_openrouter_takes_priority(self, monkeypatch, codex_auth_dir):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_text_auxiliary_client()
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _OPENROUTER_MODEL
         mock_openai.assert_called_once()
         call_kwargs = mock_openai.call_args
         assert call_kwargs.kwargs["api_key"] == "or-key"
@@ -824,9 +836,10 @@ class TestAuxiliaryPoolAwareness:
 
     def test_vision_uses_openrouter_when_available(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_vision_auxiliary_client()
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _OPENROUTER_MODEL
         assert client is not None
 
     def test_vision_uses_nous_when_available(self, monkeypatch):
@@ -836,6 +849,16 @@ class TestAuxiliaryPoolAwareness:
             client, model = get_vision_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
         assert client is not None
+
+    def test_vision_openrouter_rejects_paid_model(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            with pytest.raises(RuntimeError, match="restricted to free"):
+                resolve_vision_provider_client(
+                    provider="openrouter",
+                    model="google/gemini-3-flash-preview",
+                )
 
     def test_vision_config_google_provider_uses_gemini_credentials(self, monkeypatch):
         config = {
@@ -955,7 +978,7 @@ class TestResolveForcedProvider:
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = _resolve_forced_provider("openrouter")
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _OPENROUTER_MODEL
         assert client is not None
 
     def test_forced_openrouter_no_key(self, monkeypatch):
@@ -1071,9 +1094,10 @@ class TestTaskSpecificOverrides:
         """AUXILIARY_VISION_PROVIDER should not affect text tasks."""
         monkeypatch.setenv("AUXILIARY_VISION_PROVIDER", "nous")
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client.OpenAI"):
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client()  # no task → auto
-        assert model == "google/gemini-3-flash-preview"  # OpenRouter, not Nous
+        assert model == _OPENROUTER_MODEL  # OpenRouter, not Nous
 
     def test_compression_task_reads_context_prefix(self, monkeypatch):
         """Compression task should check CONTEXT_COMPRESSION_PROVIDER env var."""
@@ -1092,7 +1116,7 @@ class TestTaskSpecificOverrides:
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         with patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client("web_extract")
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _OPENROUTER_MODEL
 
     def test_task_direct_endpoint_from_config(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
@@ -1115,9 +1139,10 @@ class TestTaskSpecificOverrides:
     def test_task_without_override_uses_auto(self, monkeypatch):
         """A task with no provider env var falls through to auto chain."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client.OpenAI"):
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client("compression")
-        assert model == "google/gemini-3-flash-preview"  # auto → OpenRouter
+        assert model == _OPENROUTER_MODEL  # auto → OpenRouter
 
     def test_compression_summary_base_url_from_config(self, monkeypatch, tmp_path):
         """compression.summary_base_url should produce a custom-endpoint client."""
@@ -1204,15 +1229,30 @@ class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
     def test_returns_five_entries(self):
-        chain = _get_provider_chain()
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
+            chain = _get_provider_chain()
         assert len(chain) == 5
         labels = [label for label, _ in chain]
         assert labels == ["openrouter", "nous", "local/custom", "openai-codex", "api-key"]
 
+    def test_direct_main_provider_omits_openrouter(self):
+        with patch("agent.auxiliary_client._read_main_provider", return_value="nous"):
+            chain = _get_provider_chain()
+        labels = [label for label, _ in chain]
+        assert labels == ["nous", "local/custom", "openai-codex", "api-key"]
+
+    def test_env_opt_in_allows_openrouter_after_direct_main_provider(self, monkeypatch):
+        monkeypatch.setenv("HERMES_AUXILIARY_ALLOW_OPENROUTER_FALLBACK", "1")
+        with patch("agent.auxiliary_client._read_main_provider", return_value="nous"):
+            chain = _get_provider_chain()
+        labels = [label for label, _ in chain]
+        assert labels == ["nous", "openrouter", "local/custom", "openai-codex", "api-key"]
+
     def test_picks_up_patched_functions(self):
         """Patches on _try_* functions must be visible in the chain."""
         sentinel = lambda: ("patched", "model")
-        with patch("agent.auxiliary_client._try_openrouter", sentinel):
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+             patch("agent.auxiliary_client._try_openrouter", sentinel):
             chain = _get_provider_chain()
         assert chain[0] == ("openrouter", sentinel)
 
@@ -1246,7 +1286,7 @@ class TestTryPaymentFallback:
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(mock_client, "or-model")), \
              patch("agent.auxiliary_client._try_codex", return_value=(None, None)), \
-             patch("agent.auxiliary_client._read_main_provider", return_value="openai-codex"):
+             patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openai-codex", task="vision")
         assert client is mock_client
         assert label == "openrouter"
@@ -1284,9 +1324,9 @@ class TestCallLlmPaymentFallback:
         fallback_client.chat.completions.create.return_value = fallback_response
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, _OPENROUTER_MODEL)), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("openrouter", "google/gemini-3-flash-preview", None, None)), \
+                    return_value=("openrouter", _OPENROUTER_MODEL, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(fallback_client, "gpt-5.2-codex", "openai-codex")) as mock_fb:
             result = call_llm(
@@ -1310,9 +1350,9 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = server_err
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, _OPENROUTER_MODEL)), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("openrouter", "google/gemini-3-flash-preview", None, None)):
+                    return_value=("openrouter", _OPENROUTER_MODEL, None, None)):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
                     task="compression",
@@ -1327,9 +1367,9 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = self._make_402_error()
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, _OPENROUTER_MODEL)), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("openrouter", "google/gemini-3-flash-preview", None, None)), \
+                    return_value=("openrouter", _OPENROUTER_MODEL, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(None, None, "")):
             with pytest.raises(Exception, match="insufficient credits"):

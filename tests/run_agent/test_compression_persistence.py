@@ -37,7 +37,7 @@ class TestFlushAfterCompression:
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
             from run_agent import AIAgent
             agent = AIAgent(
-                model="test/model",
+                model="test/model:free",
                 quiet_mode=True,
                 session_db=session_db,
                 session_id="original-session",

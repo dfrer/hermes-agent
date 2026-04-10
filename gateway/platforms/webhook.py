@@ -373,8 +373,13 @@ class WebhookAdapter(BasePlatformAdapter):
                         skill_payload = build_skill_invocation_message(
                             cmd_key, user_instruction=prompt
                         )
-                        if skill_payload and skill_payload.message:
-                            prompt = skill_payload.message
+                        skill_message = (
+                            skill_payload
+                            if isinstance(skill_payload, str)
+                            else getattr(skill_payload, "message", "")
+                        )
+                        if skill_message:
+                            prompt = skill_message
                             break  # Load the first matching skill
                     else:
                         logger.warning(

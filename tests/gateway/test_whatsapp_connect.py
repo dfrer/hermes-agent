@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -97,10 +98,19 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         patch("builtins.open", return_value=mock_fh),
         patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock),
         patch("gateway.platforms.whatsapp.asyncio.create_task"),
+        patch("gateway.status.acquire_scoped_lock", return_value=(True, {})),
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))
     return base
+
+
+def _enter_patches(patches):
+    """Enter all patches returned by _connect_patches()."""
+    stack = ExitStack()
+    for item in patches:
+        stack.enter_context(item)
+    return stack
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +182,7 @@ class TestDataInitialized:
 
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8], \
+        with _enter_patches(patches), \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
             # Must NOT raise NameError
             result = await adapter.connect()
@@ -202,8 +211,7 @@ class TestFileHandleClosedOnError:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7]:
+        with _enter_patches(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -272,8 +280,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with _enter_patches(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -303,8 +310,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with _enter_patches(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -321,6 +327,7 @@ class TestBridgeRuntimeFailure:
         with patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "mkdir", return_value=None), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, {})), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("subprocess.Popen", side_effect=OSError("spawn failed")), \
              patch("builtins.open", return_value=mock_fh):

@@ -842,6 +842,9 @@ class AIAgent:
             # stream tool call arguments token-by-token, keeping the
             # connection alive.
             _effective_base = str(client_kwargs.get("base_url", "")).lower()
+            if self.provider == "openrouter" or "openrouter" in _effective_base:
+                from agent.auxiliary_client import _ensure_openrouter_free_model
+                self.model = _ensure_openrouter_free_model(self.model)
             if "openrouter" in _effective_base and "claude" in (self.model or "").lower():
                 headers = client_kwargs.get("default_headers") or {}
                 existing_beta = headers.get("x-anthropic-beta", "")

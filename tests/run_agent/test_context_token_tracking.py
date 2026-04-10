@@ -58,7 +58,8 @@ def _make_agent(monkeypatch, api_mode, provider, response_fn):
             self._interruptible_api_call = lambda kw: response_fn()
             return super().run_conversation(msg, conversation_history=conversation_history, task_id=task_id)
 
-    return _A(model="test-model", api_key="test-key", provider=provider, api_mode=api_mode)
+    model = "test-model:free" if provider == "openrouter" else "test-model"
+    return _A(model=model, api_key="test-key", provider=provider, api_mode=api_mode)
 
 
 def _anthropic_resp(input_tok, output_tok, cache_read=0, cache_creation=0):

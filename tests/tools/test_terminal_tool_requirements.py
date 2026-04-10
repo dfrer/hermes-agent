@@ -29,6 +29,7 @@ class TestTerminalRequirements:
 
     def test_terminal_and_execute_code_tools_resolve_for_managed_modal(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+        monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
         monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)

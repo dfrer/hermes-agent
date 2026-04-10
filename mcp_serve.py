@@ -201,8 +201,8 @@ class EventBridge:
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
         # mtime cache — skip expensive work when files haven't changed
-        self._sessions_json_mtime: float = 0.0
-        self._state_db_mtime: float = 0.0
+        self._sessions_json_mtime: int = 0
+        self._state_db_mtime: int = 0
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -333,13 +333,20 @@ class EventBridge:
         # Check if sessions.json has changed (mtime check is ~1μs)
         sessions_file = _get_sessions_dir() / "sessions.json"
         try:
-            sj_mtime = sessions_file.stat().st_mtime if sessions_file.exists() else 0.0
+            sj_mtime = sessions_file.stat().st_mtime_ns if sessions_file.exists() else 0
         except OSError:
-            sj_mtime = 0.0
+            sj_mtime = 0
 
         if sj_mtime != self._sessions_json_mtime:
             self._sessions_json_mtime = sj_mtime
-            self._cached_sessions_index = _load_sessions_index()
+            sessions_changed = True
+        else:
+            sessions_changed = False
+
+        sessions_index = _load_sessions_index()
+        if sessions_index != self._cached_sessions_index:
+            sessions_changed = True
+            self._cached_sessions_index = sessions_index
 
         # Check if state.db has changed
         try:
@@ -349,11 +356,11 @@ class EventBridge:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
         try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
         except OSError:
-            db_mtime = 0.0
+            db_mtime = 0
 
-        if db_mtime == self._state_db_mtime and sj_mtime == self._sessions_json_mtime:
+        if db_mtime == self._state_db_mtime and not sessions_changed:
             return  # Nothing changed since last poll — skip entirely
 
         self._state_db_mtime = db_mtime

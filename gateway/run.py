@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -6952,12 +6953,22 @@ class GatewayRunner:
                     for hint in event_routing_skill_hints or []
                     if isinstance(hint, dict)
                 )
-                result = agent.run_conversation(
-                    message,
-                    conversation_history=agent_history,
-                    task_id=session_id,
-                    active_skill_hints=turn_skill_hints,
-                )
+                run_kwargs = {
+                    "conversation_history": agent_history,
+                    "task_id": session_id,
+                }
+                try:
+                    run_params = inspect.signature(agent.run_conversation).parameters.values()
+                    accepts_skill_hints = any(
+                        param.name == "active_skill_hints"
+                        or param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in run_params
+                    )
+                except (TypeError, ValueError):
+                    accepts_skill_hints = True
+                if accepts_skill_hints:
+                    run_kwargs["active_skill_hints"] = turn_skill_hints
+                result = agent.run_conversation(message, **run_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

@@ -5,18 +5,21 @@ session search, web extraction, vision analysis, browser vision) picks up
 the best available backend without duplicating fallback logic.
 
 Resolution order for text tasks (auto mode):
-  1. OpenRouter  (OPENROUTER_API_KEY)
-  2. Nous Portal (~/.hermes/auth.json active provider)
-  3. Custom endpoint (config.yaml model.base_url + OPENAI_API_KEY)
-  4. Codex OAuth (Responses API via chatgpt.com with gpt-5.3-codex,
+  1. Selected main provider, when configured and available
+  2. OpenRouter  (OPENROUTER_API_KEY) only when OpenRouter is the main/auto provider
+     and only with model slugs explicitly marked ":free"
+  3. Nous Portal (~/.hermes/auth.json active provider)
+  4. Custom endpoint (config.yaml model.base_url + OPENAI_API_KEY)
+  5. Codex OAuth (Responses API via chatgpt.com with gpt-5.3-codex,
      wrapped to look like a chat.completions client)
-  5. Native Anthropic
-  6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
-  7. None
+  6. Native Anthropic
+  7. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
+  8. None
 
 Resolution order for vision/multimodal tasks (auto mode):
   1. Selected main provider, if it is one of the supported vision backends below
-  2. OpenRouter
+  2. OpenRouter, only when OpenRouter is the main/auto provider and only with
+     model slugs explicitly marked ":free"
   3. Nous Portal
   4. Codex OAuth (gpt-5.3-codex supports vision via Responses API)
   5. Native Anthropic
@@ -38,8 +41,9 @@ custom OpenAI-compatible endpoint without touching the main model settings.
 Payment / credit exhaustion fallback:
   When a resolved provider returns HTTP 402 or a credit-related error,
   call_llm() automatically retries with the next available provider in the
-  auto-detection chain.  This handles the common case where a user depletes
-  their OpenRouter balance but has Codex OAuth or another provider available.
+  auto-detection chain.  OpenRouter is never used as an implicit fallback for
+  direct-provider setups, and OpenRouter calls are restricted to free endpoints
+  for now.
 """
 
 import json
@@ -124,7 +128,7 @@ NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
 auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
+_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 _NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_FREE_TIER_VISION_MODEL = "xiaomi/mimo-v2-omni"
 _NOUS_FREE_TIER_AUX_MODEL = "xiaomi/mimo-v2-pro"
@@ -759,6 +763,58 @@ def _get_auxiliary_env_override(task: str, suffix: str) -> Optional[str]:
     return None
 
 
+def _env_truthy(name: str) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _openrouter_fallback_allowed() -> bool:
+    """Return whether auxiliary auto/fallback may use OpenRouter.
+
+    Avoid surprise OpenRouter spend when the user's main provider is an
+    explicit direct provider such as Nous, Z.AI, MiniMax, or Gemini. Users can
+    still force OpenRouter with auxiliary.provider=openrouter, or opt into it
+    for fallback with HERMES_AUXILIARY_ALLOW_OPENROUTER_FALLBACK=1.
+    """
+    override = _env_truthy("HERMES_AUXILIARY_ALLOW_OPENROUTER_FALLBACK")
+    if override is not None:
+        return override
+    main_provider = _read_main_provider()
+    return main_provider in ("", "auto", "openrouter")
+
+
+def _ensure_openrouter_free_model(model: Optional[str]) -> str:
+    """Return a safe OpenRouter model, or reject paid OpenRouter endpoints.
+
+    Current policy: OpenRouter is allowed only for free models.  That means a
+    model slug must be explicitly tagged with ":free".  Future paid OpenRouter
+    support should add a deliberate config switch instead of relaxing this
+    guard implicitly.
+    """
+    final_model = (model or _OPENROUTER_MODEL).strip()
+    if not final_model.endswith(":free"):
+        raise RuntimeError(
+            "OpenRouter is currently restricted to free model endpoints. "
+            f"Refusing non-free OpenRouter model {final_model!r}; choose a "
+            "direct provider endpoint or an OpenRouter model ending in ':free'."
+        )
+    return final_model
+
+
+def _client_uses_openrouter(client: Any) -> bool:
+    base_url = str(getattr(client, "base_url", "") or "").lower()
+    return "openrouter" in base_url
+
+
 def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
@@ -768,14 +824,14 @@ def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                       default_headers=_OR_HEADERS), _ensure_openrouter_free_model(_OPENROUTER_MODEL)
 
     or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                   default_headers=_OR_HEADERS), _ensure_openrouter_free_model(_OPENROUTER_MODEL)
 
 
 def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -1018,13 +1074,22 @@ def _get_provider_chain() -> List[tuple]:
     Built at call time (not module level) so that test patches
     on the ``_try_*`` functions are picked up correctly.
     """
-    return [
+    chain = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("openai-codex", _try_codex),
         ("api-key", _resolve_api_key_provider),
     ]
+    if not _openrouter_fallback_allowed():
+        chain = [item for item in chain if item[0] != "openrouter"]
+
+    main_provider = _read_main_provider()
+    if main_provider in {label for label, _ in chain}:
+        preferred = [item for item in chain if item[0] == main_provider]
+        rest = [item for item in chain if item[0] != main_provider]
+        chain = preferred + rest
+    return chain
 
 
 def _is_payment_error(exc: Exception) -> bool:
@@ -1123,16 +1188,16 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
 
     Priority:
-      1. If the user's main provider is NOT an aggregator (OpenRouter / Nous),
-         use their main provider + main model directly.  This ensures users on
-         Alibaba, DeepSeek, ZAI, etc. get auxiliary tasks handled by the same
-         provider they already have credentials for — no OpenRouter key needed.
-      2. OpenRouter → Nous → custom → Codex → API-key providers (original chain).
+      1. If the user's main provider is not an aggregator, use their main
+         provider + main model directly.
+      2. Otherwise use the provider chain, with the active aggregator first
+         and OpenRouter omitted unless it is the main/auto provider or
+         HERMES_AUXILIARY_ALLOW_OPENROUTER_FALLBACK=1.
     """
     global auxiliary_is_nous
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
 
-    # ── Step 1: non-aggregator main provider → use main model directly ──
+    # ── Step 1: main direct provider → use main model directly ──
     main_provider = _read_main_provider()
     main_model = _read_main_model()
     if (main_provider and main_model
@@ -1251,6 +1316,8 @@ def resolve_provider_client(
                 "auxiliary provider (using %r instead)", model, resolved)
             model = None
         final_model = model or resolved
+        if _client_uses_openrouter(client):
+            final_model = _ensure_openrouter_free_model(final_model)
         return (_to_async_client(client, final_model) if async_mode
                 else (client, final_model))
 
@@ -1261,7 +1328,7 @@ def resolve_provider_client(
             logger.warning("resolve_provider_client: openrouter requested "
                            "but OPENROUTER_API_KEY not set")
             return None, None
-        final_model = model or default
+        final_model = _ensure_openrouter_free_model(model or default)
         return (_to_async_client(client, final_model) if async_mode
                 else (client, final_model))
 
@@ -1531,6 +1598,8 @@ def get_available_vision_backends() -> List[str]:
                 available.append(main_provider)
     # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
     for p in _VISION_AUTO_PROVIDER_ORDER:
+        if p == "openrouter" and not _openrouter_fallback_allowed():
+            continue
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)
     return available
@@ -1560,6 +1629,8 @@ def resolve_vision_provider_client(
         if sync_client is None:
             return resolved_provider, None, None
         final_model = resolved_model or default_model
+        if resolved_provider == "openrouter" or _client_uses_openrouter(sync_client):
+            final_model = _ensure_openrouter_free_model(final_model)
         if async_mode:
             async_client, async_model = _to_async_client(sync_client, final_model)
             return resolved_provider, async_client, async_model
@@ -1603,10 +1674,13 @@ def resolve_vision_provider_client(
                     return _finalize(
                         main_provider, rpc_client, rpc_model or main_model)
 
-        # Fall back through aggregators.
+        # Fall back through aggregators. Do not use OpenRouter as an implicit
+        # fallback when the main configured provider is direct/non-OpenRouter.
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             if candidate == main_provider:
                 continue  # already tried above
+            if candidate == "openrouter" and not _openrouter_fallback_allowed():
+                continue
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
                 return _finalize(candidate, sync_client, default_model)
@@ -1820,9 +1894,15 @@ def _get_cached_client(
                     _force_close_async_httpx(cached_client)
                     del _client_cache[cache_key]
                 else:
-                    return cached_client, model or cached_default
+                    final_model = model or cached_default
+                    if _client_uses_openrouter(cached_client):
+                        final_model = _ensure_openrouter_free_model(final_model)
+                    return cached_client, final_model
             else:
-                return cached_client, model or cached_default
+                final_model = model or cached_default
+                if _client_uses_openrouter(cached_client):
+                    final_model = _ensure_openrouter_free_model(final_model)
+                return cached_client, final_model
     # Build outside the lock
     client, default_model = resolve_provider_client(
         provider,
@@ -1840,7 +1920,10 @@ def _get_cached_client(
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
                 client, default_model, _ = _client_cache[cache_key]
-    return client, model or default_model
+    final_model = model or default_model
+    if client is not None and _client_uses_openrouter(client):
+        final_model = _ensure_openrouter_free_model(final_model)
+    return client, final_model
 
 
 def _resolve_task_provider_model(
@@ -1957,6 +2040,9 @@ def _build_call_kwargs(
     base_url: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    if provider == "openrouter" or "openrouter" in str(base_url or "").lower():
+        model = _ensure_openrouter_free_model(model)
+
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -2041,6 +2127,13 @@ def call_llm(
             async_mode=False,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit not in ("openrouter", "custom"):
+                raise RuntimeError(
+                    f"Provider '{_explicit}' is set in config.yaml but no API key "
+                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"variable, or switch to a different provider with `hermes model`."
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -2235,6 +2328,13 @@ async def async_call_llm(
             async_mode=True,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit not in ("openrouter", "custom"):
+                raise RuntimeError(
+                    f"Provider '{_explicit}' is set in config.yaml but no API key "
+                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"variable, or switch to a different provider with `hermes model`."
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -2267,11 +2367,9 @@ async def async_call_llm(
                     f"variable, or switch to a different provider with `hermes model`."
                 )
             if not resolved_base_url:
-                logger.warning("Provider %s unavailable, falling back to openrouter",
-                               resolved_provider)
-                client, final_model = _get_cached_client(
-                    "openrouter", resolved_model or _OPENROUTER_MODEL,
-                    async_mode=True)
+                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
+                            task or "call", resolved_provider)
+                client, final_model = _get_cached_client("auto", async_mode=True)
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "

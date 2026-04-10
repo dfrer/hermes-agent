@@ -193,7 +193,7 @@ def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
         model="gpt-5-codex",
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://chatgpt.com/backend-api/codex",
         provider="openai-codex",
         api_key="codex-token",
         quiet_mode=True,
@@ -209,7 +209,7 @@ def test_api_mode_normalizes_provider_case(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
         model="gpt-5-codex",
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://chatgpt.com/backend-api/codex",
         provider="OpenAI-Codex",
         api_key="codex-token",
         quiet_mode=True,
@@ -224,7 +224,7 @@ def test_api_mode_normalizes_provider_case(monkeypatch):
 def test_api_mode_respects_explicit_openrouter_provider_over_codex_url(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
-        model="gpt-5-codex",
+        model="gpt-5-codex:free",
         base_url="https://chatgpt.com/backend-api/codex",
         provider="openrouter",
         api_key="test-token",

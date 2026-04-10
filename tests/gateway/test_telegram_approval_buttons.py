@@ -159,7 +159,8 @@ class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
     @pytest.mark.asyncio
-    async def test_resolves_approval_on_click(self):
+    async def test_resolves_approval_on_click(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
         adapter = _make_adapter()
         # Set up approval state
         adapter._approval_state[1] = "agent:main:telegram:group:12345:99"
@@ -189,7 +190,8 @@ class TestTelegramApprovalCallback:
         assert 1 not in adapter._approval_state
 
     @pytest.mark.asyncio
-    async def test_deny_button(self):
+    async def test_deny_button(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
         adapter = _make_adapter()
         adapter._approval_state[2] = "some-session"
 
@@ -214,7 +216,8 @@ class TestTelegramApprovalCallback:
         assert "Denied" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_already_resolved(self):
+    async def test_already_resolved(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
         adapter = _make_adapter()
         # No state for approval_id 99 — already resolved
 

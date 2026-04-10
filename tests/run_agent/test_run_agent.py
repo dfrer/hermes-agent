@@ -420,7 +420,7 @@ class TestInit:
         ):
             a = AIAgent(
                 api_key="test-k...7890",
-                model="anthropic/claude-sonnet-4-20250514",
+                model="anthropic/claude-sonnet-4-20250514:free",
                 base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
@@ -3656,7 +3656,7 @@ class TestMemoryNudgeCounterPersistence:
         """Counters must exist on the agent after __init__."""
         with patch("run_agent.get_tool_definitions", return_value=[]):
             a = AIAgent(
-                model="test", api_key="test-key", provider="openrouter",
+                model="test:free", api_key="test-key", provider="openrouter",
                 skip_context_files=True, skip_memory=True,
             )
         assert hasattr(a, "_turns_since_memory")

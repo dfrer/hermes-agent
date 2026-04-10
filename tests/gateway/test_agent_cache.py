@@ -110,11 +110,11 @@ class TestAgentCacheLifecycle:
         session_key = "telegram:12345"
         runtime = {"api_key": "test", "base_url": "https://openrouter.ai/api/v1",
                     "provider": "openrouter", "api_mode": "chat_completions"}
-        sig = runner._agent_config_signature("anthropic/claude-sonnet-4", runtime, ["hermes-telegram"], "")
+        sig = runner._agent_config_signature("anthropic/claude-sonnet-4:free", runtime, ["hermes-telegram"], "")
 
         # First message — create and cache
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -138,9 +138,9 @@ class TestAgentCacheLifecycle:
         runtime = {"api_key": "test", "base_url": "https://openrouter.ai/api/v1",
                     "provider": "openrouter", "api_mode": "chat_completions"}
 
-        old_sig = runner._agent_config_signature("anthropic/claude-sonnet-4", runtime, ["hermes-telegram"], "")
+        old_sig = runner._agent_config_signature("anthropic/claude-sonnet-4:free", runtime, ["hermes-telegram"], "")
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -149,7 +149,7 @@ class TestAgentCacheLifecycle:
             runner._agent_cache[session_key] = (agent1, old_sig)
 
         # New model → different signature
-        new_sig = runner._agent_config_signature("anthropic/claude-opus-4.6", runtime, ["hermes-telegram"], "")
+        new_sig = runner._agent_config_signature("anthropic/claude-opus-4.6:free", runtime, ["hermes-telegram"], "")
         assert new_sig != old_sig
 
         with runner._agent_cache_lock:
@@ -164,7 +164,7 @@ class TestAgentCacheLifecycle:
         session_key = "telegram:12345"
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
@@ -195,7 +195,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
@@ -218,7 +218,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -237,7 +237,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="anthropic/claude-sonnet-4:free", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,

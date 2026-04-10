@@ -4888,6 +4888,8 @@ class HermesCLI:
                 if payload and payload.message:
                     skill_name = _skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
+                    if not hasattr(self, "_pending_turn_skill_hints"):
+                        self._pending_turn_skill_hints = []
                     self._pending_turn_skill_hints.extend(payload.routing_hints)
                     if hasattr(self, '_pending_input'):
                         self._pending_input.put(payload.message)
@@ -4957,6 +4959,8 @@ class HermesCLI:
             return
 
         _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path}")
+        if not hasattr(self, "_pending_turn_skill_hints"):
+            self._pending_turn_skill_hints = []
         self._pending_turn_skill_hints.extend(payload.routing_hints)
         if hasattr(self, '_pending_input'):
             self._pending_input.put(payload.message)
