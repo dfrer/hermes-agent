@@ -1164,7 +1164,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if not _is_local_backend() and not _allow_private_urls() and not _is_safe_url(url):
         return json.dumps({
             "success": False,
-            "error": "Blocked by browser SSRF protection: URL targets a private or internal address. Set browser.allow_private_urls=true to allow this.",
+            "error": (
+                "Blocked by browser SSRF protection: URL targets a private or internal address. "
+                "For local file/localhost visual previews, use a local browser backend "
+                "(set browser.cloud_provider=local or connect a local CDP browser). "
+                "Set browser.allow_private_urls=true only when you intentionally want a cloud browser "
+                "to access a private address reachable from that cloud browser."
+            ),
         })
 
     # Website policy check — block before navigating
@@ -1209,7 +1215,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)
             return json.dumps({
                 "success": False,
-                "error": "Blocked by browser SSRF protection: redirect landed on a private/internal address. Set browser.allow_private_urls=true to allow this.",
+                "error": (
+                    "Blocked by browser SSRF protection: redirect landed on a private/internal address. "
+                    "For local file/localhost visual previews, use a local browser backend "
+                    "(set browser.cloud_provider=local or connect a local CDP browser). "
+                    "Set browser.allow_private_urls=true only when you intentionally want a cloud browser "
+                    "to access a private address reachable from that cloud browser."
+                ),
             })
 
         response = {

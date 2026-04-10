@@ -509,6 +509,33 @@ def test_allows_chained_read_only_terminal_inspection():
         deactivate_for_task(task_id)
 
 
+def test_allows_local_visual_preview_command_before_route_lock():
+    task_id = "task-routing-local-preview-before-route"
+    activate_for_task(task_id, session_id="session-local-preview-before-route", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "terminal",
+                {
+                    "command": "cd /home/hunter/matrix-glitch && python3 -m http.server 8765 --bind 127.0.0.1",
+                },
+                task_id,
+            )
+            is None
+        )
+        blocked = pre_tool_call_block_reason(
+            "terminal",
+            {
+                "command": "cd /home/hunter/matrix-glitch && python3 -m http.server 8765 --bind 0.0.0.0",
+            },
+            task_id,
+        )
+        assert blocked is not None
+        assert "localhost-only visual preview commands" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_allows_read_only_git_branch_listing_before_routing():
     task_id = "task-routing-terminal-git-branch-listing"
     activate_for_task(task_id, session_id="session-git-branch-listing", skills=["routing-layer"])

@@ -1934,11 +1934,13 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             )
         if routed:
             return None
+        if _classify_visual_verification_command(command) is not None:
+            return None
         if _is_read_only_terminal_command(command):
             return None
         return (
             f"Routing guard blocked `terminal` for task {task_id}: "
-            "only read-only inspection commands are allowed before a routing decision."
+            "only read-only inspection commands and localhost-only visual preview commands are allowed before a routing decision."
         )
 
     if tool_name == "delegate_task":

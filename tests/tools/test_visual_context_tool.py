@@ -119,6 +119,42 @@ async def test_browser_source_collects_visual_snapshot_and_console():
 
 
 @pytest.mark.asyncio
+async def test_browser_source_stops_when_navigation_fails():
+    from tools.visual_context_tool import visual_context_tool
+
+    with (
+        patch("tools.visual_context_tool._vision_capability_error", return_value=None),
+        patch("tools.browser_tool.check_browser_requirements", return_value=True),
+        patch(
+            "tools.browser_tool.browser_navigate",
+            return_value=json.dumps(
+                {
+                    "success": False,
+                    "error": "Blocked by browser SSRF protection: use a local browser backend",
+                }
+            ),
+        ),
+        patch("tools.browser_tool.browser_snapshot") as mock_snapshot,
+        patch("tools.browser_tool.browser_console") as mock_console,
+        patch("tools.browser_tool.browser_vision") as mock_browser_vision,
+    ):
+        result = json.loads(
+            await visual_context_tool(
+                "browser",
+                "Does the page look ready?",
+                url="http://127.0.0.1:3000",
+            )
+        )
+
+    assert result["success"] is False
+    assert "local browser backend" in result["error"]
+    assert result["browser"]["navigation"]["success"] is False
+    mock_snapshot.assert_not_called()
+    mock_console.assert_not_called()
+    mock_browser_vision.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_known_text_only_vision_model_is_rejected():
     from tools.visual_context_tool import visual_context_tool
 

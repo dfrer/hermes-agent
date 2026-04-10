@@ -228,9 +228,23 @@ async def visual_context_tool(
     browser_details: dict[str, Any] = {}
     clean_url = str(url or "").strip()
     if clean_url:
-        browser_details["navigation"] = _json_or_text(
+        navigation_payload = _json_or_text(
             browser_navigate(clean_url, task_id=task_id)
         )
+        browser_details["navigation"] = navigation_payload
+        if isinstance(navigation_payload, dict) and navigation_payload.get("success") is False:
+            return json.dumps(
+                {
+                    "success": False,
+                    "source": "browser",
+                    "question": clean_question,
+                    "url": clean_url,
+                    "error": str(navigation_payload.get("error") or "browser navigation failed"),
+                    "browser": _truncate_nested_text(browser_details),
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+            )
 
     if include_snapshot:
         browser_details["snapshot"] = _json_or_text(
