@@ -139,6 +139,7 @@ def _discover_tools():
         "tools.web_tools",
         "tools.terminal_tool",
         "tools.routed_exec_tool",
+        "tools.routed_plan_tool",
         "tools.file_tools",
         "tools.vision_tools",
         "tools.visual_context_tool",
@@ -513,6 +514,7 @@ def handle_function_call(
                 function_name,
                 function_args if isinstance(function_args, dict) else {},
                 task_id or "",
+                session_id or "",
             )
             if block_reason:
                 return json.dumps({"error": block_reason})
@@ -542,11 +544,13 @@ def handle_function_call(
                 enabled_tools=sandbox_enabled,
             )
         else:
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                user_task=user_task,
-            )
+            dispatch_kwargs = {
+                "task_id": task_id,
+                "user_task": user_task,
+            }
+            if function_name == "routed_plan":
+                dispatch_kwargs["session_id"] = session_id or ""
+            result = registry.dispatch(function_name, function_args, **dispatch_kwargs)
 
         try:
             from agent.routing_guard import record_tool_result

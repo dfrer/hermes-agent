@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +88,24 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS routed_plans (
+    plan_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    task_id TEXT,
+    status TEXT NOT NULL,
+    parent_decision_json TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_routed_plans_task_status
+    ON routed_plans(task_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routed_plans_session_status
+    ON routed_plans(session_id, status, updated_at DESC);
 """
 
 FTS_SQL = """
@@ -329,6 +347,29 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: routed_plan persistence for operational resume/audit.
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS routed_plans (
+                        plan_id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        task_id TEXT,
+                        status TEXT NOT NULL,
+                        parent_decision_json TEXT NOT NULL,
+                        plan_json TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        completed_at REAL,
+                        last_error TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_routed_plans_task_status
+                        ON routed_plans(task_id, status, updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_routed_plans_session_status
+                        ON routed_plans(session_id, status, updated_at DESC);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -594,6 +635,144 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    @staticmethod
+    def _decode_routed_plan_row(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        record = dict(row)
+        try:
+            parent_decision = json.loads(record.get("parent_decision_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            parent_decision = {}
+        try:
+            plan = json.loads(record.get("plan_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            plan = {}
+        return {
+            "plan_id": record.get("plan_id", ""),
+            "session_id": record.get("session_id", ""),
+            "task_id": record.get("task_id", ""),
+            "status": record.get("status", ""),
+            "parent_decision": parent_decision if isinstance(parent_decision, dict) else {},
+            "plan": plan if isinstance(plan, dict) else {},
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+            "completed_at": record.get("completed_at"),
+            "last_error": record.get("last_error") or "",
+        }
+
+    def save_routed_plan(
+        self,
+        *,
+        plan_id: str,
+        session_id: str = "",
+        task_id: str = "",
+        status: str,
+        parent_decision: Dict[str, Any],
+        plan: Dict[str, Any],
+        last_error: str = "",
+    ) -> str:
+        """Persist or update one routed plan snapshot."""
+        clean_plan_id = str(plan_id or "").strip()
+        if not clean_plan_id:
+            raise ValueError("plan_id is required")
+        now = time.time()
+        completed_at = now if status in {"completed", "failed", "blocked", "reset"} else None
+        parent_json = json.dumps(parent_decision or {}, ensure_ascii=False)
+        plan_json = json.dumps(plan or {}, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO routed_plans (
+                    plan_id, session_id, task_id, status, parent_decision_json,
+                    plan_json, created_at, updated_at, completed_at, last_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    task_id = excluded.task_id,
+                    status = excluded.status,
+                    parent_decision_json = excluded.parent_decision_json,
+                    plan_json = excluded.plan_json,
+                    updated_at = excluded.updated_at,
+                    completed_at = excluded.completed_at,
+                    last_error = excluded.last_error
+                """,
+                (
+                    clean_plan_id,
+                    str(session_id or ""),
+                    str(task_id or ""),
+                    str(status or "submitted"),
+                    parent_json,
+                    plan_json,
+                    now,
+                    now,
+                    completed_at,
+                    str(last_error or ""),
+                ),
+            )
+
+        self._execute_write(_do)
+        return clean_plan_id
+
+    def get_routed_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        """Load one routed plan by plan_id."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM routed_plans WHERE plan_id = ?",
+                (str(plan_id or "").strip(),),
+            )
+            row = cursor.fetchone()
+        return self._decode_routed_plan_row(row)
+
+    def get_active_routed_plan_for_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Load the latest non-reset routed plan snapshot for a task."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM routed_plans
+                WHERE task_id = ? AND status != 'reset'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (str(task_id or ""),),
+            )
+            row = cursor.fetchone()
+        return self._decode_routed_plan_row(row)
+
+    def get_latest_routed_plan_for_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Load the latest non-reset routed plan snapshot for a session."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM routed_plans
+                WHERE session_id = ? AND status != 'reset'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (str(session_id or ""),),
+            )
+            row = cursor.fetchone()
+        return self._decode_routed_plan_row(row)
+
+    def mark_routed_plan_reset(self, plan_id: str, *, last_error: str = "") -> bool:
+        """Mark a routed plan inactive without deleting its audit row."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                UPDATE routed_plans
+                SET status = 'reset', updated_at = ?, completed_at = ?, last_error = ?
+                WHERE plan_id = ?
+                """,
+                (now, now, str(last_error or ""), str(plan_id or "").strip()),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

@@ -14,9 +14,13 @@ from agent.routing_guard import (
     get_verification_attempts,
     has_route_lock,
     pre_tool_call_block_reason,
+    record_ability_packet,
     record_tool_result,
     record_routing_decision,
 )
+from agent.ability_context import make_ability_packet
+from agent.routing_plan_store import set_plan_store_db
+from hermes_state import SessionDB
 
 
 def _plan_kind_labels(task_id: str) -> list[dict[str, str]]:
@@ -365,6 +369,175 @@ def test_allows_routed_exec_after_routing_decision():
             )
             is None
         )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_routed_plan_before_routing_decision():
+    task_id = "task-routing-routed-plan-block"
+    activate_for_task(task_id, session_id="session-routed-plan-block", skills=["routing-layer"])
+    try:
+        blocked = pre_tool_call_block_reason(
+            "routed_plan",
+            {"action": "submit", "plan": {"summary": "x", "nodes": []}},
+            task_id,
+        )
+        assert blocked is not None
+        assert "emit a routing decision line" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_routed_plan_after_routing_decision():
+    task_id = "task-routing-routed-plan-allow"
+    activate_for_task(task_id, session_id="session-routed-plan-allow", skills=["routing-layer"])
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3A | PATH: high-risk | MODEL: Codex CLI (gpt-5.4) | REASON: multi-node fix | CONFIDENCE: high",
+            session_id="session-routed-plan-allow",
+        )
+        assert (
+            pre_tool_call_block_reason(
+                "routed_plan",
+                {"action": "submit", "plan": {"summary": "x", "nodes": []}},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_routed_plan_after_memory_loss_when_persisted_plan_exists(tmp_path):
+    task_id = "task-routing-routed-plan-persisted-allow"
+    session_id = "session-routed-plan-persisted-allow"
+    session_db = SessionDB(tmp_path / "guard_routed_plan_state.db")
+    set_plan_store_db(session_db)
+    decision = {
+        "tier": "3C",
+        "path": "quick-edit",
+        "model": "Codex CLI (gpt-5.4-mini)",
+        "reason": "resume persisted plan",
+        "confidence": "high",
+    }
+    plan = {
+        "plan_id": "guard-persisted-plan",
+        "summary": "resume plan",
+        "workdir": str(tmp_path),
+        "nodes": [
+            {
+                "id": "a",
+                "goal": "resume",
+                "tier": "3C",
+                "path": "quick-edit",
+                "model": "Codex CLI (gpt-5.4-mini)",
+                "workdir": str(tmp_path),
+                "write_scope": ["src/a.py"],
+                "depends_on": [],
+                "status": "pending",
+                "result": None,
+            }
+        ],
+    }
+    try:
+        session_db.save_routed_plan(
+            plan_id="guard-persisted-plan",
+            session_id=session_id,
+            task_id=task_id,
+            status="submitted",
+            parent_decision=decision,
+            plan=plan,
+        )
+        activate_for_task(task_id, session_id=session_id, skills=["routing-layer"])
+
+        blocked = pre_tool_call_block_reason(
+            "routed_plan",
+            {"action": "status", "plan_id": "guard-persisted-plan"},
+            task_id,
+            session_id,
+        )
+
+        assert blocked is None
+        assert has_route_lock(task_id) is True
+        assert get_routing_decision(task_id)["path"] == "quick-edit"
+    finally:
+        deactivate_for_task(task_id)
+        set_plan_store_db(None)
+        session_db.close()
+
+
+def test_routed_plan_blocked_when_ability_preflight_missing():
+    task_id = "task-routing-routed-plan-ability-block"
+    activate_for_task(
+        task_id,
+        session_id="session-routed-plan-ability-block",
+        skills=["routing-layer"],
+        user_message="Fix the visual layout and responsive CSS.",
+    )
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3A | PATH: high-risk | MODEL: Codex CLI (gpt-5.4) | REASON: visual implementation | CONFIDENCE: high",
+            session_id="session-routed-plan-ability-block",
+        )
+        blocked = pre_tool_call_block_reason(
+            "routed_plan",
+            {"action": "submit", "plan": {"summary": "x", "nodes": []}},
+            task_id,
+        )
+        assert blocked is not None
+        assert "required ability preflight lane(s) missing: visual" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_routed_plan_does_not_unblock_native_mutation_or_delegate():
+    task_id = "task-routing-routed-plan-native-blocks"
+    activate_for_task(
+        task_id,
+        session_id="session-routed-plan-native-blocks",
+        skills=["routing-layer"],
+        user_message="Fix the visual layout.",
+    )
+    try:
+        record_ability_packet(
+            task_id,
+            make_ability_packet(
+                task_id=task_id,
+                lanes=["visual"],
+                phase="pre",
+                status="success",
+                summary="visual preflight captured",
+            ),
+        )
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3A | PATH: high-risk | MODEL: Codex CLI (gpt-5.4) | REASON: visual implementation | CONFIDENCE: high",
+            session_id="session-routed-plan-native-blocks",
+        )
+        assert pre_tool_call_block_reason("routed_plan", {"action": "status"}, task_id) is None
+
+        blocked_delegate = pre_tool_call_block_reason(
+            "delegate_task",
+            {"goal": "Implement the fix"},
+            task_id,
+        )
+        blocked_patch = pre_tool_call_block_reason("patch", {"path": "src/app.py"}, task_id)
+        blocked_write = pre_tool_call_block_reason(
+            "write_file",
+            {"path": "src/app.py", "content": "print('x')"},
+            task_id,
+        )
+        blocked_terminal = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "python scripts/mutate.py"},
+            task_id,
+        )
+        assert "native `delegate_task`" in blocked_delegate
+        assert "native `patch`" in blocked_patch
+        assert "native `write_file`" in blocked_write
+        assert "native `terminal`" in blocked_terminal
     finally:
         deactivate_for_task(task_id)
 

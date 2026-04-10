@@ -12,12 +12,14 @@ from typing import Any, Optional
 from agent.routing_policy import (
     ROUTING_POLICY_VERSION,
     DEFAULT_ROUTE_PATHS,
+    infer_route_path,
     get_allowed_route_models,
     get_primary_model_path_by_tier,
     get_route_matrix,
     load_routing_policy,
     normalize_route_model,
     normalize_route_path,
+    validate_route_choice,
 )
 from agent.ability_context import (
     VISUAL_CACHE_TTL_SECONDS,
@@ -508,6 +510,7 @@ def _new_task_state(
         "decision": None,
         "decision_line": None,
         "decision_error": None,
+        "routed_plan": None,
         "route_attempts": _initial_route_attempts(),
         "verification_attempts": [],
         "git_permissions": _derive_git_permissions(user_message),
@@ -849,6 +852,87 @@ def get_selected_route(task_id: str) -> dict[str, Any]:
         return dict(selected)
 
 
+def get_routed_plan_state(task_id: str) -> Optional[dict[str, Any]]:
+    if not task_id:
+        return None
+    with _task_state_lock:
+        _purge_expired()
+        plan = _task_state.get(task_id, {}).get("routed_plan")
+        if not isinstance(plan, dict):
+            return None
+        return json.loads(json.dumps(plan, ensure_ascii=False))
+
+
+def set_routed_plan_state(task_id: str, plan: Optional[dict[str, Any]]) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        state["routed_plan"] = json.loads(json.dumps(plan, ensure_ascii=False)) if isinstance(plan, dict) else None
+        state["updated_at"] = time.time()
+
+
+def clear_routed_plan_state(task_id: str) -> None:
+    set_routed_plan_state(task_id, None)
+
+
+def hydrate_routed_plan_from_persistence(task_id: str, *, session_id: str = "", plan_id: str = "") -> bool:
+    """Restore route lock + routed_plan state from state.db when routing-layer is active."""
+    if not task_id:
+        return False
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state or DEFAULT_ROUTING_SKILL not in (state.get("skills") or []):
+            return False
+
+    try:
+        from agent.routing_plan_store import load_plan_snapshot
+
+        record = load_plan_snapshot(plan_id=plan_id, task_id=task_id, session_id=session_id)
+    except Exception:
+        return False
+    if not isinstance(record, dict):
+        return False
+
+    parent_decision = record.get("parent_decision") if isinstance(record.get("parent_decision"), dict) else {}
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else None
+    if not parent_decision or not plan:
+        return False
+    route_validation = validate_route_choice(
+        str(parent_decision.get("tier", "")),
+        str(parent_decision.get("path", "")),
+        str(parent_decision.get("model", "")),
+    )
+    if not route_validation.ok or not route_validation.profile:
+        return False
+
+    policy = load_routing_policy()
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state or DEFAULT_ROUTING_SKILL not in (state.get("skills") or []):
+            return False
+        state["session_id"] = session_id or str(record.get("session_id") or state.get("session_id") or "")
+        state["routed"] = True
+        state["decision"] = dict(parent_decision)
+        state["policy_version"] = policy.version or ROUTING_POLICY_VERSION
+        state["selected_route"] = {
+            "policy_version": policy.version or ROUTING_POLICY_VERSION,
+            "tier": route_validation.tier,
+            "path": route_validation.path,
+            "model": str(parent_decision.get("model", "")),
+            "profile": route_validation.profile,
+        }
+        state["decision_error"] = None
+        state["routed_plan"] = json.loads(json.dumps(plan, ensure_ascii=False))
+        state["updated_at"] = time.time()
+    return True
+
+
 def get_session_lane_context(task_id: str) -> dict[str, str]:
     if not task_id:
         return {"model": "", "provider": "", "label": ""}
@@ -1053,6 +1137,35 @@ def mark_ability_evidence_stale(task_id: str, *, reason: str = "") -> None:
         state["updated_at"] = time.time()
 
 
+def _mark_visual_verification_pending_locked(state: dict[str, Any], *, reason: str) -> None:
+    if not state.get("visual_verification_required"):
+        return
+    state["visual_verification_pending"] = True
+    state["final_response_guard_attempts"] = 0
+    for packet in state.get("ability_packets", []):
+        if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
+            packet["stale"] = True
+            packet["stale_reason"] = reason
+    cache = state.get("ability_cache")
+    if isinstance(cache, dict):
+        for packet in cache.values():
+            if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
+                packet["stale"] = True
+                packet["stale_reason"] = reason
+
+
+def mark_routed_plan_node_success(task_id: str) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        _mark_visual_verification_pending_locked(state, reason="routed_plan node succeeded")
+        state["updated_at"] = time.time()
+
+
 def get_ability_handoff(task_id: str) -> str:
     return compact_packets_for_handoff(get_ability_packets(task_id))
 
@@ -1139,10 +1252,7 @@ def _normalize_route_path(path: str) -> str:
 
 
 def _infer_route_path(tier: str, normalized_model: str) -> str:
-    inferred = get_primary_model_path_by_tier().get((tier or "").upper(), {}).get(normalized_model)
-    if inferred:
-        return inferred
-    return _DEFAULT_ROUTE_PATHS.get(tier, "")
+    return infer_route_path(tier, normalized_model)
 
 
 def _get_route_profile(tier: str, path: str, normalized_model: str = "") -> Optional[dict[str, Any]]:
@@ -1261,11 +1371,10 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
                 decision["path"] = _normalize_route_path(str(current.get("path", "")))
             else:
                 decision["path"] = _infer_route_path(decision["tier"], normalized_model)
+        route_validation = validate_route_choice(decision["tier"], decision["path"], decision["model"])
         policy = load_routing_policy()
-        route_matrix = {
-            tier: {path: profile.to_dict() for path, profile in paths.items()}
-            for tier, paths in policy.routes.items()
-        }
+        route_matrix = get_route_matrix()
+        profile = route_validation.profile
         if decision["path"] not in route_matrix.get(decision["tier"], {}):
             correction = _format_route_correction_hint(decision["tier"], decision["path"], normalized_model)
             _set_decision_error(
@@ -1291,7 +1400,6 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
                 ),
             )
             return False
-        profile = _get_route_profile(decision["tier"], decision["path"], normalized_model)
         if not profile:
             _set_decision_error(
                 state,
@@ -1612,19 +1720,8 @@ def record_tool_result(task_id: str, tool_name: str, args: dict[str, Any], resul
                     attempts["3b_primary_attempted"] = True
                     attempts["3b_primary_failed"] = failed
                     attempts["3b_primary_failure_kind"] = failure_kind if failed else None
-                if not failed and state.get("visual_verification_required"):
-                    state["visual_verification_pending"] = True
-                    state["final_response_guard_attempts"] = 0
-                    for packet in state.get("ability_packets", []):
-                        if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
-                            packet["stale"] = True
-                            packet["stale_reason"] = "routed_exec mutation succeeded"
-                    cache = state.get("ability_cache")
-                    if isinstance(cache, dict):
-                        for packet in cache.values():
-                            if isinstance(packet, dict) and "visual" in normalize_lanes(packet.get("lanes") or []):
-                                packet["stale"] = True
-                                packet["stale_reason"] = "routed_exec mutation succeeded"
+                if not failed:
+                    _mark_visual_verification_pending_locked(state, reason="routed_exec mutation succeeded")
             state["updated_at"] = time.time()
         return
 
@@ -2119,14 +2216,14 @@ def _is_implementation_delegate(args: dict[str, Any]) -> bool:
     return any(keyword in combined for keyword in _IMPLEMENTATION_DELEGATE_KEYWORDS)
 
 
-def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: str) -> Optional[str]:
+def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: str, session_id: str = "") -> Optional[str]:
     if not task_id or not is_active_for_task(task_id):
         return None
     routed = has_route_lock(task_id)
     routing_task = is_routing_enforced_task(task_id)
     decision_error = _get_decision_error(task_id)
 
-    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec", "execute_code"}:
+    if decision_error and tool_name in {"patch", "write_file", "terminal", "delegate_task", "routed_exec", "routed_plan", "execute_code"}:
         return decision_error
 
     if tool_name == "execute_code":
@@ -2180,6 +2277,38 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
         return (
             f"Routing guard blocked `routed_exec` for task {task_id}: "
             "emit a routing decision line before starting routed execution."
+        )
+
+    if tool_name == "routed_plan":
+        if not routing_task:
+            return (
+                "Routing guard blocked `routed_plan`: this tool is reserved for routing-layer controlled "
+                "coding tasks."
+            )
+        if not routed:
+            requested_plan_id = ""
+            if isinstance(args, dict):
+                requested_plan_id = str(args.get("plan_id", "") or "").strip()
+            routed = hydrate_routed_plan_from_persistence(
+                task_id,
+                session_id=session_id,
+                plan_id=requested_plan_id,
+            ) or has_route_lock(task_id)
+        if routed:
+            requirements = get_ability_requirements(task_id)
+            missing = preflight_missing_lanes(requirements, get_ability_packets(task_id))
+            if missing:
+                lanes = ", ".join(missing)
+                return (
+                    f"Routing guard blocked `routed_plan` for task {task_id}: "
+                    f"required ability preflight lane(s) missing: {lanes}. "
+                    "Call `ability_context` with `mode=\"auto\"` or `mode=\"collect\"` and `phase=\"pre\"`; "
+                    "if a lane is unavailable, record an unavailable packet with the concrete blocker."
+                )
+            return None
+        return (
+            f"Routing guard blocked `routed_plan` for task {task_id}: "
+            "emit a routing decision line before submitting or running a routed plan."
         )
 
     if tool_name == "terminal":

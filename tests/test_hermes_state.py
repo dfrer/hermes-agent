@@ -84,6 +84,66 @@ class TestSessionLifecycle:
         assert child["parent_session_id"] == "parent"
 
 
+class TestRoutedPlanPersistence:
+    def test_routed_plan_crud_and_reset(self, db):
+        plan = {
+            "plan_id": "plan-1",
+            "nodes": [{"id": "a", "status": "pending"}],
+        }
+        decision = {
+            "tier": "3C",
+            "path": "quick-edit",
+            "model": "Codex CLI (gpt-5.4-mini)",
+        }
+        db.save_routed_plan(
+            plan_id="plan-1",
+            session_id="session-1",
+            task_id="task-1",
+            status="submitted",
+            parent_decision=decision,
+            plan=plan,
+        )
+
+        loaded = db.get_routed_plan("plan-1")
+        assert loaded["plan"] == plan
+        assert loaded["parent_decision"] == decision
+        assert db.get_active_routed_plan_for_task("task-1")["plan_id"] == "plan-1"
+        assert db.get_latest_routed_plan_for_session("session-1")["plan_id"] == "plan-1"
+
+        db.mark_routed_plan_reset("plan-1", last_error="done")
+        reset = db.get_routed_plan("plan-1")
+        assert reset["status"] == "reset"
+        assert reset["completed_at"] is not None
+        assert reset["last_error"] == "done"
+        assert db.get_active_routed_plan_for_task("task-1") is None
+
+    def test_routed_plan_upsert_preserves_created_at_and_updates_status(self, db):
+        decision = {"tier": "3C", "path": "quick-edit", "model": "Codex CLI (gpt-5.4-mini)"}
+        db.save_routed_plan(
+            plan_id="plan-2",
+            session_id="session-2",
+            task_id="task-2",
+            status="submitted",
+            parent_decision=decision,
+            plan={"plan_id": "plan-2", "nodes": [{"id": "a", "status": "pending"}]},
+        )
+        first = db.get_routed_plan("plan-2")
+        db.save_routed_plan(
+            plan_id="plan-2",
+            session_id="session-2",
+            task_id="task-2",
+            status="completed",
+            parent_decision=decision,
+            plan={"plan_id": "plan-2", "nodes": [{"id": "a", "status": "completed"}]},
+        )
+        second = db.get_routed_plan("plan-2")
+
+        assert second["created_at"] == first["created_at"]
+        assert second["updated_at"] >= first["updated_at"]
+        assert second["status"] == "completed"
+        assert second["completed_at"] is not None
+
+
 # =========================================================================
 # Message storage
 # =========================================================================
@@ -935,7 +995,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -991,12 +1051,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v7
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")

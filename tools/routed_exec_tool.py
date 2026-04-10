@@ -433,6 +433,8 @@ def _run_codex(
             command,
             input=prompt,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             cwd=host_cwd,
@@ -523,6 +525,8 @@ def _run_hermes(
         result = subprocess.run(
             command,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             cwd=host_cwd,
@@ -599,39 +603,43 @@ def _run_hermes(
         )
 
 
-def routed_exec_tool(
+def execute_routed_context(
     task: str,
     workdir: str,
-    timeout: Optional[int] = None,
     *,
+    decision: dict[str, Any],
+    route_targets: list[dict[str, Any]],
+    selected_route: Optional[dict[str, Any]] = None,
+    session_lane: Optional[dict[str, str]] = None,
     task_id: str = "",
+    timeout: Optional[int] = None,
     evidence: str = "",
-) -> str:
+    ability_evidence: str = "",
+) -> dict[str, Any]:
     prompt = str(task or "").strip()
     if not prompt:
-        return tool_error("`task` is required for routed_exec.")
+        return {"success": False, "error": "`task` is required for routed_exec."}
 
-    decision = get_routing_decision(task_id)
-    if not decision:
-        return tool_error("No active routing decision for this task. Emit the routing line first.")
-
-    plan = get_routed_execution_plan(task_id)
+    plan = [dict(item) for item in route_targets if isinstance(item, dict)]
     if not plan:
-        return tool_error("No routed execution plan is available for the current task.")
+        return {"success": False, "error": "No routed execution plan is available for the current task."}
 
     workdir_info = _resolve_host_workdir(workdir)
     if not workdir_info:
-        return tool_error(
-            f"Could not resolve routed_exec workdir `{workdir}` on this host. "
-            "Use an absolute path whose parent directory already exists."
-        )
+        return {
+            "success": False,
+            "error": (
+                f"Could not resolve routed_exec workdir `{workdir}` on this host. "
+                "Use an absolute path whose parent directory already exists."
+            ),
+        }
     requested_workdir = str(workdir_info.get("requested_workdir", workdir) or workdir)
     resolved_workdir = str(workdir_info.get("resolved_workdir", "") or "")
     routed_prompt = _build_routed_prompt(
         prompt,
         requested_workdir=requested_workdir,
         resolved_workdir=resolved_workdir,
-        ability_evidence=get_ability_handoff(task_id),
+        ability_evidence=ability_evidence,
         explicit_evidence=str(evidence or ""),
     )
 
@@ -698,45 +706,93 @@ def routed_exec_tool(
     failure_guidance = _failure_guidance(attempts, default_timeout_used, effective_timeout)
     fallback_exhausted = (not success) and bool(attempts) and len(attempts) >= len(plan)
 
-    return tool_result(
-        {
-            "success": success,
-            "tier": decision.get("tier"),
-            "route_path": decision.get("path"),
-            "route_model": decision.get("model"),
-            "selected_route": get_selected_route(task_id),
-            "session_lane": get_session_lane_context(task_id),
-            "workdir": requested_workdir,
-            "requested_workdir": requested_workdir,
-            "resolved_workdir": resolved_workdir,
-            "timeout_seconds": effective_timeout,
-            "timeout_source": "route-default" if default_timeout_used else "explicit",
-            "executors_attempted": [str(item.get("executor") or item.get("kind") or "") for item in attempts],
-            "attempt_summary": attempt_summary,
-            "attempts": attempts,
-            "verification_expectations": (
-                "Child executor must report concrete verification in the final "
-                f"{_ROUTED_RESULT_MARKER} JSON line."
-            ),
-            "ability_evidence_included": bool(get_ability_handoff(task_id) or str(evidence or "").strip()),
-            "fallback_exhausted": fallback_exhausted,
-            "output": str(final_attempt.get("output", "") if final_attempt else ""),
-            "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
-            "status": str(final_attempt.get("status", "failed") if final_attempt else "failed"),
-            "warning_kinds": list(final_attempt.get("warning_kinds", []) if final_attempt else []),
-            "resolved_base_url": str(final_attempt.get("resolved_base_url", "") if final_attempt else ""),
-            "endpoint_source": str(final_attempt.get("endpoint_source", "") if final_attempt else ""),
-            "failure_guidance": None if success else failure_guidance,
-            "error": None if success else (
-                str(final_attempt.get("error", "")).strip()
-                or (
-                    f"All routed execution attempts failed for {decision.get('tier')}."
-                    if final_attempt
-                    else "No routed execution attempts were made."
-                )
-            ),
-        }
+    warnings: list[str] = []
+    if final_attempt:
+        warnings.extend(str(item) for item in final_attempt.get("warning_kinds", []) if str(item or "").strip())
+        warnings.extend(str(item) for item in final_attempt.get("warnings", []) if str(item or "").strip())
+
+    final_output_path = final_attempt.get("output_path") if final_attempt else ""
+    final_failure_kind = final_attempt.get("failure_kind") if final_attempt else ""
+    return {
+        "success": success,
+        "tier": decision.get("tier"),
+        "route_path": decision.get("path"),
+        "route_model": decision.get("model"),
+        "selected_route": dict(selected_route or {}),
+        "session_lane": dict(session_lane or {}),
+        "workdir": requested_workdir,
+        "requested_workdir": requested_workdir,
+        "resolved_workdir": resolved_workdir,
+        "timeout_seconds": effective_timeout,
+        "timeout_source": "route-default" if default_timeout_used else "explicit",
+        "executors_attempted": [str(item.get("executor") or item.get("kind") or "") for item in attempts],
+        "attempt_summary": attempt_summary,
+        "attempts": attempts,
+        "summary": str(final_attempt.get("summary", "") if final_attempt else ""),
+        "verification": str(final_attempt.get("verification", "") if final_attempt else ""),
+        "warnings": warnings,
+        "output_excerpt": str(final_attempt.get("output_excerpt", "") if final_attempt else ""),
+        "output_path": str(final_output_path or ""),
+        "failure_kind": str(final_failure_kind or ""),
+        "verification_expectations": (
+            "Child executor must report concrete verification in the final "
+            f"{_ROUTED_RESULT_MARKER} JSON line."
+        ),
+        "ability_evidence_included": bool(str(ability_evidence or "").strip() or str(evidence or "").strip()),
+        "fallback_exhausted": fallback_exhausted,
+        "output": str(final_attempt.get("output", "") if final_attempt else ""),
+        "exit_code": int(final_attempt.get("exit_code", -1) if final_attempt else -1),
+        "status": str(final_attempt.get("status", "failed") if final_attempt else "failed"),
+        "warning_kinds": list(final_attempt.get("warning_kinds", []) if final_attempt else []),
+        "resolved_base_url": str(final_attempt.get("resolved_base_url", "") if final_attempt else ""),
+        "endpoint_source": str(final_attempt.get("endpoint_source", "") if final_attempt else ""),
+        "failure_guidance": None if success else failure_guidance,
+        "error": None if success else (
+            str(final_attempt.get("error", "")).strip()
+            or (
+                f"All routed execution attempts failed for {decision.get('tier')}."
+                if final_attempt
+                else "No routed execution attempts were made."
+            )
+        ),
+    }
+
+
+def routed_exec_tool(
+    task: str,
+    workdir: str,
+    timeout: Optional[int] = None,
+    *,
+    task_id: str = "",
+    evidence: str = "",
+) -> str:
+    prompt = str(task or "").strip()
+    if not prompt:
+        return tool_error("`task` is required for routed_exec.")
+
+    decision = get_routing_decision(task_id)
+    if not decision:
+        return tool_error("No active routing decision for this task. Emit the routing line first.")
+
+    plan = get_routed_execution_plan(task_id)
+    if not plan:
+        return tool_error("No routed execution plan is available for the current task.")
+
+    result = execute_routed_context(
+        prompt,
+        workdir,
+        decision=decision,
+        route_targets=plan,
+        selected_route=get_selected_route(task_id),
+        session_lane=get_session_lane_context(task_id),
+        task_id=task_id,
+        timeout=timeout,
+        evidence=evidence,
+        ability_evidence=get_ability_handoff(task_id),
     )
+    if not result.get("success") and result.get("error") and not result.get("attempts"):
+        return tool_error(str(result["error"]))
+    return tool_result(result)
 
 
 def check_routed_exec_requirements() -> bool:

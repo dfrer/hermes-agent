@@ -59,6 +59,19 @@ class RoutingPolicy:
         return self.routes.get((tier or "").upper(), {}).get(normalize_route_path(path))
 
 
+@dataclass(frozen=True)
+class RouteChoiceValidation:
+    ok: bool
+    tier: str
+    path: str
+    model: str
+    normalized_model: str
+    policy_version: str
+    profile: Optional[dict[str, Any]]
+    selected_target: Optional[dict[str, str]]
+    errors: tuple[str, ...] = ()
+
+
 KNOWN_TARGETS: dict[str, RouteTarget] = {
     "codex_gpt54": RouteTarget(
         kind="codex_gpt54",
@@ -132,6 +145,12 @@ DEFAULT_ROUTE_PATHS = {
     "3C": "quick-edit",
 }
 
+TIER_RANK = {
+    "3C": 1,
+    "3B": 2,
+    "3A": 3,
+}
+
 
 def normalize_route_model(model: str) -> str:
     return " ".join((model or "").strip().lower().split())
@@ -139,6 +158,13 @@ def normalize_route_model(model: str) -> str:
 
 def normalize_route_path(path: str) -> str:
     return "-".join((path or "").strip().lower().split())
+
+
+def infer_route_path(tier: str, normalized_model: str, config: Optional[dict[str, Any]] = None) -> str:
+    inferred = get_primary_model_path_by_tier(config).get((tier or "").upper(), {}).get(normalized_model)
+    if inferred:
+        return inferred
+    return DEFAULT_ROUTE_PATHS.get((tier or "").upper(), "")
 
 
 def _coerce_timeout(value: Any, default: int, errors: list[str], label: str) -> int:
@@ -322,6 +348,71 @@ def get_allowed_route_models(config: Optional[dict[str, Any]] = None) -> dict[st
                     labels.append(target.label)
         result[tier] = tuple(labels)
     return result
+
+
+def validate_route_choice(
+    tier: str,
+    path: str,
+    model: str,
+    config: Optional[dict[str, Any]] = None,
+) -> RouteChoiceValidation:
+    """Validate a tier/path/model selection against the active routing policy."""
+    policy = load_routing_policy(config)
+    normalized_tier = str(tier or "").strip().upper()
+    normalized_model = normalize_route_model(model)
+    normalized_path = normalize_route_path(path) or infer_route_path(normalized_tier, normalized_model, config)
+    errors: list[str] = []
+
+    if normalized_tier not in policy.routes:
+        errors.append(f"unsupported routing tier '{tier}'")
+        return RouteChoiceValidation(
+            ok=False,
+            tier=normalized_tier,
+            path=normalized_path,
+            model=str(model or "").strip(),
+            normalized_model=normalized_model,
+            policy_version=policy.version,
+            profile=None,
+            selected_target=None,
+            errors=tuple(errors),
+        )
+
+    profile = policy.profile(normalized_tier, normalized_path)
+    if profile is None:
+        allowed = ", ".join(sorted(policy.routes.get(normalized_tier, {}).keys()))
+        errors.append(f"path '{normalized_path}' is not allowed for {normalized_tier}; allowed paths: {allowed}")
+        return RouteChoiceValidation(
+            ok=False,
+            tier=normalized_tier,
+            path=normalized_path,
+            model=str(model or "").strip(),
+            normalized_model=normalized_model,
+            policy_version=policy.version,
+            profile=None,
+            selected_target=None,
+            errors=tuple(errors),
+        )
+
+    targets = (profile.primary, *profile.fallbacks)
+    selected = next(
+        (target for target in targets if normalize_route_model(target.label) == normalized_model),
+        None,
+    )
+    if selected is None:
+        allowed = ", ".join(target.label for target in targets)
+        errors.append(f"model '{model}' is not allowed for {normalized_tier}/{normalized_path}; allowed models: {allowed}")
+
+    return RouteChoiceValidation(
+        ok=not errors,
+        tier=normalized_tier,
+        path=normalized_path,
+        model=str(model or "").strip(),
+        normalized_model=normalized_model,
+        policy_version=policy.version,
+        profile=profile.to_dict(),
+        selected_target=selected.to_dict() if selected is not None else None,
+        errors=tuple(errors),
+    )
 
 
 def resolve_primary_turn_route(primary: dict[str, Any]) -> dict[str, Any]:

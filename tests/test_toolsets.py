@@ -26,6 +26,7 @@ class TestGetToolset:
         ts = get_toolset("routing")
         assert ts is not None
         assert "routed_exec" in ts["tools"]
+        assert "routed_plan" in ts["tools"]
 
     def test_ability_context_toolset_exists(self):
         ts = get_toolset("ability_context")
@@ -172,9 +173,11 @@ class TestToolsetConsistency:
         platforms = ["hermes-cli", "hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant"]
         for name in platforms:
             assert "routed_exec" in TOOLSETS[name]["tools"]
+            assert "routed_plan" in TOOLSETS[name]["tools"]
             assert "ability_context" in TOOLSETS[name]["tools"]
 
     def test_editor_and_api_platforms_include_routed_exec(self):
         for name in ["hermes-acp", "hermes-api-server"]:
             assert "routed_exec" in TOOLSETS[name]["tools"]
+            assert "routed_plan" in TOOLSETS[name]["tools"]
             assert "ability_context" in TOOLSETS[name]["tools"]

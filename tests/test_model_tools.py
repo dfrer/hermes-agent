@@ -86,6 +86,21 @@ class TestHandleFunctionCall:
             ),
         ]
 
+    def test_routed_plan_dispatch_receives_session_id_for_resume(self):
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch,
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            result = handle_function_call(
+                "routed_plan",
+                {"action": "status"},
+                task_id="task-routed-plan-dispatch",
+                session_id="session-routed-plan-dispatch",
+            )
+
+        assert result == '{"ok":true}'
+        assert mock_dispatch.call_args.kwargs["session_id"] == "session-routed-plan-dispatch"
+
     def test_routing_guard_blocks_mutating_tool_without_decision(self):
         task_id = "guarded-task"
         activate_for_task(task_id, session_id="session-guard", skills=["routing-layer"])
@@ -897,12 +912,15 @@ class TestBackwardCompat:
         assert len(names) > 0
         # Should contain well-known tools
         assert "terminal" in names
-        assert "terminal" in names
+        assert "routed_plan" in names
 
     def test_get_toolset_for_tool(self):
         result = get_toolset_for_tool("terminal")
         assert result is not None
         assert isinstance(result, str)
+
+    def test_get_toolset_for_routed_plan(self):
+        assert get_toolset_for_tool("routed_plan") == "routing"
 
     def test_get_toolset_for_unknown_tool(self):
         result = get_toolset_for_tool("totally_nonexistent_tool")
@@ -916,3 +934,9 @@ class TestBackwardCompat:
         defs = get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
         names = {item["function"]["name"] for item in defs}
         assert "routed_exec" in names
+        assert "routed_plan" in names
+
+    def test_routing_toolset_includes_routed_plan(self):
+        defs = get_tool_definitions(enabled_toolsets=["routing"], quiet_mode=True)
+        names = {item["function"]["name"] for item in defs}
+        assert {"routed_exec", "routed_plan"} <= names
