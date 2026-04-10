@@ -500,6 +500,8 @@ class AIAgent:
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
+        service_tier: str = None,
+        request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -666,6 +668,8 @@ class AIAgent:
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+        self.service_tier = service_tier
+        self.request_overrides = dict(request_overrides or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
         # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
@@ -3374,7 +3378,7 @@ class AIAgent:
         allowed_keys = {
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
-            "tool_choice", "parallel_tool_calls", "prompt_cache_key",
+            "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -3392,6 +3396,9 @@ class AIAgent:
         include = api_kwargs.get("include")
         if isinstance(include, list):
             normalized["include"] = include
+        service_tier = api_kwargs.get("service_tier")
+        if isinstance(service_tier, str) and service_tier.strip():
+            normalized["service_tier"] = service_tier.strip()
 
         # Pass through max_output_tokens and temperature
         max_output_tokens = api_kwargs.get("max_output_tokens")
@@ -4457,7 +4464,17 @@ class AIAgent:
             """Stream a chat completions response."""
             import httpx as _httpx
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
+            # prefill on large contexts before producing the first token.
+            # Auto-increase the httpx read timeout unless the user explicitly
+            # overrode HERMES_STREAM_READ_TIMEOUT.
+            if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
+                _stream_read_timeout = _base_timeout
+                logger.debug(
+                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
+                    self.base_url, _stream_read_timeout,
+                )
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
@@ -5495,6 +5512,10 @@ class AIAgent:
                 "models.github.ai" in self.base_url.lower()
                 or "api.githubcopilot.com" in self.base_url.lower()
             )
+            is_codex_backend = (
+                self.provider == "openai-codex"
+                or "chatgpt.com/backend-api/codex" in self.base_url.lower()
+            )
 
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"
@@ -5532,7 +5553,10 @@ class AIAgent:
             elif not is_github_responses:
                 kwargs["include"] = []
 
-            if self.max_tokens is not None:
+            if self.request_overrides:
+                kwargs.update(self.request_overrides)
+
+            if self.max_tokens is not None and not is_codex_backend:
                 kwargs["max_output_tokens"] = self.max_tokens
 
             return kwargs
@@ -5627,20 +5651,20 @@ class AIAgent:
         if self.max_tokens is not None:
             if not self._is_qwen_portal():
                 api_kwargs.update(self._max_tokens_param(self.max_tokens))
-        elif self._is_openrouter_url() and "claude" in (self.model or "").lower():
-            # OpenRouter translates requests to Anthropic's Messages API,
-            # which requires max_tokens as a mandatory field.  When we omit
-            # it, OpenRouter picks a default that can be too low — the model
-            # spends its output budget on thinking and has almost nothing
-            # left for the actual response (especially large tool calls like
-            # write_file).  Sending the model's real output limit ensures
-            # full capacity.  Other providers handle the default fine.
+        elif (self._is_openrouter_url() or "nousresearch" in self._base_url_lower) and "claude" in (self.model or "").lower():
+            # OpenRouter and Nous Portal translate requests to Anthropic's
+            # Messages API, which requires max_tokens as a mandatory field.
+            # When we omit it, the proxy picks a default that can be too
+            # low — the model spends its output budget on thinking and has
+            # almost nothing left for the actual response (especially large
+            # tool calls like write_file).  Sending the model's real output
+            # limit ensures full capacity.
             try:
                 from agent.anthropic_adapter import _get_anthropic_max_output
                 _model_output_limit = _get_anthropic_max_output(self.model)
                 api_kwargs["max_tokens"] = _model_output_limit
             except Exception:
-                pass  # fail open — let OpenRouter pick its default
+                pass  # fail open — let the proxy pick its default
 
         extra_body = {}
 
@@ -5702,6 +5726,11 @@ class AIAgent:
         # https://docs.x.ai/developers/advanced-api-usage/prompt-caching
         if "x.ai" in self._base_url_lower and hasattr(self, "session_id") and self.session_id:
             api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
+
+        # Priority Processing / generic request overrides (e.g. service_tier).
+        # Applied last so overrides win over any defaults set above.
+        if self.request_overrides:
+            api_kwargs.update(self.request_overrides)
 
         return api_kwargs
 
@@ -9212,6 +9241,11 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    # Reset per-turn retry counters after successful tool
+                    # execution so a single truncation doesn't poison the
+                    # entire conversation.
+                    truncated_tool_call_retries = 0
 
                     # Signal that a paragraph break is needed before the next
                     # streamed text.  We don't emit it immediately because
