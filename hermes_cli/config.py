@@ -105,7 +105,17 @@ def get_managed_update_command() -> Optional[str]:
 
 def recommended_update_command() -> str:
     """Return the best update command for the current installation."""
-    return get_managed_update_command() or "hermes update"
+    managed = get_managed_update_command()
+    if managed:
+        return managed
+    try:
+        from hermes_cli.routing_auto_update import is_routing_update_topology
+
+        if is_routing_update_topology(get_project_root()):
+            return "hermes routing update run"
+    except Exception:
+        pass
+    return "hermes update"
 
 
 def format_managed_message(action: str = "modify this Hermes installation") -> str:
@@ -363,6 +373,24 @@ DEFAULT_CONFIG = {
         # Optional advanced overrides for the guarded routed-exec matrix.
         # Empty means use the built-in canonical defaults.
         "routes": {},
+    },
+    "entitlements": {
+        "enabled": True,
+        "locked_spend_classes": ["openai", "anthropic"],
+        "unknown_quota_policy": "fail_closed",
+        "approval_scope": "task",
+        "codex": {
+            "quota_source": "local_logs",
+            "codex_home": "",
+            "max_snapshot_age_seconds": 180,
+        },
+        "downgrade_policy": {
+            "3A/high-risk": {
+                "action_when_primary_blocked": "ask_before_downgrade",
+                "downgrade_order": ["hermes_glm_zai", "hermes_minimax_m27"],
+                "action_when_only_locked_paid_routes_remain": "ask_before_paid_spend",
+            }
+        },
     },
     
     # Auxiliary model config — provider:model for each side task.
@@ -2151,6 +2179,25 @@ _FALLBACK_COMMENT = """
 # routing:
 #   policy_version: "3.0.0"
 #   routes: {}
+#
+# entitlement-aware spend gating. Locked spend classes fail closed when
+# quota state is unknown. Task-scoped approvals are used for 3A downgrade
+# or explicit paid-spend exceptions.
+#
+# entitlements:
+#   enabled: true
+#   locked_spend_classes: ["openai", "anthropic"]
+#   unknown_quota_policy: "fail_closed"
+#   approval_scope: "task"
+#   codex:
+#     quota_source: "local_logs"
+#     codex_home: ""
+#     max_snapshot_age_seconds: 180
+#   downgrade_policy:
+#     "3A/high-risk":
+#       action_when_primary_blocked: "ask_before_downgrade"
+#       downgrade_order: ["hermes_glm_zai", "hermes_minimax_m27"]
+#       action_when_only_locked_paid_routes_remain: "ask_before_paid_spend"
 """
 
 
@@ -2189,6 +2236,21 @@ _COMMENTED_SECTIONS = """
 # routing:
 #   policy_version: "3.0.0"
 #   routes: {}
+#
+# entitlements:
+#   enabled: true
+#   locked_spend_classes: ["openai", "anthropic"]
+#   unknown_quota_policy: "fail_closed"
+#   approval_scope: "task"
+#   codex:
+#     quota_source: "local_logs"
+#     codex_home: ""
+#     max_snapshot_age_seconds: 180
+#   downgrade_policy:
+#     "3A/high-risk":
+#       action_when_primary_blocked: "ask_before_downgrade"
+#       downgrade_order: ["hermes_glm_zai", "hermes_minimax_m27"]
+#       action_when_only_locked_paid_routes_remain: "ask_before_paid_spend"
 """
 
 

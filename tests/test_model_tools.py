@@ -1,10 +1,12 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import time
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from agent.entitlements import QuotaSnapshot
 from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
@@ -22,6 +24,22 @@ from model_tools import (
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stable_codex_quota(monkeypatch):
+    monkeypatch.setattr(
+        "agent.entitlements.observe_codex_quota",
+        lambda config=None, now=None: QuotaSnapshot(
+            spend_class="openai",
+            source="test",
+            status="available",
+            reason="allowed",
+            captured_at=now or time.time(),
+            age_seconds=0.0,
+            provider="openai-codex",
+        ),
+    )
 
 
 # =========================================================================
@@ -285,6 +303,77 @@ class TestHandleFunctionCall:
         assert command[:3] == ["codex", "exec", "--skip-git-repo-check"]
         assert command[-1] == "-"
         assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
+    def test_routed_exec_degrades_3a_to_glm_after_task_scoped_approval(self, tmp_path):
+        task_id = "guarded-task-codex-entitlement-downgrade"
+        activate_for_task(task_id, session_id="session-guard-entitlement", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: multi-file fix | CONFIDENCE: high",
+            session_id="session-guard-entitlement",
+        )
+        blocked_codex = QuotaSnapshot(
+            spend_class="openai",
+            source="test",
+            status="locked_paid_only",
+            reason="locked_paid_spend",
+            captured_at=time.time(),
+            age_seconds=0.0,
+            provider="openai-codex",
+            primary_used_percent=100.0,
+            primary_window_minutes=300,
+            secondary_used_percent=80.0,
+            secondary_window_minutes=10080,
+            credits_present=True,
+            credits_locked=True,
+            credit_balance="123.45",
+        )
+        with (
+            patch("agent.entitlements.observe_codex_quota", return_value=blocked_codex),
+            patch("tools.routed_exec_tool.request_blocking_approval", return_value="once"),
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout='HERMES_ROUTED_RESULT: {"status":"success","summary":"done"}',
+                    stderr="",
+                ),
+            ) as mock_run,
+            patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
+            patch(
+                "tools.routed_exec_tool.resolve_api_key_provider_credentials",
+                return_value={
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                    "endpoint_source": "probe",
+                    "endpoint_id": "coding-global",
+                    "endpoint_label": "Global (Coding Plan)",
+                },
+            ),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert result["route_path"] == "high-risk"
+        assert result["route_model"] == "Codex CLI (gpt-5.4)"
+        assert result["attempts"][0]["kind"] == "hermes_glm_zai"
+        assert result["selected_route"]["degraded"] is True
+        assert result["selected_route"]["entitlement"]["degraded"] is True
+        assert result["selected_route"]["effective_targets"][0]["kind"] == "hermes_glm_zai"
+        command = mock_run.call_args.args[0]
+        assert command[:4] == ["hermes", "chat", "-m", "glm-5.1"]
 
     def test_routed_exec_includes_ability_and_explicit_evidence(self, tmp_path):
         task_id = "guarded-task-routed-exec-evidence"

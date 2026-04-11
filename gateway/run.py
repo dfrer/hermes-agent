@@ -2172,6 +2172,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "quota":
+            return await self._handle_quota_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -5497,6 +5500,12 @@ class GatewayRunner:
                 f"_(Detailed usage available after the first agent response)_"
             )
         return "No usage data available for this session."
+
+    async def _handle_quota_command(self, event: MessageEvent) -> str:
+        """Handle /quota command -- show entitlement-aware quota state."""
+        from agent.entitlements import format_quota_display
+
+        return format_quota_display()
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

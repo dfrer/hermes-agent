@@ -243,6 +243,77 @@ def unregister_gateway_notify(session_key: str) -> None:
             entry.event.set()
 
 
+def request_blocking_approval(
+    command: str,
+    description: str,
+    *,
+    session_key: str = "",
+    approval_callback=None,
+    allow_permanent: bool = False,
+    timeout_seconds: int | None = None,
+) -> str:
+    """Request a blocking user approval without persisting generic pattern state.
+
+    This is used by higher-level policy gates that need a prompt/queue but do
+    not want to grant session- or permanent-level dangerous-command approvals.
+    Returns one of: "once", "session", "always", or "deny".
+    """
+    effective_session = session_key or get_current_session_key(default="")
+    notify_cb = None
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(effective_session)
+
+    if notify_cb is not None:
+        approval_data = {
+            "command": command,
+            "pattern_key": description,
+            "pattern_keys": [description],
+            "description": description,
+        }
+        entry = _ApprovalEntry(approval_data)
+        with _lock:
+            _gateway_queues.setdefault(effective_session, []).append(entry)
+
+        try:
+            notify_cb(approval_data)
+        except Exception as exc:
+            logger.warning("Gateway approval notify failed: %s", exc)
+            with _lock:
+                queue = _gateway_queues.get(effective_session, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(effective_session, None)
+            return "deny"
+
+        if timeout_seconds is None:
+            timeout = _get_approval_config().get("gateway_timeout", 300)
+            try:
+                timeout = int(timeout)
+            except (TypeError, ValueError):
+                timeout = 300
+        else:
+            timeout = int(timeout_seconds)
+        resolved = entry.event.wait(timeout=timeout)
+        with _lock:
+            queue = _gateway_queues.get(effective_session, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(effective_session, None)
+        if not resolved or entry.result is None:
+            return "deny"
+        return entry.result
+
+    return prompt_dangerous_approval(
+        command,
+        description,
+        timeout_seconds=timeout_seconds,
+        allow_permanent=allow_permanent,
+        approval_callback=approval_callback,
+    )
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False) -> int:
     """Called by the gateway's /approve or /deny handler to unblock

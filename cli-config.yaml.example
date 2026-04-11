@@ -102,6 +102,28 @@ model:
 # routing:
 #   policy_version: "3.0.0"
 #   routes: {}
+#
+# =============================================================================
+# Entitlement Gating (advanced)
+# =============================================================================
+# Lock selected paid spend classes by default and fail closed when quota state
+# is unknown. Current v1 support observes Codex local plan usage from
+# ~/.codex/sessions/*.jsonl.
+#
+# entitlements:
+#   enabled: true
+#   locked_spend_classes: ["openai", "anthropic"]
+#   unknown_quota_policy: "fail_closed"
+#   approval_scope: "task"
+#   codex:
+#     quota_source: "local_logs"
+#     codex_home: ""                # empty = auto-detect ~/.codex
+#     max_snapshot_age_seconds: 180
+#   downgrade_policy:
+#     "3A/high-risk":
+#       action_when_primary_blocked: "ask_before_downgrade"
+#       downgrade_order: ["hermes_glm_zai", "hermes_minimax_m27"]
+#       action_when_only_locked_paid_routes_remain: "ask_before_paid_spend"
 
 # =============================================================================
 # Git Worktree Isolation

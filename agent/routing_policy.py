@@ -78,12 +78,14 @@ KNOWN_TARGETS: dict[str, RouteTarget] = {
         label="Codex CLI (gpt-5.4)",
         executor="codex",
         model="gpt-5.4",
+        provider="openai-codex",
     ),
     "codex_gpt54mini": RouteTarget(
         kind="codex_gpt54mini",
         label="Codex CLI (gpt-5.4-mini)",
         executor="codex",
         model="gpt-5.4-mini",
+        provider="openai-codex",
     ),
     "hermes_glm_zai": RouteTarget(
         kind="hermes_glm_zai",
@@ -113,7 +115,7 @@ DEFAULT_ROUTE_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     "3A": {
         "high-risk": {
             "primary": "codex_gpt54",
-            "fallbacks": [],
+            "fallbacks": ["hermes_glm_zai", "hermes_minimax_m27"],
             "default_timeout": 1200,
         }
     },
