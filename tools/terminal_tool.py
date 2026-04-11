@@ -134,6 +134,11 @@ def set_approval_callback(cb):
     global _approval_callback
     _approval_callback = cb
 
+
+def get_approval_callback():
+    """Return the active CLI approval callback, if one is registered."""
+    return _approval_callback
+
 # =============================================================================
 # Dangerous Command Approval System
 # =============================================================================

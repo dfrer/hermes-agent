@@ -243,6 +243,24 @@ def load_cli_config() -> Dict[str, Any]:
             "policy_version": "3.0.0",
             "routes": {},
         },
+        "entitlements": {
+            "enabled": True,
+            "locked_spend_classes": ["openai", "anthropic"],
+            "unknown_quota_policy": "fail_closed",
+            "approval_scope": "task",
+            "codex": {
+                "quota_source": "local_logs",
+                "codex_home": "",
+                "max_snapshot_age_seconds": 180,
+            },
+            "downgrade_policy": {
+                "3A/high-risk": {
+                    "action_when_primary_blocked": "ask_before_downgrade",
+                    "downgrade_order": ["hermes_glm_zai", "hermes_minimax_m27"],
+                    "action_when_only_locked_paid_routes_remain": "ask_before_paid_spend",
+                }
+            },
+        },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
@@ -4947,6 +4965,8 @@ class HermesCLI:
             self._manual_compress()
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "quota":
+            self._show_quota()
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "paste":
@@ -5928,6 +5948,14 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_quota(self):
+        """Show entitlement-aware quota state and effective route availability."""
+        from agent.entitlements import format_quota_display
+
+        print()
+        print(format_quota_display())
+        print()
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

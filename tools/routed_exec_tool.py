@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.entitlements import build_effective_route_plan
 from agent.redact import redact_sensitive_text
 from agent.routing_guard import (
     _classify_routed_failure_kind,
@@ -23,10 +24,14 @@ from agent.routing_guard import (
     get_routing_decision,
     get_selected_route,
     get_session_lane_context,
+    has_task_entitlement_approval,
+    record_task_entitlement_approval,
+    update_selected_route_entitlement,
 )
 from agent.routing_policy import load_routing_policy
 from hermes_cli.auth import resolve_api_key_provider_credentials
 from hermes_constants import get_hermes_home
+from tools.approval import request_blocking_approval
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
@@ -184,6 +189,74 @@ def _default_timeout_for_route(decision: dict[str, Any]) -> int:
     if profile is not None:
         return int(profile.default_timeout)
     return _ROUTE_TIMEOUT_SECONDS.get((tier, path), _DEFAULT_TIMEOUT_SECONDS)
+
+
+def _get_cli_approval_callback():
+    try:
+        from tools.terminal_tool import get_approval_callback
+
+        return get_approval_callback()
+    except Exception:
+        return None
+
+
+def _resolve_effective_route_plan(
+    task_id: str,
+    decision: dict[str, Any],
+    plan: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    effective = build_effective_route_plan(
+        task_id,
+        decision,
+        plan,
+        has_task_approval=has_task_entitlement_approval,
+    )
+    if effective.approval_required and effective.approval_key:
+        route_label = f"{decision.get('tier')}/{decision.get('path')}"
+        command = (
+            f"routed_exec entitlement approval for {route_label}: "
+            f"{effective.approval_kind or 'route'}"
+        )
+        description = (
+            f"{effective.approval_description} This approval applies only to the current task."
+        )
+        choice = request_blocking_approval(
+            command,
+            description,
+            session_key="",
+            approval_callback=_get_cli_approval_callback(),
+            allow_permanent=False,
+        )
+        if choice != "deny":
+            record_task_entitlement_approval(task_id, effective.approval_key)
+            effective = build_effective_route_plan(
+                task_id,
+                decision,
+                plan,
+                has_task_approval=has_task_entitlement_approval,
+            )
+        else:
+            update_selected_route_entitlement(
+                task_id,
+                entitlement=effective.to_metadata(),
+                effective_targets=[],
+                degraded=effective.degraded,
+                failure_reason=effective.failure_reason or "approval_required",
+            )
+            return [], effective.to_metadata(), (
+                "Entitlement approval denied for this task. "
+                "The routed executor will not spend locked quota or downgrade without approval."
+            )
+
+    metadata = effective.to_metadata()
+    update_selected_route_entitlement(
+        task_id,
+        entitlement=metadata,
+        effective_targets=list(effective.route_targets),
+        degraded=effective.degraded,
+        failure_reason=effective.failure_reason,
+    )
+    return [dict(item) for item in effective.route_targets], metadata, ""
 
 
 def _compact_explicit_evidence(evidence: str) -> str:
@@ -623,6 +696,89 @@ def execute_routed_context(
     plan = [dict(item) for item in route_targets if isinstance(item, dict)]
     if not plan:
         return {"success": False, "error": "No routed execution plan is available for the current task."}
+    effective_plan, entitlement_metadata, entitlement_error = _resolve_effective_route_plan(
+        task_id,
+        decision,
+        plan,
+    )
+    if entitlement_error:
+        selected_route = get_selected_route(task_id) if task_id else dict(selected_route or {})
+        return {
+            "success": False,
+            "tier": decision.get("tier"),
+            "route_path": decision.get("path"),
+            "route_model": decision.get("model"),
+            "selected_route": dict(selected_route or {}),
+            "session_lane": dict(session_lane or {}),
+            "workdir": workdir,
+            "requested_workdir": workdir,
+            "resolved_workdir": "",
+            "timeout_seconds": int(timeout or _default_timeout_for_route(decision)),
+            "timeout_source": "route-default" if timeout is None else "explicit",
+            "executors_attempted": [],
+            "attempt_summary": "",
+            "attempts": [],
+            "summary": "",
+            "verification": "",
+            "warnings": [],
+            "output_excerpt": "",
+            "output_path": "",
+            "failure_kind": "",
+            "failure_reason": str(entitlement_metadata.get("failure_reason") or "approval_required"),
+            "verification_expectations": (
+                "Child executor must report concrete verification in the final "
+                f"{_ROUTED_RESULT_MARKER} JSON line."
+            ),
+            "ability_evidence_included": bool(str(ability_evidence or "").strip() or str(evidence or "").strip()),
+            "fallback_exhausted": False,
+            "output": "",
+            "exit_code": -1,
+            "status": "blocked",
+            "warning_kinds": [],
+            "resolved_base_url": "",
+            "endpoint_source": "",
+            "error": entitlement_error,
+        }
+    plan = effective_plan
+    if not plan:
+        selected_route = get_selected_route(task_id) if task_id else dict(selected_route or {})
+        failure_reason = str(entitlement_metadata.get("failure_reason") or "locked_paid_spend")
+        return {
+            "success": False,
+            "tier": decision.get("tier"),
+            "route_path": decision.get("path"),
+            "route_model": decision.get("model"),
+            "selected_route": dict(selected_route or {}),
+            "session_lane": dict(session_lane or {}),
+            "workdir": workdir,
+            "requested_workdir": workdir,
+            "resolved_workdir": "",
+            "timeout_seconds": int(timeout or _default_timeout_for_route(decision)),
+            "timeout_source": "route-default" if timeout is None else "explicit",
+            "executors_attempted": [],
+            "attempt_summary": "",
+            "attempts": [],
+            "summary": "",
+            "verification": "",
+            "warnings": [],
+            "output_excerpt": "",
+            "output_path": "",
+            "failure_kind": "",
+            "failure_reason": failure_reason,
+            "verification_expectations": (
+                "Child executor must report concrete verification in the final "
+                f"{_ROUTED_RESULT_MARKER} JSON line."
+            ),
+            "ability_evidence_included": bool(str(ability_evidence or "").strip() or str(evidence or "").strip()),
+            "fallback_exhausted": False,
+            "output": "",
+            "exit_code": -1,
+            "status": "blocked",
+            "warning_kinds": [],
+            "resolved_base_url": "",
+            "endpoint_source": "",
+            "error": f"No entitlement-approved route target is available ({failure_reason}).",
+        }
 
     workdir_info = _resolve_host_workdir(workdir)
     if not workdir_info:
@@ -701,6 +857,7 @@ def execute_routed_context(
             break
 
     final_attempt = attempts[-1] if attempts else None
+    selected_route = get_selected_route(task_id) if task_id else dict(selected_route or {})
     success = bool(final_attempt) and not bool(final_attempt.get("failed"))
     attempt_summary = _summarize_attempts(attempts)
     failure_guidance = _failure_guidance(attempts, default_timeout_used, effective_timeout)
@@ -713,6 +870,7 @@ def execute_routed_context(
 
     final_output_path = final_attempt.get("output_path") if final_attempt else ""
     final_failure_kind = final_attempt.get("failure_kind") if final_attempt else ""
+    failure_reason = str(entitlement_metadata.get("failure_reason") or "")
     return {
         "success": success,
         "tier": decision.get("tier"),
@@ -734,6 +892,7 @@ def execute_routed_context(
         "output_excerpt": str(final_attempt.get("output_excerpt", "") if final_attempt else ""),
         "output_path": str(final_output_path or ""),
         "failure_kind": str(final_failure_kind or ""),
+        "failure_reason": failure_reason or str(final_failure_kind or ""),
         "verification_expectations": (
             "Child executor must report concrete verification in the final "
             f"{_ROUTED_RESULT_MARKER} JSON line."

@@ -5125,6 +5125,34 @@ class AIAgent:
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
+        try:
+            from agent.entitlements import evaluate_route_target
+
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            eligibility = evaluate_route_target(
+                {
+                    "kind": fb_provider or fb_model,
+                    "label": fb_model,
+                    "executor": "provider_fallback",
+                    "model": fb_model,
+                    "provider": fb_provider,
+                },
+                base_url=fb_base_url_hint or "",
+            )
+            if not eligibility.allowed:
+                logging.warning(
+                    "Fallback to %s (%s) blocked by entitlements: %s",
+                    fb_model,
+                    fb_provider,
+                    eligibility.reason,
+                )
+                if not self.quiet_mode:
+                    self._emit_status(
+                        f"⚠️ Skipping fallback {fb_model} via {fb_provider}: {eligibility.reason}"
+                    )
+                return self._try_activate_fallback()
+        except Exception:
+            pass
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()

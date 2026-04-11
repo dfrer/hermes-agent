@@ -520,6 +520,7 @@ def _new_task_state(
         "routed_plan": None,
         "route_attempts": _initial_route_attempts(),
         "verification_attempts": [],
+        "entitlement_approvals": [],
         "git_permissions": _derive_git_permissions(user_message),
         "blocked_tool_attempts": {},
         "last_blocked_tool": None,
@@ -572,6 +573,7 @@ def _refresh_task_state(
         "verification_attempts",
         "policy_version",
         "selected_route",
+        "entitlement_approvals",
         "routed_mutation_succeeded",
     ):
         if key in existing:
@@ -924,6 +926,62 @@ def get_selected_route(task_id: str) -> dict[str, Any]:
         return dict(selected)
 
 
+def has_task_entitlement_approval(task_id: str, approval_key: str) -> bool:
+    if not task_id or not approval_key:
+        return False
+    with _task_state_lock:
+        _purge_expired()
+        approvals = _task_state.get(task_id, {}).get("entitlement_approvals") or []
+        return str(approval_key) in {str(item) for item in approvals}
+
+
+def record_task_entitlement_approval(task_id: str, approval_key: str) -> None:
+    if not task_id or not approval_key:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        approvals = [str(item) for item in (state.get("entitlement_approvals") or []) if str(item or "").strip()]
+        if approval_key not in approvals:
+            approvals.append(approval_key)
+        state["entitlement_approvals"] = approvals
+        state["updated_at"] = time.time()
+
+
+def update_selected_route_entitlement(
+    task_id: str,
+    *,
+    entitlement: Optional[dict[str, Any]] = None,
+    effective_targets: Optional[list[dict[str, Any]]] = None,
+    degraded: Optional[bool] = None,
+    failure_reason: str = "",
+) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not state:
+            return
+        selected = state.get("selected_route")
+        if not isinstance(selected, dict):
+            selected = {}
+            state["selected_route"] = selected
+        if entitlement is not None:
+            selected["entitlement"] = _deep_copy_jsonable(entitlement)
+        if effective_targets is not None:
+            selected["effective_targets"] = _deep_copy_jsonable(effective_targets)
+        if degraded is not None:
+            selected["degraded"] = bool(degraded)
+        if failure_reason:
+            selected["failure_reason"] = str(failure_reason)
+        elif failure_reason == "":
+            selected.pop("failure_reason", None)
+        state["updated_at"] = time.time()
+
+
 def get_routed_plan_state(task_id: str) -> Optional[dict[str, Any]]:
     if not task_id:
         return None
@@ -998,6 +1056,9 @@ def hydrate_routed_plan_from_persistence(task_id: str, *, session_id: str = "", 
             "path": route_validation.path,
             "model": str(parent_decision.get("model", "")),
             "profile": route_validation.profile,
+            "entitlement": None,
+            "effective_targets": [],
+            "degraded": False,
         }
         state["decision_error"] = None
         state["routed_plan"] = json.loads(json.dumps(plan, ensure_ascii=False))
@@ -1093,6 +1154,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
             "route_attempts": _initial_route_attempts(),
             "verification_attempts": [],
             "routed_plan": None,
+            "selected_route": {},
         }
 
     with _task_state_lock:
@@ -1109,6 +1171,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
                 "route_attempts": _initial_route_attempts(),
                 "verification_attempts": [],
                 "routed_plan": None,
+                "selected_route": {},
             }
         snapshot = {
             "task_id": task_id,
@@ -1123,6 +1186,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
             "latest_user_message": str(state.get("latest_user_message", "") or state.get("user_message", "") or ""),
             "route_locked": bool(state.get("routed")),
             "decision": _deep_copy_jsonable(state.get("decision")) if isinstance(state.get("decision"), dict) else None,
+            "selected_route": _deep_copy_jsonable(state.get("selected_route")) if isinstance(state.get("selected_route"), dict) else {},
             "decision_error": str(state.get("decision_error", "") or "") or None,
             "git_permissions": dict(state.get("git_permissions") or {}),
             "blocked_tool_attempts": dict(state.get("blocked_tool_attempts") or {}),
@@ -1132,6 +1196,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
             "verification_attempts": [
                 dict(item) for item in state.get("verification_attempts", []) if isinstance(item, dict)
             ],
+            "entitlement_approvals": list(state.get("entitlement_approvals") or []),
             "visual_verification_required": bool(state.get("visual_verification_required")),
             "visual_verification_pending": bool(state.get("visual_verification_pending")),
             "routed_mutation_succeeded": bool(state.get("routed_mutation_succeeded")),
@@ -1622,6 +1687,9 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
             "path": decision["path"],
             "model": decision["model"],
             "profile": profile,
+            "entitlement": None,
+            "effective_targets": [],
+            "degraded": False,
         }
         state["decision_line"] = raw_line
         state["decision_error"] = None
