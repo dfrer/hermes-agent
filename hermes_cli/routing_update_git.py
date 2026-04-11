@@ -45,7 +45,14 @@ def _linux_to_windows_path(path: Path | str) -> str:
 
 
 def _candidate_windows_git_paths() -> list[str]:
-    return [candidate for candidate in DEFAULT_WINDOWS_GIT_CANDIDATES if Path(candidate).exists()]
+    candidates: list[str] = []
+    for candidate in DEFAULT_WINDOWS_GIT_CANDIDATES:
+        try:
+            if Path(candidate).exists():
+                candidates.append(candidate)
+        except OSError:
+            continue
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -149,6 +156,14 @@ def _probe_backend(
     return fetch_ready, all(push_targets.values()), push_targets, errors
 
 
+def _candidate_score(fetch_ready: bool, push_targets: dict[str, bool], kind: str) -> tuple[int, int, int]:
+    return (
+        1 if fetch_ready else 0,
+        sum(1 for allowed in push_targets.values() if allowed),
+        1 if kind == "native" else 0,
+    )
+
+
 def probe_git_backend(
     repo_root: Path | str,
     *,
@@ -174,15 +189,9 @@ def probe_git_backend(
         "push_ready": native_push_ready,
         "errors": "; ".join(f"{key}={value}" for key, value in native_errors.items()),
     }
-    if native_fetch_ready and native_push_ready:
-        return GitBackendProbe(
-            backend="native",
-            fetch_ready=True,
-            push_ready=True,
-            push_targets=native_targets,
-            errors={},
-            details=details,
-        )
+    candidates: list[tuple[str, bool, bool, dict[str, bool], dict[str, str]]] = [
+        ("native", native_fetch_ready, native_push_ready, native_targets, native_errors)
+    ]
 
     windows_candidates = _candidate_windows_git_paths()
     if _is_wsl_runtime() and windows_candidates:
@@ -201,26 +210,7 @@ def probe_git_backend(
             "errors": "; ".join(f"{key}={value}" for key, value in bridge_errors.items()),
             "executable": windows.executable,
         }
-        if bridge_fetch_ready and bridge_push_ready:
-            return GitBackendProbe(
-                backend="windows-bridge",
-                fetch_ready=True,
-                push_ready=True,
-                push_targets=bridge_targets,
-                errors={},
-                details=details,
-            )
-        errors = {**native_errors, **bridge_errors}
-        targets = dict(native_targets)
-        targets.update({key: value or targets.get(key, False) for key, value in bridge_targets.items()})
-        return GitBackendProbe(
-            backend="unavailable",
-            fetch_ready=native_fetch_ready or bridge_fetch_ready,
-            push_ready=native_push_ready or bridge_push_ready,
-            push_targets=targets,
-            errors=errors,
-            details=details,
-        )
+        candidates.append(("windows-bridge", bridge_fetch_ready, bridge_push_ready, bridge_targets, bridge_errors))
 
     details["windows-bridge"] = {
         "available": bool(windows_candidates),
@@ -228,12 +218,18 @@ def probe_git_backend(
         "push_ready": False,
         "errors": "not running in WSL or git.exe not found",
     }
+    kind, fetch_ready, push_ready, push_targets, errors = max(
+        candidates,
+        key=lambda item: _candidate_score(item[1], item[3], item[0]),
+    )
+    if not fetch_ready:
+        kind = "unavailable"
     return GitBackendProbe(
-        backend="unavailable",
-        fetch_ready=native_fetch_ready,
-        push_ready=native_push_ready,
-        push_targets=native_targets,
-        errors=native_errors,
+        backend=kind,
+        fetch_ready=fetch_ready,
+        push_ready=push_ready,
+        push_targets=push_targets,
+        errors=errors,
         details=details,
     )
 

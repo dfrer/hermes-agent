@@ -1030,41 +1030,91 @@ def install_routing_auto_update(repo_root: Path | None = None) -> InstallResult:
     )
 
 
-def _promotion_pending(current_head: str, integration_head: str, main_head: str) -> bool:
-    return bool(current_head) and (integration_head != current_head or main_head != current_head)
+def _target_needs_promotion(repo_root: Path, current_head: str, target_ref: str, target_head: str) -> bool:
+    if not current_head:
+        return False
+    if not target_head:
+        return True
+    if current_head == target_head:
+        return False
+    return not _git_is_ancestor(repo_root, current_head, target_ref)
 
 
-def _push_targets(repo_root: Path, backend: GitBackend, report: UpdateReport, target_head: str) -> None:
-    integration_push = backend.run(
-        ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{LIVE_BRANCH}"],
-        check=False,
-    )
-    if integration_push.returncode != 0:
-        report.integration_push_status = "failed"
-        report.push_status = "failed"
-        report.main_promotion_status = "not_attempted"
-        stderr = (integration_push.stderr or integration_push.stdout or "").strip() or "unknown error"
-        report.auth_errors["push:integration"] = stderr
-        report.message = f"Failed to push {LIVE_BRANCH} to fork: {stderr}"
-        return
+def _promotion_plan(repo_root: Path, current_head: str, integration_head: str, main_head: str) -> dict[str, bool]:
+    return {
+        "integration": _target_needs_promotion(repo_root, current_head, PUSH_REF, integration_head),
+        "main": _target_needs_promotion(repo_root, current_head, MAIN_REF, main_head),
+    }
 
-    report.integration_push_status = "ok"
-    report.push_status = "ok"
 
-    main_push = backend.run(
-        ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{PROMOTION_BRANCH}"],
-        check=False,
-    )
-    if main_push.returncode != 0:
-        report.main_promotion_status = "failed"
-        stderr = (main_push.stderr or main_push.stdout or "").strip() or "unknown error"
-        report.auth_errors["push:main"] = stderr
-        report.message = f"Updated {LIVE_BRANCH} on fork, but promoting fork/main failed: {stderr}"
-        return
+def _realign_live_branch_to_promoted_head(repo_root: Path, current_head: str, integration_head: str, main_head: str) -> str:
+    for target_ref, target_head in ((MAIN_REF, main_head), (PUSH_REF, integration_head)):
+        if not target_head or target_head == current_head:
+            continue
+        if not _git_is_ancestor(repo_root, current_head, target_ref):
+            continue
+        ff_result = _git(repo_root, "merge", "--ff-only", target_ref, check=False)
+        if ff_result.returncode != 0:
+            stderr = (ff_result.stderr or ff_result.stdout or "").strip() or "unknown error"
+            raise UpdateError(f"Could not fast-forward {LIVE_BRANCH} to {target_ref}: {stderr}")
+        return target_ref
+    return ""
 
-    report.main_promotion_status = "ok"
-    report.promoted_head = target_head
-    report.last_successful_sync_at = _iso(_utc_now())
+
+def _push_targets(
+    repo_root: Path,
+    backend: GitBackend,
+    report: UpdateReport,
+    target_head: str,
+    *,
+    push_integration: bool,
+    push_main: bool,
+) -> None:
+    pushed_any = False
+    if push_integration:
+        integration_push = backend.run(
+            ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{LIVE_BRANCH}"],
+            check=False,
+        )
+        if integration_push.returncode != 0:
+            report.integration_push_status = "failed"
+            report.push_status = "failed"
+            if not push_main:
+                report.main_promotion_status = "not_needed"
+            stderr = (integration_push.stderr or integration_push.stdout or "").strip() or "unknown error"
+            report.auth_errors["push:integration"] = stderr
+            report.message = f"Failed to push {LIVE_BRANCH} to fork: {stderr}"
+            return
+        report.integration_push_status = "ok"
+        report.push_status = "ok"
+        pushed_any = True
+    else:
+        report.integration_push_status = "not_needed"
+
+    if push_main:
+        main_push = backend.run(
+            ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{PROMOTION_BRANCH}"],
+            check=False,
+        )
+        if main_push.returncode != 0:
+            report.main_promotion_status = "failed"
+            if not pushed_any:
+                report.push_status = "failed"
+            stderr = (main_push.stderr or main_push.stdout or "").strip() or "unknown error"
+            report.auth_errors["push:main"] = stderr
+            report.message = f"Updated {LIVE_BRANCH} on fork, but promoting fork/main failed: {stderr}"
+            return
+        report.main_promotion_status = "ok"
+        pushed_any = True
+    else:
+        report.main_promotion_status = "not_needed"
+
+    if pushed_any:
+        report.push_status = "ok"
+        report.promoted_head = target_head
+        report.last_successful_sync_at = _iso(_utc_now())
+    else:
+        report.push_status = "not_needed"
 
 
 def _latest_retained_failure(latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
@@ -1135,7 +1185,7 @@ def _run_state_machine(
         raise UpdateError("Repo merge defaults are not ready: " + "; ".join(merge_issues))
 
     backend, probe = _preflight_backend(repo_root, report)
-    if backend is None or not probe.fetch_ready or not probe.push_ready:
+    if backend is None or not probe.fetch_ready:
         report.status = "auth_failed"
         details = [f"{key}={value}" for key, value in sorted(probe.errors.items())]
         report.message = "Git auth preflight failed. " + ("; ".join(details) if details else "No usable backend.")
@@ -1168,27 +1218,75 @@ def _run_state_machine(
         report.repair_blockers = list(retained.get("repair_blockers") or [])
         return report
 
-    upstream_missing = not _git_is_ancestor(repo_root, UPSTREAM_REF, "HEAD")
-    pending_promotion = _promotion_pending(
+    realigned_to = _realign_live_branch_to_promoted_head(
+        repo_root,
         report.pre_update_head,
         drift.get("integration_head") or "",
         drift.get("main_head") or "",
     )
+    if realigned_to:
+        report.pre_update_head = _current_ref(repo_root, "HEAD")
+        drift = _compute_live_drift(repo_root)
+        report.upstream_behind_count = int(drift["upstream"]["behind"])
+        report.upstream_ahead_count = int(drift["upstream"]["ahead"])
+        report.fork_behind_count = int(drift["integration"]["behind"])
+        report.fork_ahead_count = int(drift["integration"]["ahead"])
+        report.main_behind_count = int(drift["main"]["behind"])
+        report.main_ahead_count = int(drift["main"]["ahead"])
+
+    upstream_missing = not _git_is_ancestor(repo_root, UPSTREAM_REF, "HEAD")
+    promotion_plan = _promotion_plan(
+        repo_root,
+        report.pre_update_head,
+        drift.get("integration_head") or "",
+        drift.get("main_head") or "",
+    )
+    pending_promotion = any(promotion_plan.values())
 
     if not upstream_missing and not finalize_from_retained:
         report.post_update_head = report.pre_update_head
         if pending_promotion:
-            _push_targets(repo_root, backend, report, report.pre_update_head)
-            report.status = "updated" if report.main_promotion_status == "ok" else "push_failed"
+            _push_targets(
+                repo_root,
+                backend,
+                report,
+                report.pre_update_head,
+                push_integration=promotion_plan["integration"],
+                push_main=promotion_plan["main"],
+            )
+            promotion_ok = (
+                report.integration_push_status in {"ok", "not_needed"}
+                and report.main_promotion_status in {"ok", "not_needed"}
+            )
+            report.status = "updated" if promotion_ok else "push_failed"
             if report.status == "updated":
-                report.message = "Recovered pending fork promotion without creating a new update worktree."
+                if realigned_to:
+                    if promotion_plan["integration"] and not promotion_plan["main"]:
+                        report.message = (
+                            f"Fast-forwarded {LIVE_BRANCH} to {realigned_to} and restored the fork integration branch."
+                        )
+                    elif promotion_plan["main"] and not promotion_plan["integration"]:
+                        report.message = (
+                            f"Fast-forwarded {LIVE_BRANCH} to {realigned_to} and restored fork/main promotion."
+                        )
+                    else:
+                        report.message = f"Fast-forwarded {LIVE_BRANCH} to {realigned_to} and restored fork promotion."
+                elif promotion_plan["integration"] and not promotion_plan["main"]:
+                    report.message = "Recovered pending fork integration branch without creating a new update worktree."
+                elif promotion_plan["main"] and not promotion_plan["integration"]:
+                    report.message = "Recovered pending fork/main promotion without creating a new update worktree."
+                else:
+                    report.message = "Recovered pending fork promotion without creating a new update worktree."
             return report
 
         report.status = "noop"
         report.push_status = "not_needed"
         report.integration_push_status = "not_needed"
         report.main_promotion_status = "not_needed"
-        report.message = "No upstream changes to apply and fork promotion is already in sync."
+        if realigned_to:
+            report.message = f"No upstream changes to apply; fast-forwarded {LIVE_BRANCH} to {realigned_to}."
+        else:
+            report.message = "No upstream changes to apply and fork promotion is already in sync."
         return report
 
     if finalize_from_retained:
@@ -1277,7 +1375,14 @@ def _run_state_machine(
     post_sync["phase"] = "post-update"
     report.policy_history_sync.append(post_sync)
 
-    _push_targets(repo_root, backend, report, report.post_update_head)
+    _push_targets(
+        repo_root,
+        backend,
+        report,
+        report.post_update_head,
+        push_integration=True,
+        push_main=True,
+    )
     if report.integration_push_status == "ok" and report.main_promotion_status == "ok":
         report.status = "updated"
         report.message = "Applied upstream changes, passed the trust gate, and promoted fork integration + main."
@@ -1489,10 +1594,13 @@ def routing_update_status(
             "main_behind": int(live_drift["main"]["behind"]),
             "main_ahead": int(live_drift["main"]["ahead"]),
         }
-        summary["promotion_pending"] = _promotion_pending(
-            live_drift.get("current_head") or "",
-            live_drift.get("integration_head") or "",
-            live_drift.get("main_head") or "",
+        summary["promotion_pending"] = any(
+            _promotion_plan(
+                effective_repo,
+                live_drift.get("current_head") or "",
+                live_drift.get("integration_head") or "",
+                live_drift.get("main_head") or "",
+            ).values()
         )
 
     summary["auth"] = {

@@ -226,11 +226,15 @@ def test_run_state_machine_recovers_pending_promotion(tmp_path, monkeypatch):
             "main": {"behind": 0, "ahead": 1},
         },
     )
-    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: True)
+    monkeypatch.setattr(
+        rau,
+        "_git_is_ancestor",
+        lambda repo_root, ancestor, descendant: True if (ancestor, descendant) == (rau.UPSTREAM_REF, "HEAD") else False,
+    )
     monkeypatch.setattr(
         rau,
         "_push_targets",
-        lambda repo_root, backend, report, target_head: (
+        lambda repo_root, backend, report, target_head, **kwargs: (
             setattr(report, "integration_push_status", "ok"),
             setattr(report, "main_promotion_status", "ok"),
             setattr(report, "push_status", "ok"),
@@ -277,9 +281,13 @@ def test_run_state_machine_reports_main_promotion_failure(tmp_path, monkeypatch)
             "main": {"behind": 0, "ahead": 1},
         },
     )
-    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: True)
+    monkeypatch.setattr(
+        rau,
+        "_git_is_ancestor",
+        lambda repo_root, ancestor, descendant: True if (ancestor, descendant) == (rau.UPSTREAM_REF, "HEAD") else False,
+    )
 
-    def fake_push_targets(repo_root_arg, backend, report_arg, target_head):
+    def fake_push_targets(repo_root_arg, backend, report_arg, target_head, **kwargs):
         report_arg.integration_push_status = "ok"
         report_arg.main_promotion_status = "failed"
         report_arg.push_status = "ok"
@@ -292,6 +300,100 @@ def test_run_state_machine_reports_main_promotion_failure(tmp_path, monkeypatch)
     assert result.status == "push_failed"
     assert result.integration_push_status == "ok"
     assert result.main_promotion_status == "failed"
+
+
+def test_run_state_machine_realigns_to_promoted_main_and_repairs_integration_branch(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+    pushed = {}
+
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH})
+    monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+    monkeypatch.setattr(rau, "_git_output", lambda repo, *args, cwd=None: {("branch", "--show-current"): rau.LIVE_BRANCH, ("status", "--porcelain"): ""}[tuple(args)])
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(
+        rau,
+        "select_git_backend",
+        lambda *args, **kwargs: (
+            GitBackend("windows-bridge", "/mnt/c/Program Files/Git/cmd/git.exe", repo_root),
+            _probe(backend="windows-bridge", fetch_ready=True, push_ready=False, errors={"push:main": "non-fast-forward"}, details={"windows-bridge": {"available": True}}),
+        ),
+    )
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+
+    heads = {"HEAD": "abc123"}
+
+    def fake_current_ref(repo_root_arg, ref):
+        mapping = {
+            "HEAD": heads["HEAD"],
+            rau.UPSTREAM_REF: "abc123",
+            rau.PUSH_REF: "",
+            rau.MAIN_REF: "merge-main",
+        }
+        return mapping.get(ref, "")
+
+    monkeypatch.setattr(rau, "_current_ref", fake_current_ref)
+
+    drift_calls = {"count": 0}
+
+    def fake_compute_live_drift(repo_root_arg):
+        drift_calls["count"] += 1
+        if drift_calls["count"] == 1:
+            return {
+                "current_head": "abc123",
+                "upstream_head": "abc123",
+                "integration_head": "",
+                "main_head": "merge-main",
+                "upstream": {"behind": 0, "ahead": 0},
+                "integration": {"behind": 0, "ahead": 0},
+                "main": {"behind": 0, "ahead": 1},
+            }
+        return {
+            "current_head": "merge-main",
+            "upstream_head": "abc123",
+            "integration_head": "",
+            "main_head": "merge-main",
+            "upstream": {"behind": 0, "ahead": 1},
+            "integration": {"behind": 0, "ahead": 0},
+            "main": {"behind": 0, "ahead": 0},
+        }
+
+    monkeypatch.setattr(rau, "_compute_live_drift", fake_compute_live_drift)
+
+    def fake_is_ancestor(repo_root_arg, ancestor, descendant):
+        if ancestor == rau.UPSTREAM_REF and descendant == "HEAD":
+            return True
+        if ancestor == "abc123" and descendant == rau.MAIN_REF:
+            return True
+        return False
+
+    monkeypatch.setattr(rau, "_git_is_ancestor", fake_is_ancestor)
+
+    def fake_git(repo_root_arg, *args, cwd=None, check=True):
+        if args == ("merge", "--ff-only", rau.MAIN_REF):
+            heads["HEAD"] = "merge-main"
+        return _ok_completed(args)
+
+    monkeypatch.setattr(rau, "_git", fake_git)
+
+    def fake_push_targets(repo_root_arg, backend, report_arg, target_head, **kwargs):
+        pushed.update(kwargs)
+        report_arg.integration_push_status = "ok"
+        report_arg.main_promotion_status = "not_needed"
+        report_arg.push_status = "ok"
+        report_arg.promoted_head = target_head
+
+    monkeypatch.setattr(rau, "_push_targets", fake_push_targets)
+
+    result = rau._run_state_machine(repo_root, report_root, report)
+
+    assert result.status == "updated"
+    assert pushed == {"push_integration": True, "push_main": False}
+    assert "Fast-forwarded" in result.message
+    assert "integration branch" in result.message
 
 
 def test_run_state_machine_merge_conflict_writes_repair_manifest(tmp_path, monkeypatch):
@@ -415,6 +517,7 @@ def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, False, False))
     monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH, "origin_remote": "origin", "fork_remote": "fork"})
     monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (None, _probe(backend="unavailable", fetch_ready=False, push_ready=False, errors={"push:main": "denied"})))
+    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
     monkeypatch.setattr(
         rau,
         "_compute_live_drift",
@@ -451,6 +554,7 @@ def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypat
     )
     monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
     monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: refresh_calls.append(True))
+    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
     monkeypatch.setattr(
         rau,
         "_compute_live_drift",
