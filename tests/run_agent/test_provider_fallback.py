@@ -5,9 +5,22 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from run_agent import AIAgent
+
+
+@pytest.fixture(autouse=True)
+def _allow_entitled_fallbacks(monkeypatch):
+    import agent.entitlements as entitlements
+
+    monkeypatch.setattr(
+        entitlements,
+        "evaluate_route_target",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, reason="allowed"),
+    )
 
 
 def _make_agent(fallback_model=None):

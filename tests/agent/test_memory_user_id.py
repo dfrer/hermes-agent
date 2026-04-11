@@ -208,8 +208,8 @@ class TestMem0UserIdScoping:
 class TestHonchoUserIdScoping:
     """Verify Honcho plugin uses gateway user_id for peer_name when provided."""
 
-    def test_gateway_user_id_overrides_peer_name(self):
-        """When user_id is in kwargs, cfg.peer_name should be overridden."""
+    def test_gateway_user_id_preserves_explicit_peer_name(self):
+        """An explicit peer_name should not be replaced by a gateway user_id."""
         from plugins.memory.honcho import HonchoMemoryProvider
 
         provider = HonchoMemoryProvider()
@@ -232,8 +232,8 @@ class TestHonchoUserIdScoping:
                 platform="discord",
             )
 
-        # The config's peer_name should have been overridden with the user_id
-        assert mock_cfg.peer_name == "discord_user_789"
+        # Explicit peer_name wins over gateway user_id.
+        assert mock_cfg.peer_name == "static-user"
 
     def test_no_user_id_preserves_config_peer_name(self):
         """Without user_id, the config peer_name should be preserved."""

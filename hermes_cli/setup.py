@@ -106,8 +106,8 @@ _DEFAULT_PROVIDER_MODELS = {
     ],
     "zai": ["glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
-    "minimax": ["MiniMax-M1", "MiniMax-M1-40k", "MiniMax-M1-80k", "MiniMax-M1-128k", "MiniMax-M1-256k", "MiniMax-M2.5", "MiniMax-M2.7"],
-    "minimax-cn": ["MiniMax-M1", "MiniMax-M1-40k", "MiniMax-M1-80k", "MiniMax-M1-128k", "MiniMax-M1-256k", "MiniMax-M2.5", "MiniMax-M2.7"],
+    "minimax": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
+    "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
     "opencode-zen": ["gpt-5.4", "gpt-5.3-codex", "claude-sonnet-4-6", "gemini-3-flash", "glm-5", "kimi-k2.5", "minimax-m2.7"],
@@ -197,24 +197,12 @@ def print_header(title: str):
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
-def print_info(text: str):
-    """Print info text."""
-    print(color(f"  {text}", Colors.DIM))
-
-
-def print_success(text: str):
-    """Print success message."""
-    print(color(f"✓ {text}", Colors.GREEN))
-
-
-def print_warning(text: str):
-    """Print warning message."""
-    print(color(f"⚠ {text}", Colors.YELLOW))
-
-
-def print_error(text: str):
-    """Print error message."""
-    print(color(f"✗ {text}", Colors.RED))
+from hermes_cli.cli_output import (  # noqa: E402
+    print_error,
+    print_info,
+    print_success,
+    print_warning,
+)
 
 
 def is_interactive_stdin() -> bool:
@@ -269,80 +257,9 @@ def prompt(question: str, default: str = None, password: bool = False) -> str:
 
 
 def _curses_prompt_choice(question: str, choices: list, default: int = 0) -> int:
-    """Single-select menu using curses to avoid simple_term_menu rendering bugs."""
-    try:
-        import curses
-        result_holder = [default]
-
-        def _curses_menu(stdscr):
-            curses.curs_set(0)
-            if curses.has_colors():
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_GREEN, -1)
-                curses.init_pair(2, curses.COLOR_YELLOW, -1)
-            cursor = default
-            scroll_offset = 0
-
-            while True:
-                stdscr.clear()
-                max_y, max_x = stdscr.getmaxyx()
-
-                # Rows available for list items: rows 2..(max_y-2) inclusive.
-                visible = max(1, max_y - 3)
-
-                # Scroll the viewport so the cursor is always visible.
-                if cursor < scroll_offset:
-                    scroll_offset = cursor
-                elif cursor >= scroll_offset + visible:
-                    scroll_offset = cursor - visible + 1
-                scroll_offset = max(0, min(scroll_offset, max(0, len(choices) - visible)))
-
-                try:
-                    stdscr.addnstr(
-                        0,
-                        0,
-                        question,
-                        max_x - 1,
-                        curses.A_BOLD | (curses.color_pair(2) if curses.has_colors() else 0),
-                    )
-                except curses.error:
-                    pass
-
-                for row, i in enumerate(range(scroll_offset, min(scroll_offset + visible, len(choices)))):
-                    y = row + 2
-                    if y >= max_y - 1:
-                        break
-                    arrow = "→" if i == cursor else " "
-                    line = f" {arrow}  {choices[i]}"
-                    attr = curses.A_NORMAL
-                    if i == cursor:
-                        attr = curses.A_BOLD
-                        if curses.has_colors():
-                            attr |= curses.color_pair(1)
-                    try:
-                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
-                    except curses.error:
-                        pass
-
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (curses.KEY_UP, ord("k")):
-                    cursor = (cursor - 1) % len(choices)
-                elif key in (curses.KEY_DOWN, ord("j")):
-                    cursor = (cursor + 1) % len(choices)
-                elif key in (curses.KEY_ENTER, 10, 13):
-                    result_holder[0] = cursor
-                    return
-                elif key in (27, ord("q")):
-                    return
-
-        curses.wrapper(_curses_menu)
-        from hermes_cli.curses_ui import flush_stdin
-        flush_stdin()
-        return result_holder[0]
-    except Exception:
-        return -1
+    """Single-select menu using curses. Delegates to curses_radiolist."""
+    from hermes_cli.curses_ui import curses_radiolist
+    return curses_radiolist(question, choices, selected=default, cancel_returns=-1)
 
 
 
@@ -557,6 +474,8 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Text-to-Speech (OpenAI)", True, None))
     elif tts_provider == "minimax" and get_env_value("MINIMAX_API_KEY"):
         tool_status.append(("Text-to-Speech (MiniMax)", True, None))
+    elif tts_provider == "mistral" and get_env_value("MISTRAL_API_KEY"):
+        tool_status.append(("Text-to-Speech (Mistral Voxtral)", True, None))
     elif tts_provider == "neutts":
         try:
             import importlib.util
@@ -1044,6 +963,7 @@ def _setup_tts_provider(config: dict):
         "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
         "minimax": "MiniMax TTS",
+        "mistral": "Mistral Voxtral TTS",
         "neutts": "NeuTTS",
     }
     current_label = provider_labels.get(current_provider, current_provider)
@@ -1064,10 +984,11 @@ def _setup_tts_provider(config: dict):
             "ElevenLabs (premium quality, needs API key)",
             "OpenAI TTS (good quality, needs API key)",
             "MiniMax TTS (high quality with voice cloning, needs API key)",
+            "Mistral Voxtral TTS (multilingual, native Opus, needs API key)",
             "NeuTTS (local on-device, free, ~300MB model download)",
         ]
     )
-    providers.extend(["edge", "elevenlabs", "openai", "minimax", "neutts"])
+    providers.extend(["edge", "elevenlabs", "openai", "minimax", "mistral", "neutts"])
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1141,6 +1062,18 @@ def _setup_tts_provider(config: dict):
             if api_key:
                 save_env_value("MINIMAX_API_KEY", api_key)
                 print_success("MiniMax TTS API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
+    elif selected == "mistral":
+        existing = get_env_value("MISTRAL_API_KEY")
+        if not existing:
+            print()
+            api_key = prompt("Mistral API key for TTS", password=True)
+            if api_key:
+                save_env_value("MISTRAL_API_KEY", api_key)
+                print_success("Mistral TTS API key saved")
             else:
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
@@ -1925,9 +1858,9 @@ def _setup_matrix():
             save_env_value("MATRIX_ENCRYPTION", "true")
             print_success("E2EE enabled")
 
-        matrix_pkg = "matrix-nio[e2e]" if want_e2ee else "matrix-nio"
+        matrix_pkg = "mautrix[encryption]" if want_e2ee else "mautrix"
         try:
-            __import__("nio")
+            __import__("mautrix")
         except ImportError:
             print_info(f"Installing {matrix_pkg}...")
             import subprocess
@@ -2922,19 +2855,33 @@ def run_setup_wizard(args):
     _offer_launch_chat()
 
 
+def _resolve_hermes_chat_argv() -> Optional[list[str]]:
+    """Resolve argv for launching ``hermes chat`` in a fresh process."""
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin, "chat"]
+
+    try:
+        if importlib.util.find_spec("hermes_cli") is not None:
+            return [sys.executable, "-m", "hermes_cli.main", "chat"]
+    except Exception:
+        pass
+
+    return None
+
+
 def _offer_launch_chat():
     """Prompt the user to jump straight into chat after setup."""
     print()
-    if prompt_yes_no("Launch hermes chat now?", True):
-        from hermes_cli.main import cmd_chat
-        from types import SimpleNamespace
-        cmd_chat(SimpleNamespace(
-            query=None, resume=None, continue_last=None, model=None,
-            provider=None, effort=None, skin=None, oneshot=False,
-            quiet=False, verbose=False, toolsets=None, skills=None,
-            yolo=False, source=None, worktree=False, checkpoints=False,
-            pass_session_id=False, max_turns=None,
-        ))
+    if not prompt_yes_no("Launch hermes chat now?", True):
+        return
+
+    chat_argv = _resolve_hermes_chat_argv()
+    if not chat_argv:
+        print_info("Could not relaunch Hermes automatically. Run 'hermes chat' manually.")
+        return
+
+    os.execvp(chat_argv[0], chat_argv)
 
 
 def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):

@@ -28,7 +28,7 @@ class TestInterruptModule:
         assert not is_interrupted()
 
     def test_thread_safety(self):
-        """Set from one thread, check from another."""
+        """Interrupts are thread-scoped and must target the worker thread."""
         from tools.interrupt import set_interrupt, is_interrupted
         set_interrupt(False)
 
@@ -45,7 +45,7 @@ class TestInterruptModule:
         time.sleep(0.05)
         assert not seen["value"]
 
-        set_interrupt(True)
+        set_interrupt(True, t.ident)
         t.join(timeout=1)
         assert seen["value"]
 
@@ -189,7 +189,7 @@ class TestSIGKILLEscalation:
         t.start()
 
         time.sleep(0.5)
-        set_interrupt(True)
+        set_interrupt(True, t.ident)
 
         t.join(timeout=5)
         set_interrupt(False)

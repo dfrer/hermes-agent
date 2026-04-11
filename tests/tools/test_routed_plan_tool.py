@@ -321,6 +321,10 @@ def test_run_all_uses_expected_route_selection(tmp_path):
                     MagicMock(returncode=0, stdout=success_payload, stderr=""),
                 ],
             ) as mock_run,
+            patch(
+                "tools.routed_exec_tool._resolve_effective_route_plan",
+                side_effect=lambda task_id, decision, plan: (plan, {}, ""),
+            ),
             patch("tools.routed_exec_tool._find_executable", side_effect=lambda name: name),
             patch("tools.routed_exec_tool.resolve_api_key_provider_credentials", return_value={}),
         ):

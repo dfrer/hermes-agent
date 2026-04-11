@@ -335,9 +335,21 @@ class TestChannelDirectory(unittest.TestCase):
 
     def test_email_in_session_discovery(self):
         import gateway.channel_directory
-        import inspect
-        source = inspect.getsource(gateway.channel_directory.build_channel_directory)
-        self.assertIn('"email"', source)
+        from gateway.config import Platform
+        from unittest.mock import patch
+
+        def fake_build_from_sessions(platform_name):
+            return [{"id": f"{platform_name}-1", "name": platform_name}]
+
+        with patch.object(gateway.channel_directory, "_build_from_sessions", side_effect=fake_build_from_sessions), \
+             patch.object(gateway.channel_directory, "atomic_json_write"):
+            directory = gateway.channel_directory.build_channel_directory({})
+
+        self.assertIn(Platform.EMAIL.value, directory["platforms"])
+        self.assertEqual(
+            directory["platforms"][Platform.EMAIL.value],
+            [{"id": "email-1", "name": "email"}],
+        )
 
 
 class TestGatewaySetup(unittest.TestCase):

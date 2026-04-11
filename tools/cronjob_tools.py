@@ -64,14 +64,15 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
-    origin_platform = os.getenv("HERMES_SESSION_PLATFORM")
-    origin_chat_id = os.getenv("HERMES_SESSION_CHAT_ID")
+    from gateway.session_context import get_session_env
+    origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
+    origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
-            "chat_name": os.getenv("HERMES_SESSION_CHAT_NAME"),
-            "thread_id": os.getenv("HERMES_SESSION_THREAD_ID"),
+            "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID") or None,
         }
     return None
 
@@ -164,12 +165,12 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
         )
 
     # Validate containment after resolution
+    from tools.path_security import validate_within_dir
+
     scripts_dir = get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    resolved = (scripts_dir / raw).resolve()
-    try:
-        resolved.relative_to(scripts_dir.resolve())
-    except ValueError:
+    containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
+    if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
         )

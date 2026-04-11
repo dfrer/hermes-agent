@@ -13,6 +13,17 @@ import pytest
 from run_agent import AIAgent
 
 
+@pytest.fixture(autouse=True)
+def _allow_entitled_fallbacks(monkeypatch):
+    import agent.entitlements as entitlements
+
+    monkeypatch.setattr(
+        entitlements,
+        "evaluate_route_target",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, reason="allowed"),
+    )
+
+
 def _make_tool_defs(*names: str) -> list:
     return [
         {

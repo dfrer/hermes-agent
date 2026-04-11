@@ -1,9 +1,22 @@
 """Tests that _try_activate_fallback updates the context compressor."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+
+
+@pytest.fixture(autouse=True)
+def _allow_entitled_fallbacks(monkeypatch):
+    import agent.entitlements as entitlements
+
+    monkeypatch.setattr(
+        entitlements,
+        "evaluate_route_target",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, reason="allowed"),
+    )
 
 
 def _make_agent_with_compressor() -> AIAgent:

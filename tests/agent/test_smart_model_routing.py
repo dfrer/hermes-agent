@@ -64,7 +64,11 @@ def test_invalid_override_fails_closed_to_defaults():
 def test_allowed_route_models_come_from_policy():
     allowed = get_allowed_route_models({})
 
-    assert allowed["3A"] == ("Codex CLI (gpt-5.4)",)
+    assert allowed["3A"] == (
+        "Codex CLI (gpt-5.4)",
+        "Hermes CLI (glm-5.1 via zai)",
+        "Hermes CLI (MiniMax-M2.7 via minimax)",
+    )
     assert "Hermes CLI (glm-5.1 via zai)" in allowed["3B"]
     assert "Codex CLI (gpt-5.4-mini)" in allowed["3C"]
 

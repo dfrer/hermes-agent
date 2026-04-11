@@ -467,3 +467,12 @@ python -m pytest tests/tools/ -q                 # Tool-level tests
 ```
 
 Always run the full suite before pushing changes.
+
+### WSL stability rule for Codex
+
+- When this repo is being worked through WSL or `\\wsl.localhost\...`, do not let Codex drive long multi-minute validation loops in one shot.
+- Prefer the smallest failing slice first and use `-x --maxfail=1` where practical.
+- If a validation command is likely to run for more than a few minutes, give the exact command to the user to run manually in a plain WSL terminal instead of continuing to run it through Codex.
+- Before starting any new test run, check for stray background `pytest`/updater processes from earlier attempts.
+- If a run needs to be stopped, use one clean interrupt or kill only the specific WSL `pytest` PID. Do not force-close Codex or kill WSL to stop tests.
+- After any timeout/crash/interrupted run, first verify WSL health, process table, unmerged paths, and last stable transcript state before resuming.
