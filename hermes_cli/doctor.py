@@ -400,6 +400,25 @@ def run_doctor(args):
             pass
 
     # =========================================================================
+    # Check: Routing auto-update readiness
+    # =========================================================================
+    print()
+    print(color("◆ Routing Auto Update Readiness", Colors.CYAN, Colors.BOLD))
+    try:
+        from hermes_cli.routing_auto_update import routing_update_doctor
+
+        update_doctor = routing_update_doctor(repo_root=PROJECT_ROOT)
+        if update_doctor.get("status") == "ready":
+            check_ok("Canonical routing updater", "(ready)")
+        else:
+            check_warn("Canonical routing updater", "(degraded)")
+            for item in update_doctor.get("issues", []):
+                check_info(item)
+                issues.append(item)
+    except Exception as e:
+        check_warn("Canonical routing updater", f"(could not inspect: {e})")
+
+    # =========================================================================
     # Check: Auth providers
     # =========================================================================
     print()

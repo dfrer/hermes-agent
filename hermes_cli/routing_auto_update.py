@@ -6,6 +6,7 @@ Deterministic Hermes auto-update orchestration for the routing integration branc
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import platform
@@ -32,6 +33,13 @@ from hermes_cli.gateway import (
     is_linux,
     is_macos,
 )
+from hermes_cli.routing_update_git import (
+    GitBackend,
+    GitBackendProbe,
+    _linux_to_windows_path,
+    probe_git_backend,
+    select_git_backend,
+)
 
 
 LIVE_BRANCH = "codex/routing-integration"
@@ -39,9 +47,12 @@ UPSTREAM_REMOTE = "origin"
 UPSTREAM_REF = "origin/main"
 PUSH_REMOTE = "fork"
 PUSH_REF = f"{PUSH_REMOTE}/{LIVE_BRANCH}"
+PROMOTION_BRANCH = "main"
+MAIN_REF = f"{PUSH_REMOTE}/{PROMOTION_BRANCH}"
 EXPECTED_FORK_URL = "https://github.com/dfrer/hermes-agent.git"
+EXPECTED_ORIGIN_URL = "https://github.com/NousResearch/hermes-agent.git"
 ROUTING_AUTO_UPDATE_JOB_NAME = "routing auto update"
-ROUTING_AUTO_UPDATE_SCHEDULE = "0 14 * * *"
+ROUTING_AUTO_UPDATE_SCHEDULE = "0 */4 * * *"
 ROUTING_AUTO_UPDATE_TIMEZONE = "America/Vancouver"
 ROUTING_AUTO_UPDATE_DELIVERY = "telegram"
 REPORT_DIR_NAME = "routing-auto-update"
@@ -51,41 +62,89 @@ DEFAULT_RETENTION_DAYS = 30
 UPDATE_BRANCH_PREFIX = "codex/upstream-sync"
 
 ROUTING_CONTRACT_TESTS: tuple[str, ...] = (
-    "tests/agent/test_routing_guard.py",
-    "tests/test_model_tools.py",
-    "tests/agent/test_skill_commands.py",
-    "tests/cli/test_cli_preloaded_skills.py",
-    "tests/hermes_cli/test_api_key_providers.py",
-    "tests/hermes_cli/test_auth_commands.py",
+    "scripts/test-routing-contract.ps1",
 )
 
-TARGETED_REGRESSION_TESTS: tuple[str, ...] = (
-    "tests/hermes_cli/test_doctor.py",
-    "tests/hermes_cli/test_runtime_provider_resolution.py",
-    "tests/tools/test_terminal_none_command_guard.py",
+TRUST_GATE_PYTEST_ARGS: tuple[str, ...] = (
+    "-m",
+    "pytest",
+    "-o",
+    "addopts=",
+    "tests/",
+    "-q",
+    "--ignore=tests/integration",
+    "--ignore=tests/e2e",
+    "--tb=short",
 )
 
-FAST_SMOKE_FILES: tuple[str, ...] = (
-    "agent/routing_policy.py",
-    "agent/routing_guard.py",
-    "tools/routed_exec_tool.py",
-    "hermes_cli/auth_commands.py",
-    "hermes_cli/routing_auto_update.py",
+FAST_REPAIR_HINTS: tuple[str, ...] = (
+    "rerun the failing verification command first",
+    "prefer the smallest repair scoped to the retained worktree",
+    "do not mutate dependency manifests, lockfiles, databases, binaries, or out-of-repo policy files",
+)
+
+PLAYBOOKS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "routing-core",
+        "label": "routing guard / prompt / tool registration",
+        "patterns": (
+            "agent/routing_guard.py",
+            "agent/prompt_builder.py",
+            "model_tools.py",
+            "toolsets.py",
+            "run_agent.py",
+        ),
+    },
+    {
+        "id": "run-agent-provider",
+        "label": "run_agent request / extra-body / provider drift",
+        "patterns": (
+            "run_agent.py",
+            "agent/auxiliary_client.py",
+            "agent/smart_model_routing.py",
+            "gateway/run.py",
+        ),
+    },
+    {
+        "id": "browser-gateway-schema",
+        "label": "browser / gateway / tool schema drift",
+        "patterns": (
+            "tools/browser",
+            "tools/browser_tool.py",
+            "gateway/",
+            "tools/",
+        ),
+    },
+    {
+        "id": "provider-auth-tests",
+        "label": "provider metadata and auth command/test drift",
+        "patterns": (
+            "hermes_cli/auth_commands.py",
+            "hermes_cli/config.py",
+            "tests/hermes_cli/",
+            "tests/gateway/",
+            "tests/agent/",
+        ),
+    },
 )
 
 CRON_PROMPT_TEMPLATE = """You are running the daily Hermes routing-preserving updater.
 
-Do not implement Git update logic yourself. The deterministic script is authoritative.
+Do not implement merge, test, or push logic yourself. The deterministic updater is authoritative.
 
-1. Emit a routing decision for a deterministic repository-maintenance task.
-2. Call `routed_exec` once to run:
-   `python -m hermes_cli.routing_auto_update run --repo-root {repo_root}`
-   Use workdir `{repo_root}`.
-3. Read `{latest_json}` and `{latest_md}`.
-4. If `latest.json` reports `status == "noop"`, return exactly `[SILENT]`.
-5. Otherwise send a concise summary based on `latest.md`.
-
-Do not perform manual merge, test, or push steps outside the script.
+1. Call `hermes routing update run --json --repo-root {repo_root}`.
+2. Read `{latest_json}` and `{latest_md}`.
+3. If `latest.json` reports `status == "noop"`, return exactly `[SILENT]`.
+4. If `status == "updated"`, send a concise summary based on `latest.md` and stop.
+5. If `status in {{"repair_required", "verification_failed"}}` and `repair_eligible == true`:
+   - emit a `TIER: 3A | PATH: high-risk | ...` routing decision for guarded maintenance repair
+   - submit a `routed_plan` over the retained worktree from `latest.json`
+   - node 1: inspect `repair_manifest_path` and latest report
+   - node 2: apply the smallest repair inside the retained worktree
+   - node 3: rerun the targeted failing validation command from the manifest
+   - node 4: call `hermes routing update finalize --json --repo-root {repo_root}`
+   - node 5: summarize the finalized outcome
+6. If repair is ineligible or finalize fails, stop and report the exact retained worktree and manifest paths.
 """
 
 
@@ -98,28 +157,45 @@ class UpdateReport:
     status: str
     started_at: str
     finished_at: str
-    schedule_time: str = "14:00"
+    schedule_time: str = "every 4 hours"
     timezone: str = ROUTING_AUTO_UPDATE_TIMEZONE
     repo_root: str = ""
     live_branch: str = LIVE_BRANCH
     upstream_ref: str = UPSTREAM_REF
     push_remote: str = PUSH_REMOTE
+    promotion_branch: str = PROMOTION_BRANCH
     pre_update_head: str = ""
     upstream_head: str = ""
     post_update_head: str = ""
+    promoted_head: str = ""
+    last_successful_sync_at: str = ""
     upstream_behind_count: int = 0
     upstream_ahead_count: int = 0
     fork_behind_count: int = 0
     fork_ahead_count: int = 0
+    main_behind_count: int = 0
+    main_ahead_count: int = 0
     update_branch: str = ""
     update_worktree: str = ""
     backup_dir: str = ""
     tests_run: list[str] = field(default_factory=list)
+    validation_tier: str = "trust_gate"
+    last_validation_command: str = ""
     push_status: str = "not_attempted"
+    integration_push_status: str = "not_attempted"
+    main_promotion_status: str = "not_attempted"
+    auth_backend: str = "unavailable"
+    fetch_auth_ready: bool = False
+    push_auth_ready: bool = False
+    auth_errors: dict[str, str] = field(default_factory=dict)
+    auth_probe_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     delivery_target: str = ROUTING_AUTO_UPDATE_DELIVERY
     message: str = ""
     policy_history_sync: list[dict[str, Any]] = field(default_factory=list)
     retained_failed_worktree: str = ""
+    repair_manifest_path: str = ""
+    repair_eligible: bool | None = None
+    repair_blockers: list[str] = field(default_factory=list)
     gateway_running: bool | None = None
     gateway_service_installed: bool | None = None
     telegram_connected: bool | None = None
@@ -204,9 +280,17 @@ def _render_markdown_report(report: UpdateReport) -> str:
         f"- Upstream: `{report.upstream_ref}` at `{report.upstream_head or 'n/a'}`",
         f"- Upstream drift: behind `{report.upstream_behind_count}`, ahead `{report.upstream_ahead_count}`",
         f"- Fork drift: behind `{report.fork_behind_count}`, ahead `{report.fork_ahead_count}`",
+        f"- Fork main drift: behind `{report.main_behind_count}`, ahead `{report.main_ahead_count}`",
         f"- Pre-update HEAD: `{report.pre_update_head or 'n/a'}`",
         f"- Post-update HEAD: `{report.post_update_head or report.pre_update_head or 'n/a'}`",
+        f"- Promoted HEAD: `{report.promoted_head or 'n/a'}`",
         f"- Push remote: `{report.push_remote}` ({report.push_status})",
+        f"- Integration push: `{report.integration_push_status}`",
+        f"- Main promotion: `{report.main_promotion_status}`",
+        f"- Auth backend: `{report.auth_backend}`",
+        f"- Fetch auth ready: `{report.fetch_auth_ready}`",
+        f"- Push auth ready: `{report.push_auth_ready}`",
+        f"- Validation tier: `{report.validation_tier}`",
         f"- Delivery target: `{report.delivery_target}`",
     ]
     if report.update_branch:
@@ -217,6 +301,17 @@ def _render_markdown_report(report: UpdateReport) -> str:
         lines.append(f"- Backup dir: `{report.backup_dir}`")
     if report.retained_failed_worktree:
         lines.append(f"- Retained failed worktree: `{report.retained_failed_worktree}`")
+    if report.repair_manifest_path:
+        lines.append(f"- Repair manifest: `{report.repair_manifest_path}`")
+    if report.repair_eligible is not None:
+        lines.append(f"- Repair eligible: `{report.repair_eligible}`")
+    if report.repair_blockers:
+        lines.append("- Repair blockers:")
+        lines.extend([f"  - `{item}`" for item in report.repair_blockers])
+    if report.last_successful_sync_at:
+        lines.append(f"- Last successful sync: `{report.last_successful_sync_at}`")
+    if report.last_validation_command:
+        lines.append(f"- Last validation command: `{report.last_validation_command}`")
     if report.tests_run:
         lines.append("- Tests run:")
         lines.extend([f"  - `{item}`" for item in report.tests_run])
@@ -226,6 +321,10 @@ def _render_markdown_report(report: UpdateReport) -> str:
             lines.append(
                 f"  - `{item.get('phase', 'unknown')}`: {item.get('status', 'unknown')} ({item.get('head', 'n/a')})"
             )
+    if report.auth_errors:
+        lines.append("- Auth errors:")
+        for key, value in sorted(report.auth_errors.items()):
+            lines.append(f"  - `{key}`: {value}")
     if report.gateway_running is not None:
         lines.append(f"- Gateway running: `{report.gateway_running}`")
     if report.gateway_service_installed is not None:
@@ -335,6 +434,264 @@ def _clear_update_check(hermes_home: Path) -> None:
         (hermes_home / ".update_check").unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _repo_local_setting(repo_root: Path, key: str) -> str:
+    result = _git(repo_root, "config", "--local", "--get", key, check=False)
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _ensure_repo_merge_defaults(repo_root: Path) -> None:
+    defaults = {
+        "rerere.enabled": "true",
+        "rerere.autoupdate": "true",
+        "merge.conflictstyle": "zdiff3",
+    }
+    for key, expected in defaults.items():
+        if _repo_local_setting(repo_root, key) != expected:
+            _git(repo_root, "config", "--local", key, expected)
+
+
+def _merge_readiness_issues(repo_root: Path) -> list[str]:
+    expected = {
+        "rerere.enabled": "true",
+        "rerere.autoupdate": "true",
+        "merge.conflictstyle": "zdiff3",
+    }
+    issues: list[str] = []
+    for key, value in expected.items():
+        actual = _repo_local_setting(repo_root, key)
+        if actual != value:
+            issues.append(f"{key}={actual or '(unset)'} expected {value}")
+    return issues
+
+
+def _is_safe_directory_configured(path: Path) -> bool:
+    normalized = str(_normalize_path(path))
+    current = _run_subprocess(["git", "config", "--global", "--get-all", "safe.directory"], check=False)
+    lines = {(line or "").strip() for line in (current.stdout or "").splitlines() if line.strip()}
+    return normalized in lines or "*" in lines
+
+
+def _origin_url(repo_root: Path) -> str:
+    result = _git(repo_root, "remote", "get-url", UPSTREAM_REMOTE, check=False)
+    return (result.stdout or "").strip()
+
+
+def detect_routing_update_topology(repo_root: Path | str | None = None) -> dict[str, Any]:
+    repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    current_branch = ""
+    try:
+        current_branch = _git_output(repo_root, "branch", "--show-current")
+    except UpdateError:
+        current_branch = ""
+    origin_url = _origin_url(repo_root)
+    fork_url = ""
+    try:
+        fork_url = _git_output(repo_root, "remote", "get-url", PUSH_REMOTE)
+    except UpdateError:
+        fork_url = ""
+    return {
+        "repo_root": str(repo_root),
+        "current_branch": current_branch,
+        "live_branch": LIVE_BRANCH,
+        "origin_remote": UPSTREAM_REMOTE,
+        "origin_url": origin_url,
+        "fork_remote": PUSH_REMOTE,
+        "fork_url": fork_url,
+        "promotion_branch": PROMOTION_BRANCH,
+        "matches": (
+            _normalize_remote_url(origin_url) == _normalize_remote_url(EXPECTED_ORIGIN_URL)
+            and _normalize_remote_url(fork_url) == _normalize_remote_url(EXPECTED_FORK_URL)
+            and bool(LIVE_BRANCH)
+        ),
+    }
+
+
+def is_routing_update_topology(repo_root: Path | str | None = None) -> bool:
+    return bool(detect_routing_update_topology(repo_root).get("matches"))
+
+
+def _current_ref(repo_root: Path, ref: str) -> str:
+    try:
+        return _git_output(repo_root, "rev-parse", ref)
+    except UpdateError:
+        return ""
+
+
+def _load_update_cache_state(hermes_home: Path) -> dict[str, Any]:
+    cache_file = hermes_home / ".update_check"
+    if not cache_file.exists():
+        return {}
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_powershell_command(script_path: Path) -> list[str]:
+    script = str(script_path)
+    if platform.system() == "Windows":
+        return ["powershell", "-ExecutionPolicy", "Bypass", "-File", script]
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if pwsh:
+        return [pwsh, "-ExecutionPolicy", "Bypass", "-File", script]
+    windows_ps = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    if windows_ps.exists():
+        return [str(windows_ps), "-ExecutionPolicy", "Bypass", "-File", _linux_to_windows_path(script_path)]
+    raise UpdateError("No PowerShell runtime available for routing contract verification.")
+
+
+def _trust_gate_supports_xdist() -> bool:
+    return importlib.util.find_spec("xdist") is not None
+
+
+def _build_trust_gate_pytest_cmd() -> list[str]:
+    cmd = [sys.executable, *TRUST_GATE_PYTEST_ARGS]
+    if _trust_gate_supports_xdist():
+        cmd.extend(["-n", "auto"])
+    return cmd
+
+
+def _run_trust_gate(worktree: Path) -> list[str]:
+    executed: list[str] = []
+    pytest_cmd = _build_trust_gate_pytest_cmd()
+    _run_subprocess(pytest_cmd, cwd=worktree)
+    executed.append(" ".join(pytest_cmd))
+
+    contract_script = worktree / ROUTING_CONTRACT_TESTS[0]
+    contract_cmd = _resolve_powershell_command(contract_script)
+    _run_subprocess(contract_cmd, cwd=worktree)
+    executed.append(" ".join(contract_cmd))
+    return executed
+
+
+def _eligible_text_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    name = Path(normalized).name.lower()
+    if any(part in {".git", "__pycache__"} for part in Path(normalized).parts):
+        return False
+    if name in {"package-lock.json", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "state.db"}:
+        return False
+    if name.endswith((".db", ".sqlite", ".sqlite3", ".bin", ".exe", ".dll", ".so", ".dylib", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".tar", ".gz")):
+        return False
+    if normalized.startswith("../") or normalized.startswith("..\\"):
+        return False
+    return name.endswith(
+        (
+            ".py",
+            ".ps1",
+            ".sh",
+            ".md",
+            ".txt",
+            ".yaml",
+            ".yml",
+            ".json",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".service",
+            ".plist",
+        )
+    ) or "/tests/" in normalized or normalized.startswith("tests/")
+
+
+def _collect_playbooks(paths: Sequence[str]) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    normalized_paths = [path.replace("\\", "/") for path in paths]
+    for playbook in PLAYBOOKS:
+        if any(any(pattern in path for pattern in playbook["patterns"]) for path in normalized_paths):
+            selected.append({"id": playbook["id"], "label": playbook["label"]})
+    return selected
+
+
+def _repair_eligibility(paths: Sequence[str]) -> tuple[bool, list[str]]:
+    blockers: list[str] = []
+    if not paths:
+        blockers.append("no changed paths recorded")
+        return False, blockers
+    if len(paths) > 40:
+        blockers.append(f"changed path count {len(paths)} exceeds conservative repair cap")
+    for path in paths:
+        if not _eligible_text_path(path):
+            blockers.append(f"ineligible repair target: {path}")
+    return not blockers, blockers
+
+
+def _write_repair_manifest(
+    report_root: Path,
+    report: UpdateReport,
+    *,
+    failure_kind: str,
+    changed_paths: Sequence[str],
+) -> tuple[str, bool, list[str]]:
+    eligible, blockers = _repair_eligibility(changed_paths)
+    manifest = {
+        "failure_kind": failure_kind,
+        "repo_root": report.repo_root,
+        "live_branch": report.live_branch,
+        "upstream_ref": report.upstream_ref,
+        "upstream_head": report.upstream_head,
+        "pre_update_head": report.pre_update_head,
+        "update_branch": report.update_branch,
+        "update_worktree": report.update_worktree,
+        "retained_worktree": report.retained_failed_worktree or report.update_worktree,
+        "changed_paths": list(changed_paths),
+        "repair_eligible": eligible,
+        "repair_blockers": blockers,
+        "last_validation_command": report.last_validation_command,
+        "trust_gate_commands": report.tests_run,
+        "fast_repair_hints": list(FAST_REPAIR_HINTS),
+        "playbooks": _collect_playbooks(changed_paths),
+    }
+    manifest_path = report_root / f"repair-manifest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    _json_dump(manifest, manifest_path)
+    return str(manifest_path), eligible, blockers
+
+
+def _compute_live_drift(repo_root: Path) -> dict[str, Any]:
+    return {
+        "current_head": _current_ref(repo_root, "HEAD"),
+        "upstream_head": _current_ref(repo_root, UPSTREAM_REF),
+        "integration_head": _current_ref(repo_root, PUSH_REF),
+        "main_head": _current_ref(repo_root, MAIN_REF),
+        "upstream": {
+            "behind": _ahead_behind(repo_root, UPSTREAM_REF, "HEAD")[0],
+            "ahead": _ahead_behind(repo_root, UPSTREAM_REF, "HEAD")[1],
+        },
+        "integration": {
+            "behind": _ahead_behind(repo_root, PUSH_REF, "HEAD")[0],
+            "ahead": _ahead_behind(repo_root, PUSH_REF, "HEAD")[1],
+        },
+        "main": {
+            "behind": _ahead_behind(repo_root, MAIN_REF, "HEAD")[0],
+            "ahead": _ahead_behind(repo_root, MAIN_REF, "HEAD")[1],
+        },
+    }
+
+
+def _latest_job_state() -> dict[str, Any]:
+    jobs = [job for job in list_jobs(include_disabled=True) if job.get("name") == ROUTING_AUTO_UPDATE_JOB_NAME]
+    if not jobs:
+        return {"installed": False}
+    primary = jobs[0]
+    return {
+        "installed": True,
+        "job_id": primary.get("id") or "",
+        "state": primary.get("state") or "",
+        "next_run_at": primary.get("next_run_at") or "",
+        "schedule_display": primary.get("schedule_display") or "",
+    }
+
+
+def _refresh_remote_refs(repo_root: Path, backend: GitBackend | None) -> None:
+    if backend is None:
+        return
+    backend.run(["fetch", UPSTREAM_REMOTE, "--prune"], check=False)
+    backend.run(["fetch", PUSH_REMOTE, "--prune"], check=False)
 
 
 def _sync_policy_history(hermes_home: Path) -> dict[str, Any]:
@@ -497,28 +854,6 @@ Reference files copied with this backup:
     }
 
 
-def _run_pytest(repo_root: Path, tests: Sequence[str]) -> str:
-    if not tests:
-        return ""
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts="] + list(tests) + ["-q"]
-    _run_subprocess(cmd, cwd=repo_root)
-    return " ".join(cmd)
-
-
-def _run_smoke_checks(repo_root: Path) -> str:
-    cmd = [sys.executable, "-m", "py_compile", *FAST_SMOKE_FILES]
-    _run_subprocess(cmd, cwd=repo_root)
-    return " ".join(cmd)
-
-
-def _run_verification_suite(worktree: Path) -> list[str]:
-    executed: list[str] = []
-    executed.append(_run_pytest(worktree, ROUTING_CONTRACT_TESTS))
-    executed.append(_run_pytest(worktree, TARGETED_REGRESSION_TESTS))
-    executed.append(_run_smoke_checks(worktree))
-    return [item for item in executed if item]
-
-
 def _git_branch_exists(repo_root: Path, ref: str) -> bool:
     result = _git(repo_root, "rev-parse", "--verify", "--quiet", ref, check=False)
     return result.returncode == 0
@@ -657,6 +992,7 @@ def install_routing_auto_update(repo_root: Path | None = None) -> InstallResult:
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
     hermes_home = _normalize_path(get_hermes_home())
     _ensure_safe_directory(repo_root)
+    _ensure_repo_merge_defaults(repo_root)
     fork_remote = _ensure_fork_remote(repo_root)
 
     config = load_config()
@@ -694,6 +1030,267 @@ def install_routing_auto_update(repo_root: Path | None = None) -> InstallResult:
     )
 
 
+def _promotion_pending(current_head: str, integration_head: str, main_head: str) -> bool:
+    return bool(current_head) and (integration_head != current_head or main_head != current_head)
+
+
+def _push_targets(repo_root: Path, backend: GitBackend, report: UpdateReport, target_head: str) -> None:
+    integration_push = backend.run(
+        ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{LIVE_BRANCH}"],
+        check=False,
+    )
+    if integration_push.returncode != 0:
+        report.integration_push_status = "failed"
+        report.push_status = "failed"
+        report.main_promotion_status = "not_attempted"
+        stderr = (integration_push.stderr or integration_push.stdout or "").strip() or "unknown error"
+        report.auth_errors["push:integration"] = stderr
+        report.message = f"Failed to push {LIVE_BRANCH} to fork: {stderr}"
+        return
+
+    report.integration_push_status = "ok"
+    report.push_status = "ok"
+
+    main_push = backend.run(
+        ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{PROMOTION_BRANCH}"],
+        check=False,
+    )
+    if main_push.returncode != 0:
+        report.main_promotion_status = "failed"
+        stderr = (main_push.stderr or main_push.stdout or "").strip() or "unknown error"
+        report.auth_errors["push:main"] = stderr
+        report.message = f"Updated {LIVE_BRANCH} on fork, but promoting fork/main failed: {stderr}"
+        return
+
+    report.main_promotion_status = "ok"
+    report.promoted_head = target_head
+    report.last_successful_sync_at = _iso(_utc_now())
+
+
+def _latest_retained_failure(latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
+    if not latest:
+        return None
+    status = str(latest.get("status") or "")
+    if status not in {"repair_required", "verification_failed", "ff_failed"}:
+        return None
+    if str(latest.get("upstream_head") or "") != upstream_head:
+        return None
+    retained = str(latest.get("retained_failed_worktree") or "")
+    if not retained:
+        return None
+    retained_path = _normalize_path(retained)
+    if not retained_path.exists():
+        return None
+    return latest
+
+
+def _preflight_backend(repo_root: Path, report: UpdateReport) -> tuple[GitBackend | None, GitBackendProbe]:
+    backend, probe = select_git_backend(
+        repo_root,
+        upstream_remote=UPSTREAM_REMOTE,
+        push_remote=PUSH_REMOTE,
+        live_branch=LIVE_BRANCH,
+        promotion_branch=PROMOTION_BRANCH,
+    )
+    report.auth_backend = probe.backend
+    report.fetch_auth_ready = probe.fetch_ready
+    report.push_auth_ready = probe.push_ready
+    report.auth_errors = dict(probe.errors)
+    report.auth_probe_details = probe.details
+    return backend, probe
+
+
+def _run_state_machine(
+    repo_root: Path,
+    report_root: Path,
+    report: UpdateReport,
+    *,
+    finalize_from_retained: bool = False,
+) -> UpdateReport:
+    hermes_home = _normalize_path(get_hermes_home())
+    latest_report = read_latest_update_report(report_root)
+    update_worktree: Path | None = None
+    update_branch: str | None = None
+
+    _ensure_safe_directory(repo_root)
+    topology = detect_routing_update_topology(repo_root)
+    if not topology.get("matches"):
+        raise UpdateError(
+            f"Routing updater requires {EXPECTED_ORIGIN_URL} as '{UPSTREAM_REMOTE}' and {EXPECTED_FORK_URL} as '{PUSH_REMOTE}'."
+        )
+    _ensure_fork_remote(repo_root)
+
+    current_branch = _git_output(repo_root, "branch", "--show-current")
+    if current_branch != LIVE_BRANCH:
+        raise UpdateError(f"Live repo is on '{current_branch}', expected '{LIVE_BRANCH}'.")
+
+    dirty = _git_output(repo_root, "status", "--porcelain")
+    if dirty:
+        report.status = "dirty_worktree"
+        report.message = "Live worktree is dirty; routing auto-update aborted before any mutation."
+        return report
+
+    merge_issues = _merge_readiness_issues(repo_root)
+    if merge_issues:
+        raise UpdateError("Repo merge defaults are not ready: " + "; ".join(merge_issues))
+
+    backend, probe = _preflight_backend(repo_root, report)
+    if backend is None or not probe.fetch_ready or not probe.push_ready:
+        report.status = "auth_failed"
+        details = [f"{key}={value}" for key, value in sorted(probe.errors.items())]
+        report.message = "Git auth preflight failed. " + ("; ".join(details) if details else "No usable backend.")
+        return report
+
+    _refresh_remote_refs(repo_root, backend)
+
+    report.pre_update_head = _current_ref(repo_root, "HEAD")
+    report.upstream_head = _current_ref(repo_root, UPSTREAM_REF)
+    if not report.upstream_head:
+        raise UpdateError(f"Could not resolve {UPSTREAM_REF}.")
+
+    drift = _compute_live_drift(repo_root)
+    report.upstream_behind_count = int(drift["upstream"]["behind"])
+    report.upstream_ahead_count = int(drift["upstream"]["ahead"])
+    report.fork_behind_count = int(drift["integration"]["behind"])
+    report.fork_ahead_count = int(drift["integration"]["ahead"])
+    report.main_behind_count = int(drift["main"]["behind"])
+    report.main_ahead_count = int(drift["main"]["ahead"])
+
+    retained = _latest_retained_failure(latest_report, report.upstream_head)
+    if retained and not finalize_from_retained:
+        report.status = str(retained.get("status") or "repair_required")
+        report.message = "A retained maintenance worktree for the current upstream head is still pending repair or finalize."
+        report.update_branch = str(retained.get("update_branch") or "")
+        report.update_worktree = str(retained.get("update_worktree") or "")
+        report.retained_failed_worktree = str(retained.get("retained_failed_worktree") or "")
+        report.repair_manifest_path = str(retained.get("repair_manifest_path") or "")
+        report.repair_eligible = retained.get("repair_eligible")
+        report.repair_blockers = list(retained.get("repair_blockers") or [])
+        return report
+
+    upstream_missing = not _git_is_ancestor(repo_root, UPSTREAM_REF, "HEAD")
+    pending_promotion = _promotion_pending(
+        report.pre_update_head,
+        drift.get("integration_head") or "",
+        drift.get("main_head") or "",
+    )
+
+    if not upstream_missing and not finalize_from_retained:
+        report.post_update_head = report.pre_update_head
+        if pending_promotion:
+            _push_targets(repo_root, backend, report, report.pre_update_head)
+            report.status = "updated" if report.main_promotion_status == "ok" else "push_failed"
+            if report.status == "updated":
+                report.message = "Recovered pending fork promotion without creating a new update worktree."
+            return report
+
+        report.status = "noop"
+        report.push_status = "not_needed"
+        report.integration_push_status = "not_needed"
+        report.main_promotion_status = "not_needed"
+        report.message = "No upstream changes to apply and fork promotion is already in sync."
+        return report
+
+    if finalize_from_retained:
+        if not retained:
+            raise UpdateError("No retained routed-maintenance worktree is available to finalize.")
+        update_worktree = _normalize_path(str(retained.get("retained_failed_worktree") or ""))
+        update_branch = str(retained.get("update_branch") or "")
+        if not update_worktree.exists():
+            raise UpdateError(f"Retained worktree is missing: {update_worktree}")
+        if not update_branch:
+            raise UpdateError("Latest retained repair report is missing update_branch.")
+        if _git_output(update_worktree, "branch", "--show-current", cwd=update_worktree) != update_branch:
+            raise UpdateError("Retained worktree no longer matches the prepared update branch.")
+        report.update_branch = update_branch
+        report.update_worktree = str(update_worktree)
+        report.retained_failed_worktree = str(update_worktree)
+    else:
+        pre_sync = _sync_policy_history(hermes_home)
+        pre_sync["phase"] = "pre-update"
+        report.policy_history_sync.append(pre_sync)
+
+        backup = _export_routing_backup(repo_root, hermes_home)
+        report.backup_dir = backup["backup_dir"]
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        update_branch = f"{UPDATE_BRANCH_PREFIX}-{stamp}"
+        update_worktree = _unique_worktree_path(repo_root, stamp)
+        report.update_branch = update_branch
+        report.update_worktree = str(update_worktree)
+
+        host_cwd = _nearest_existing_parent(update_worktree)
+        _ensure_safe_directory(host_cwd)
+        _git(repo_root, "worktree", "add", "-b", update_branch, str(update_worktree), LIVE_BRANCH)
+        _ensure_safe_directory(update_worktree)
+
+        merge_result = _git(update_worktree, "merge", "--no-ff", UPSTREAM_REF, cwd=update_worktree, check=False)
+        if merge_result.returncode != 0:
+            report.status = "repair_required"
+            stderr = (merge_result.stderr or merge_result.stdout or "").strip() or "manual resolution required"
+            report.message = f"Upstream merge produced conflicts in the retained update worktree: {stderr}"
+            report.retained_failed_worktree = str(update_worktree)
+            conflicted = _git_output(update_worktree, "diff", "--name-only", "--diff-filter=U", cwd=update_worktree).splitlines()
+            report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+                report_root,
+                report,
+                failure_kind="merge_conflict",
+                changed_paths=[path for path in conflicted if path.strip()],
+            )
+            return report
+
+    try:
+        report.tests_run = _run_trust_gate(update_worktree)
+        report.last_validation_command = report.tests_run[-1] if report.tests_run else ""
+    except UpdateError as exc:
+        report.status = "verification_failed"
+        report.message = str(exc)
+        report.retained_failed_worktree = str(update_worktree)
+        changed = _git_output(update_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=update_worktree).splitlines()
+        report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+            report_root,
+            report,
+            failure_kind="verification_failed",
+            changed_paths=[path for path in changed if path.strip()],
+        )
+        return report
+
+    ff_result = _git(repo_root, "merge", "--ff-only", update_branch, check=False)
+    if ff_result.returncode != 0:
+        report.status = "ff_failed"
+        stderr = (ff_result.stderr or ff_result.stdout or "").strip() or "unknown error"
+        report.message = f"Fast-forward of {LIVE_BRANCH} failed: {stderr}"
+        report.retained_failed_worktree = str(update_worktree)
+        changed = _git_output(update_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=update_worktree).splitlines()
+        report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+            report_root,
+            report,
+            failure_kind="fast_forward_failed",
+            changed_paths=[path for path in changed if path.strip()],
+        )
+        return report
+
+    _clear_update_check(hermes_home)
+    report.post_update_head = _current_ref(repo_root, "HEAD")
+
+    post_sync = _sync_policy_history(hermes_home)
+    post_sync["phase"] = "post-update"
+    report.policy_history_sync.append(post_sync)
+
+    _push_targets(repo_root, backend, report, report.post_update_head)
+    if report.integration_push_status == "ok" and report.main_promotion_status == "ok":
+        report.status = "updated"
+        report.message = "Applied upstream changes, passed the trust gate, and promoted fork integration + main."
+    else:
+        report.status = "push_failed"
+
+    _remove_worktree_and_branch(repo_root, update_worktree, update_branch)
+    report.retained_failed_worktree = ""
+    report.repair_manifest_path = ""
+    report.repair_eligible = None
+    report.repair_blockers = []
+    return report
+
 def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
     started = _utc_now()
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
@@ -711,137 +1308,55 @@ def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | N
     report.gateway_running = gateway_running
     report.gateway_service_installed = service_installed
     report.telegram_connected = telegram_connected
-
-    update_worktree: Path | None = None
-    update_branch: str | None = None
-
     try:
-        _ensure_safe_directory(repo_root)
-        _ensure_fork_remote(repo_root)
-
-        current_branch = _git_output(repo_root, "branch", "--show-current")
-        if current_branch != LIVE_BRANCH:
-            raise UpdateError(f"Live repo is on '{current_branch}', expected '{LIVE_BRANCH}'.")
-
-        dirty = _git_output(repo_root, "status", "--porcelain")
-        if dirty:
-            report.status = "dirty_worktree"
-            report.message = "Live worktree is dirty; auto-update aborted without mutating the branch."
-            return report
-
-        _git(repo_root, "fetch", UPSTREAM_REMOTE, "--prune")
-        _git(repo_root, "fetch", PUSH_REMOTE, "--prune", check=False)
-
-        report.pre_update_head = _git_output(repo_root, "rev-parse", "HEAD")
-        report.upstream_head = _git_output(repo_root, "rev-parse", UPSTREAM_REF)
-        report.upstream_behind_count, report.upstream_ahead_count = _ahead_behind(repo_root, UPSTREAM_REF, "HEAD")
-
-        upstream_missing = not _git_is_ancestor(repo_root, UPSTREAM_REF, "HEAD")
-        push_needed = True
-        if _git_branch_exists(repo_root, PUSH_REF):
-            remote_head = _git_output(repo_root, "rev-parse", PUSH_REF)
-            push_needed = remote_head != report.pre_update_head
-            report.fork_behind_count, report.fork_ahead_count = _ahead_behind(repo_root, PUSH_REF, "HEAD")
-
-        if not upstream_missing:
-            report.post_update_head = report.pre_update_head
-            if push_needed:
-                push_result = _git(repo_root, "push", PUSH_REMOTE, f"{LIVE_BRANCH}:{LIVE_BRANCH}", check=False)
-                if push_result.returncode == 0:
-                    report.status = "updated"
-                    report.push_status = "ok"
-                    report.message = "Recovered a pending push to fork; upstream was already merged locally."
-                else:
-                    report.status = "push_failed"
-                    report.push_status = "failed"
-                    stderr = (push_result.stderr or push_result.stdout or "").strip()
-                    report.message = f"Fork push failed while retrying a previously-updated local branch: {stderr or 'unknown error'}"
-                return report
-
-            report.status = "noop"
-            report.push_status = "not_needed"
-            report.message = "No upstream changes to apply and fork is already in sync."
-            return report
-
-        pre_sync = _sync_policy_history(hermes_home)
-        pre_sync["phase"] = "pre-update"
-        report.policy_history_sync.append(pre_sync)
-
-        backup = _export_routing_backup(repo_root, hermes_home)
-        report.backup_dir = backup["backup_dir"]
-
-        stamp = started.strftime("%Y%m%d-%H%M%S")
-        update_branch = f"{UPDATE_BRANCH_PREFIX}-{stamp}"
-        update_worktree = _unique_worktree_path(repo_root, stamp)
-        report.update_branch = update_branch
-        report.update_worktree = str(update_worktree)
-
-        host_cwd = _nearest_existing_parent(update_worktree)
-        _ensure_safe_directory(host_cwd)
-        _git(repo_root, "worktree", "add", "-b", update_branch, str(update_worktree), LIVE_BRANCH)
-        _ensure_safe_directory(update_worktree)
-
-        merge_result = _git(update_worktree, "merge", "--no-ff", UPSTREAM_REF, cwd=update_worktree, check=False)
-        if merge_result.returncode != 0:
-            report.status = "merge_conflict"
-            stderr = (merge_result.stderr or merge_result.stdout or "").strip()
-            report.message = f"Upstream merge produced conflicts in disposable worktree: {stderr or 'manual resolution required'}"
-            report.retained_failed_worktree = str(update_worktree)
-            return report
-
-        try:
-            report.tests_run = _run_verification_suite(update_worktree)
-        except UpdateError as exc:
-            report.status = "verification_failed"
-            report.message = str(exc)
-            report.retained_failed_worktree = str(update_worktree)
-            return report
-
-        ff_result = _git(repo_root, "merge", "--ff-only", update_branch, check=False)
-        if ff_result.returncode != 0:
-            report.status = "ff_failed"
-            stderr = (ff_result.stderr or ff_result.stdout or "").strip()
-            report.message = f"Fast-forward of live branch failed: {stderr or 'unknown error'}"
-            report.retained_failed_worktree = str(update_worktree)
-            return report
-
-        _clear_update_check(hermes_home)
-        report.post_update_head = _git_output(repo_root, "rev-parse", "HEAD")
-
-        post_sync = _sync_policy_history(hermes_home)
-        post_sync["phase"] = "post-update"
-        report.policy_history_sync.append(post_sync)
-
-        push_result = _git(repo_root, "push", PUSH_REMOTE, f"{LIVE_BRANCH}:{LIVE_BRANCH}", check=False)
-        if push_result.returncode == 0:
-            report.status = "updated"
-            report.push_status = "ok"
-            report.message = "Applied upstream Hermes changes, verified the routing stack, and pushed the integration branch to fork."
-        else:
-            report.status = "push_failed"
-            report.push_status = "failed"
-            stderr = (push_result.stderr or push_result.stdout or "").strip()
-            report.message = (
-                "Applied and verified the update locally, but pushing to fork failed. "
-                f"Next scheduled run will retry the push. Details: {stderr or 'unknown error'}"
-            )
-
-        _remove_worktree_and_branch(repo_root, update_worktree, update_branch)
-        update_worktree = None
-        update_branch = None
-        return report
-
+        return _run_state_machine(repo_root, report_root, report)
     except UpdateError as exc:
         report.status = "setup_error"
         report.message = str(exc)
-        if update_worktree and update_worktree.exists():
-            report.retained_failed_worktree = str(update_worktree)
         return report
     except Exception as exc:  # pragma: no cover
         report.status = "setup_error"
         report.message = f"Unexpected error: {exc}"
-        if update_worktree and update_worktree.exists():
-            report.retained_failed_worktree = str(update_worktree)
+        return report
+    finally:
+        report.finished_at = _iso(_utc_now())
+        if not report.post_update_head:
+            report.post_update_head = report.pre_update_head
+        _write_report_files(report_root, report)
+        _prune_retention(
+            hermes_home,
+            repo_root,
+            keep_failed_worktree=_normalize_path(report.retained_failed_worktree) if report.retained_failed_worktree else None,
+        )
+
+
+def finalize_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
+    started = _utc_now()
+    repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    hermes_home = _normalize_path(get_hermes_home())
+    report_root = _normalize_path(report_root or _default_report_root(hermes_home))
+
+    report = UpdateReport(
+        status="finalize_failed",
+        started_at=_iso(started),
+        finished_at=_iso(started),
+        repo_root=str(repo_root),
+    )
+
+    gateway_running, service_installed, telegram_connected = _current_gateway_health()
+    report.gateway_running = gateway_running
+    report.gateway_service_installed = service_installed
+    report.telegram_connected = telegram_connected
+
+    try:
+        return _run_state_machine(repo_root, report_root, report, finalize_from_retained=True)
+    except UpdateError as exc:
+        report.status = "finalize_failed"
+        report.message = str(exc)
+        return report
+    except Exception as exc:  # pragma: no cover
+        report.status = "finalize_failed"
+        report.message = f"Unexpected error: {exc}"
         return report
     finally:
         report.finished_at = _iso(_utc_now())
@@ -868,47 +1383,196 @@ def read_latest_update_report(report_root: Path | str | None = None) -> dict[str
         return {}
 
 
-def routing_update_status(report_root: Path | str | None = None) -> dict[str, Any]:
-    latest = read_latest_update_report(report_root)
-    if not latest:
-        return {
-            "status": "missing",
-            "message": "No routing auto-update report has been written yet.",
-            "last_run": "",
-            "branch_drift": {},
-            "last_error": "",
-            "retained_worktree": "",
-            "gateway_running": None,
-            "telegram_connected": None,
-        }
+def _status_missing_payload(repo_root: Path, gateway_running: bool, service_installed: bool, telegram_connected: bool) -> dict[str, Any]:
+    return {
+        "status": "missing",
+        "message": "No routing auto-update report has been written yet.",
+        "last_run": "",
+        "last_successful_sync_at": "",
+        "repo_root": str(repo_root),
+        "live_branch": LIVE_BRANCH,
+        "upstream_ref": UPSTREAM_REF,
+        "branch_drift": {},
+        "current_drift": {},
+        "last_error": "",
+        "retained_worktree": "",
+        "repair_manifest_path": "",
+        "repair_eligible": None,
+        "repair_blockers": [],
+        "gateway_running": gateway_running,
+        "gateway_service_installed": service_installed,
+        "telegram_connected": telegram_connected,
+        "push_status": "not_attempted",
+        "integration_push_status": "not_attempted",
+        "main_promotion_status": "not_attempted",
+        "auth": {
+            "backend": "unavailable",
+            "fetch_ready": False,
+            "push_ready": False,
+            "errors": {},
+            "details": {},
+        },
+        "job": _latest_job_state(),
+        "topology": detect_routing_update_topology(repo_root),
+    }
 
-    status = str(latest.get("status") or "")
-    message = str(latest.get("message") or "")
-    last_error = "" if status in {"noop", "updated"} else message
+
+def routing_update_status(
+    report_root: Path | str | None = None,
+    repo_root: Path | str | None = None,
+    *,
+    probe_auth: bool = True,
+    refresh_refs: bool = False,
+) -> dict[str, Any]:
+    hermes_home = _normalize_path(get_hermes_home())
+    latest = read_latest_update_report(report_root)
+    effective_repo = _normalize_path(repo_root or latest.get("repo_root") or PROJECT_ROOT)
+    gateway_running, service_installed, telegram_connected = _current_gateway_health()
+    summary = _status_missing_payload(effective_repo, gateway_running, service_installed, telegram_connected)
+
+    if latest:
+        status = str(latest.get("status") or "")
+        message = str(latest.get("message") or "")
+        summary.update(
+            {
+                "status": status,
+                "message": message,
+                "last_run": latest.get("finished_at") or latest.get("started_at") or "",
+                "last_successful_sync_at": latest.get("last_successful_sync_at") or "",
+                "repo_root": latest.get("repo_root") or str(effective_repo),
+                "live_branch": latest.get("live_branch") or LIVE_BRANCH,
+                "upstream_ref": latest.get("upstream_ref") or UPSTREAM_REF,
+                "last_error": "" if status in {"noop", "updated"} else message,
+                "retained_worktree": latest.get("retained_failed_worktree") or "",
+                "repair_manifest_path": latest.get("repair_manifest_path") or "",
+                "repair_eligible": latest.get("repair_eligible"),
+                "repair_blockers": list(latest.get("repair_blockers") or []),
+                "push_status": latest.get("push_status") or "not_attempted",
+                "integration_push_status": latest.get("integration_push_status") or "not_attempted",
+                "main_promotion_status": latest.get("main_promotion_status") or "not_attempted",
+            }
+        )
+
+    topology = detect_routing_update_topology(effective_repo)
+    summary["topology"] = topology
+    job = _latest_job_state()
+    summary["job"] = job
+
+    auth_backend = "unavailable"
+    fetch_ready = False
+    push_ready = False
+    auth_errors: dict[str, str] = {}
+    auth_details: dict[str, dict[str, Any]] = {}
+    if (effective_repo / ".git").exists():
+        if probe_auth:
+            backend, probe = select_git_backend(
+                effective_repo,
+                upstream_remote=UPSTREAM_REMOTE,
+                push_remote=PUSH_REMOTE,
+                live_branch=LIVE_BRANCH,
+                promotion_branch=PROMOTION_BRANCH,
+            )
+            auth_backend = probe.backend
+            fetch_ready = probe.fetch_ready
+            push_ready = probe.push_ready
+            auth_errors = dict(probe.errors)
+            auth_details = dict(probe.details)
+            if backend is not None and probe.fetch_ready and refresh_refs:
+                _refresh_remote_refs(effective_repo, backend)
+        live_drift = _compute_live_drift(effective_repo)
+        summary["current_drift"] = live_drift
+        summary["branch_drift"] = {
+            "upstream_behind": int(live_drift["upstream"]["behind"]),
+            "upstream_ahead": int(live_drift["upstream"]["ahead"]),
+            "fork_behind": int(live_drift["integration"]["behind"]),
+            "fork_ahead": int(live_drift["integration"]["ahead"]),
+            "main_behind": int(live_drift["main"]["behind"]),
+            "main_ahead": int(live_drift["main"]["ahead"]),
+        }
+        summary["promotion_pending"] = _promotion_pending(
+            live_drift.get("current_head") or "",
+            live_drift.get("integration_head") or "",
+            live_drift.get("main_head") or "",
+        )
+
+    summary["auth"] = {
+        "backend": auth_backend,
+        "fetch_ready": fetch_ready,
+        "push_ready": push_ready,
+        "errors": auth_errors,
+        "details": auth_details,
+    }
+    summary["gateway_running"] = gateway_running
+    summary["gateway_service_installed"] = service_installed
+    summary["telegram_connected"] = telegram_connected
+    summary["update_cache_state"] = _load_update_cache_state(hermes_home)
+    return summary
+
+
+def routing_update_doctor(
+    report_root: Path | str | None = None,
+    repo_root: Path | str | None = None,
+) -> dict[str, Any]:
+    summary = routing_update_status(report_root, repo_root)
+    effective_repo = _normalize_path(summary.get("repo_root") or repo_root or PROJECT_ROOT)
+
+    issues: list[str] = []
+    checks = {
+        "topology": bool(summary.get("topology", {}).get("matches")),
+        "live_branch": summary.get("topology", {}).get("current_branch") == LIVE_BRANCH,
+        "safe_directory": _is_safe_directory_configured(effective_repo) if (effective_repo / ".git").exists() else False,
+        "merge_defaults": not _merge_readiness_issues(effective_repo) if (effective_repo / ".git").exists() else False,
+        "fetch_auth": bool(summary.get("auth", {}).get("fetch_ready")),
+        "push_auth": bool(summary.get("auth", {}).get("push_ready")),
+        "job_installed": bool(summary.get("job", {}).get("installed")),
+        "gateway_running": bool(summary.get("gateway_running")),
+        "telegram_connected": bool(summary.get("telegram_connected")),
+        "update_cache_hygiene": True,
+        "retained_worktree_present": False,
+    }
+
+    retained = str(summary.get("retained_worktree") or "")
+    if retained:
+        retained_path = _normalize_path(retained)
+        checks["retained_worktree_present"] = retained_path.exists()
+        if not retained_path.exists():
+            issues.append(f"Retained failed worktree is missing: {retained}")
+    if not checks["topology"]:
+        issues.append("Repo remotes/branch do not match the routing-maintenance fork topology.")
+    if not checks["safe_directory"]:
+        issues.append("git safe.directory is not configured for the live repo.")
+    merge_issues = _merge_readiness_issues(effective_repo) if (effective_repo / ".git").exists() else ["repo missing .git"]
+    if merge_issues:
+        issues.extend([f"merge readiness: {item}" for item in merge_issues])
+    if not checks["gateway_running"]:
+        issues.append("gateway delivery path is not running")
+    if not checks["telegram_connected"]:
+        issues.append("telegram delivery path is not connected")
+    auth_errors = summary.get("auth", {}).get("errors") or {}
+    for key, value in sorted(auth_errors.items()):
+        issues.append(f"{key}: {value}")
+
+    status = "ready" if not issues else "degraded"
+    message = (
+        "Routing auto-update readiness looks healthy."
+        if status == "ready"
+        else "Routing auto-update has readiness issues that should be fixed before trusting unattended promotion."
+    )
     return {
         "status": status,
         "message": message,
-        "last_run": latest.get("finished_at") or latest.get("started_at") or "",
-        "repo_root": latest.get("repo_root") or "",
-        "live_branch": latest.get("live_branch") or LIVE_BRANCH,
-        "upstream_ref": latest.get("upstream_ref") or UPSTREAM_REF,
-        "branch_drift": {
-            "upstream_behind": int(latest.get("upstream_behind_count") or 0),
-            "upstream_ahead": int(latest.get("upstream_ahead_count") or 0),
-            "fork_behind": int(latest.get("fork_behind_count") or 0),
-            "fork_ahead": int(latest.get("fork_ahead_count") or 0),
-        },
-        "last_error": last_error,
-        "retained_worktree": latest.get("retained_failed_worktree") or "",
-        "gateway_running": latest.get("gateway_running"),
-        "gateway_service_installed": latest.get("gateway_service_installed"),
-        "telegram_connected": latest.get("telegram_connected"),
-        "push_status": latest.get("push_status") or "",
+        "repo_root": str(effective_repo),
+        "checks": checks,
+        "issues": issues,
+        "summary": summary,
     }
 
 
 def routing_status_command(args) -> None:
-    summary = routing_update_status(getattr(args, "report_root", "") or None)
+    summary = routing_update_status(
+        getattr(args, "report_root", "") or None,
+        getattr(args, "repo_root", "") or None,
+    )
     if getattr(args, "json", False):
         print(json.dumps(summary, indent=2))
         return
@@ -924,14 +1588,48 @@ def routing_status_command(args) -> None:
         f"upstream behind {drift.get('upstream_behind', 0)}, "
         f"upstream ahead {drift.get('upstream_ahead', 0)}, "
         f"fork behind {drift.get('fork_behind', 0)}, "
-        f"fork ahead {drift.get('fork_ahead', 0)}"
+        f"fork ahead {drift.get('fork_ahead', 0)}, "
+        f"main behind {drift.get('main_behind', 0)}, "
+        f"main ahead {drift.get('main_ahead', 0)}"
     )
+    auth = summary.get("auth") or {}
+    print(
+        "Auth backend: "
+        f"{auth.get('backend', 'unavailable')} "
+        f"(fetch={auth.get('fetch_ready')}, push={auth.get('push_ready')})"
+    )
+    job = summary.get("job") or {}
+    if job.get("installed"):
+        print(f"Job: installed ({job.get('state') or 'unknown'}) next={job.get('next_run_at') or 'unknown'}")
+    else:
+        print("Job: not installed")
     if summary.get("last_error"):
         print(f"Last error: {summary['last_error']}")
     if summary.get("retained_worktree"):
         print(f"Retained worktree: {summary['retained_worktree']}")
+    if summary.get("repair_manifest_path"):
+        print(f"Repair manifest: {summary['repair_manifest_path']}")
     print(f"Gateway running: {summary.get('gateway_running')}")
     print(f"Telegram connected: {summary.get('telegram_connected')}")
+
+
+def routing_doctor_command(args) -> None:
+    doctor = routing_update_doctor(
+        getattr(args, "report_root", "") or None,
+        getattr(args, "repo_root", "") or None,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(doctor, indent=2))
+        return
+
+    print(f"Routing update doctor: {doctor['status']}")
+    print(f"Message: {doctor['message']}")
+    for key, value in doctor.get("checks", {}).items():
+        print(f"- {key}: {value}")
+    if doctor.get("issues"):
+        print("Issues:")
+        for item in doctor["issues"]:
+            print(f"  - {item}")
 
 
 def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -945,8 +1643,19 @@ def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     run_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
 
     status_parser = subparsers.add_parser("status", help="Summarize the latest routing auto-update report")
+    status_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
     status_parser.add_argument("--report-root", default="")
     status_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check routing auto-update readiness")
+    doctor_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    doctor_parser.add_argument("--report-root", default="")
+    doctor_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
+
+    finalize_parser = subparsers.add_parser("finalize", help=argparse.SUPPRESS)
+    finalize_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    finalize_parser.add_argument("--report-root", default="")
+    finalize_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -968,7 +1677,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         routing_status_command(args)
         return 0
 
-    report = run_routing_auto_update(args.repo_root, args.report_root or None)
+    if args.command == "doctor":
+        routing_doctor_command(args)
+        return 0
+
+    if args.command == "finalize":
+        report = finalize_routing_auto_update(args.repo_root, args.report_root or None)
+    else:
+        report = run_routing_auto_update(args.repo_root, args.report_root or None)
     if args.json:
         print(json.dumps(asdict(report), indent=2))
     else:

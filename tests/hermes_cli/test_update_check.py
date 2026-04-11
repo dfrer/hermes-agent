@@ -50,6 +50,7 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with (
         patch("hermes_cli.banner._git_short_hash", return_value="abc12345"),
+        patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False),
         patch("hermes_cli.banner.subprocess.run") as mock_run,
     ):
         result = check_for_updates()
@@ -73,7 +74,9 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     mock_result = MagicMock(returncode=0, stdout="5\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+    with patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False), patch(
+        "hermes_cli.banner.subprocess.run", return_value=mock_result
+    ) as mock_run:
         result = check_for_updates()
 
     assert result == 5
@@ -96,6 +99,7 @@ def test_check_for_updates_ignores_cache_when_head_changes(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with (
         patch("hermes_cli.banner._git_short_hash", return_value="newhead99"),
+        patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False),
         patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run,
     ):
         result = check_for_updates()
@@ -138,6 +142,27 @@ def test_check_for_updates_fallback_to_project_root(tmp_path, monkeypatch):
     assert mock_run.call_count >= 1
 
 
+def test_check_for_updates_uses_routing_status_on_custom_topology(tmp_path, monkeypatch):
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=True), patch(
+        "hermes_cli.routing_auto_update.routing_update_status",
+        return_value={"branch_drift": {"upstream_behind": 7}, "status": "updated", "current_drift": {"current_head": "abc12345"}},
+    ) as mock_status, patch("hermes_cli.banner._git_short_hash", return_value="abc12345"), patch(
+        "hermes_cli.banner.subprocess.run"
+    ) as mock_run:
+        result = check_for_updates()
+
+    assert result == 7
+    mock_status.assert_called_once_with(repo_root=repo_dir, probe_auth=False, refresh_refs=False)
+    mock_run.assert_not_called()
+
+
 def test_prefetch_non_blocking():
     """prefetch_update_check() should return immediately without blocking."""
     import hermes_cli.banner as banner
@@ -146,7 +171,7 @@ def test_prefetch_non_blocking():
     banner._update_result = None
     banner._update_check_done = threading.Event()
 
-    with patch.object(banner, "check_for_updates", return_value=5):
+    with patch.object(banner, "get_update_notice", return_value={"kind": "behind", "behind": 5}):
         start = time.monotonic()
         banner.prefetch_update_check()
         elapsed = time.monotonic() - start
@@ -156,7 +181,7 @@ def test_prefetch_non_blocking():
 
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
-        assert banner._update_result == 5
+        assert banner._update_result == {"kind": "behind", "behind": 5}
 
 
 def test_get_update_result_timeout():

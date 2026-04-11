@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -141,6 +141,32 @@ def check_for_updates() -> Optional[int]:
     if not (repo_dir / ".git").exists():
         return None
 
+    try:
+        from hermes_cli.routing_auto_update import is_routing_update_topology, routing_update_status
+
+        if is_routing_update_topology(repo_dir):
+            summary = routing_update_status(repo_root=repo_dir, probe_auth=False, refresh_refs=False)
+            drift = summary.get("branch_drift") or {}
+            behind = int(drift.get("upstream_behind", 0) or 0)
+            current_head = ((summary.get("current_drift") or {}).get("current_head")) or _git_short_hash(repo_dir, "HEAD")
+            try:
+                cache_file.write_text(
+                    json.dumps(
+                        {
+                            "ts": time.time(),
+                            "behind": behind,
+                            "head": current_head,
+                            "routing_status": summary.get("status"),
+                            "promotion_pending": summary.get("promotion_pending", False),
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            return behind
+    except Exception:
+        pass
+
     current_head = _git_short_hash(repo_dir, "HEAD")
 
     # Read cache
@@ -189,6 +215,57 @@ def check_for_updates() -> Optional[int]:
         pass
 
     return behind
+
+
+def get_update_notice() -> Optional[dict[str, Any]]:
+    repo_dir = _resolve_repo_dir()
+    if repo_dir is None:
+        return None
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".update_check"
+    current_head = _git_short_hash(repo_dir, "HEAD")
+
+    try:
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text())
+            if (
+                time.time() - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+                and cached.get("head")
+                and cached.get("head") == current_head
+            ):
+                cached_status = str(cached.get("routing_status") or "")
+                if cached_status and cached_status not in {"missing", "noop", "updated"}:
+                    return {"kind": "routing-degraded", "status": cached_status}
+                cached_behind = int(cached.get("behind", 0) or 0)
+                if cached_behind > 0:
+                    return {"kind": "behind", "behind": cached_behind}
+                return None
+    except Exception:
+        pass
+
+    try:
+        from hermes_cli.routing_auto_update import is_routing_update_topology, routing_update_status
+
+        if is_routing_update_topology(repo_dir):
+            summary = routing_update_status(repo_root=repo_dir, probe_auth=False, refresh_refs=False)
+            status = str(summary.get("status") or "")
+            if status and status not in {"missing", "noop", "updated"}:
+                return {
+                    "kind": "routing-degraded",
+                    "status": status,
+                    "message": summary.get("message") or "",
+                }
+            behind = int((summary.get("branch_drift") or {}).get("upstream_behind", 0) or 0)
+            if behind > 0:
+                return {"kind": "behind", "behind": behind}
+            return None
+    except Exception:
+        pass
+
+    behind = check_for_updates()
+    if behind and behind > 0:
+        return {"kind": "behind", "behind": behind}
+    return None
 
 
 def _resolve_repo_dir() -> Optional[Path]:
@@ -268,7 +345,7 @@ def format_banner_version_label() -> str:
 # Non-blocking update check
 # =========================================================================
 
-_update_result: Optional[int] = None
+_update_result: Optional[dict[str, Any]] = None
 _update_check_done = threading.Event()
 
 
@@ -276,13 +353,13 @@ def prefetch_update_check():
     """Kick off update check in a background daemon thread."""
     def _run():
         global _update_result
-        _update_result = check_for_updates()
+        _update_result = get_update_notice()
         _update_check_done.set()
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
 
-def get_update_result(timeout: float = 0.5) -> Optional[int]:
+def get_update_result(timeout: float = 0.5) -> Optional[dict[str, Any]]:
     """Get result of prefetched check. Returns None if not ready."""
     _update_check_done.wait(timeout=timeout)
     return _update_result
@@ -510,13 +587,22 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     # Update check — use prefetched result if available
     try:
-        behind = get_update_result(timeout=0.5)
-        if behind and behind > 0:
+        notice = get_update_result(timeout=0.5)
+        if notice and notice.get("kind") == "behind":
             from hermes_cli.config import recommended_update_command
+            behind = int(notice.get("behind") or 0)
             commits_word = "commit" if behind == 1 else "commits"
             right_lines.append(
                 f"[bold yellow]⚠ {behind} {commits_word} behind[/]"
                 f"[dim yellow] — run [bold]{recommended_update_command()}[/bold] to update[/]"
+            )
+        elif notice and notice.get("kind") == "routing-degraded":
+            from hermes_cli.config import recommended_update_command
+
+            status = notice.get("status") or "degraded"
+            right_lines.append(
+                f"[bold yellow]⚠ updater {status}[/]"
+                f"[dim yellow] — run [bold]{recommended_update_command()}[/bold][/]"
             )
     except Exception:
         pass  # Never break the banner over an update check

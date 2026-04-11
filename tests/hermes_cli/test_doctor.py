@@ -121,6 +121,23 @@ def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     assert seen["interactive"] == "1"
 
 
+def test_run_doctor_reports_routing_auto_update_readiness(monkeypatch, tmp_path, capsys):
+    helper = TestDoctorMemoryProviderSection()
+    monkeypatch.setattr(
+        "hermes_cli.routing_auto_update.routing_update_doctor",
+        lambda report_root=None, repo_root=None: {
+            "status": "degraded",
+            "issues": ["push:main: denied"],
+        },
+    )
+
+    out = helper._run_doctor_and_capture(monkeypatch, tmp_path, provider="")
+
+    assert "Routing Auto Update Readiness" in out
+    assert "Canonical routing updater" in out
+    assert "push:main: denied" in out
+
+
 def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
     unit_path.write_text("[Unit]\n")

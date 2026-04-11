@@ -3,6 +3,42 @@ from types import SimpleNamespace
 from hermes_cli.status import show_status
 
 
+def test_show_status_includes_routing_maintenance(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.status.routing_update_status",
+        lambda repo_root=None: {
+            "status": "updated",
+            "last_run": "2026-04-10T10:00:00+00:00",
+            "retained_worktree": "",
+            "topology": {
+                "current_branch": "codex/routing-integration",
+                "origin_remote": "origin",
+                "origin_url": "https://github.com/NousResearch/hermes-agent.git",
+                "fork_remote": "fork",
+                "fork_url": "https://github.com/dfrer/hermes-agent.git",
+            },
+            "branch_drift": {
+                "upstream_behind": 0,
+                "upstream_ahead": 46,
+                "fork_behind": 0,
+                "fork_ahead": 46,
+                "main_behind": 0,
+                "main_ahead": 46,
+            },
+            "auth": {"backend": "native", "fetch_ready": True, "push_ready": True},
+            "job": {"installed": True, "next_run_at": "2099-01-01T00:00:00+00:00"},
+        },
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Routing Maintenance" in output
+    assert "codex/routing-integration" in output
+    assert "native" in output
+
+
 def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-1234567890abcdef")
