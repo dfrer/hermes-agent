@@ -28,7 +28,7 @@ function Escape-ShSingleQuoted {
     return $Value.Replace("'", "'""'""'")
 }
 
-$args = @("-m", "hermes_cli.routing_auto_update", "run", "--repo-root", $RepoRoot)
+$args = @("-m", "hermes_cli.main", "routing", "update", "run", "--repo-root", $RepoRoot)
 if ($ReportRoot) {
     $args += @("--report-root", $ReportRoot)
 }
@@ -39,7 +39,7 @@ if ($Json) {
 $repoWsl = Convert-ToWslPathInfo $RepoRoot
 if ($repoWsl) {
     $repoLinux = Escape-ShSingleQuoted $repoWsl.LinuxPath
-    $command = "cd '$repoLinux' && if [ -x venv/bin/python ]; then venv/bin/python -m hermes_cli.routing_auto_update run --repo-root '$repoLinux'; else python3 -m hermes_cli.routing_auto_update run --repo-root '$repoLinux'; fi"
+    $command = "cd '$repoLinux' && if [ -x venv/bin/python ]; then venv/bin/python -m hermes_cli.main routing update run --repo-root '$repoLinux'; else python3 -m hermes_cli.main routing update run --repo-root '$repoLinux'; fi"
     if ($ReportRoot) {
         $reportWsl = Convert-ToWslPathInfo $ReportRoot
         if (-not $reportWsl -or $reportWsl.Distro -ne $repoWsl.Distro) {

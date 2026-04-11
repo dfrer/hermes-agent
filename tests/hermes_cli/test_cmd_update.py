@@ -36,16 +36,31 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
 @pytest.fixture
 def mock_args():
-    return SimpleNamespace()
+    return SimpleNamespace(gateway=False, legacy_stock_update=True)
 
 
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
+    @patch("hermes_cli.routing_auto_update._render_markdown_report", return_value="report")
+    @patch("hermes_cli.routing_auto_update.run_routing_auto_update")
+    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=True)
+    def test_update_redirects_to_routing_updater_by_default(
+        self, _mock_topology, mock_run_update, _mock_render, capsys
+    ):
+        mock_run_update.return_value = SimpleNamespace(status="updated", message="ok")
+
+        cmd_update(SimpleNamespace(gateway=False, legacy_stock_update=False))
+
+        mock_run_update.assert_called_once()
+        captured = capsys.readouterr()
+        assert "Routing-aware fork topology detected" in captured.out
+
     @patch("shutil.which", return_value=None)
+    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
     @patch("subprocess.run")
     def test_update_falls_back_to_main_when_branch_not_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_topology, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="fix/stoicneko", verify_ok=False, commit_count="3"
@@ -67,9 +82,10 @@ class TestCmdUpdateBranchFallback:
         assert "main" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
+    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
     @patch("subprocess.run")
     def test_update_uses_current_branch_when_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_topology, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="2"
@@ -88,9 +104,10 @@ class TestCmdUpdateBranchFallback:
         assert "main" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
+    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
     @patch("subprocess.run")
     def test_update_already_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_topology, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
@@ -111,6 +128,8 @@ class TestCmdUpdateBranchFallback:
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
+            "hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False
+        ), patch(
             "hermes_cli.config.get_missing_env_vars", return_value=["MISSING_KEY"]
         ), patch("hermes_cli.config.get_missing_config_fields", return_value=[]), patch(
             "hermes_cli.config.check_config_version", return_value=(1, 2)

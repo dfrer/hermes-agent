@@ -68,3 +68,27 @@ def test_build_welcome_banner_uses_normalized_toolset_names():
     assert "homeassistant_tools:" not in output
     assert "honcho_tools:" not in output
     assert "web_tools:" not in output
+
+
+def test_build_welcome_banner_shows_routing_updater_degraded_notice():
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=(["web"], []),
+        ),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value={"kind": "routing-degraded", "status": "push_failed"}),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console,
+            model="anthropic/test-model",
+            cwd="/tmp/project",
+            tools=[{"function": {"name": "web_search"}}],
+            get_toolset_for_tool=lambda name: "web",
+        )
+
+    output = console.export_text()
+    assert "updater push_failed" in output

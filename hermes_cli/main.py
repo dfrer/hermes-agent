@@ -44,6 +44,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -2717,11 +2718,45 @@ def cmd_auth(args):
 def cmd_routing(args):
     """Routing policy and updater commands."""
     if getattr(args, "routing_command", None) == "update":
-        from hermes_cli.routing_auto_update import routing_status_command
-        if getattr(args, "routing_update_command", None) == "status":
-            routing_status_command(args)
+        from dataclasses import asdict
+        from hermes_cli import routing_auto_update as rau
+
+        subcommand = getattr(args, "routing_update_command", None)
+        if subcommand == "install":
+            result = rau.install_routing_auto_update(getattr(args, "repo_root", PROJECT_ROOT))
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(result), indent=2))
+            else:
+                print(result.message)
+                print(f"job_id={result.job_id}")
             return
-    print("Usage: hermes routing update status")
+        if subcommand == "run":
+            report = rau.run_routing_auto_update(
+                getattr(args, "repo_root", PROJECT_ROOT),
+                getattr(args, "report_root", "") or None,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(report), indent=2))
+            else:
+                print(rau._render_markdown_report(report))
+            return
+        if subcommand == "status":
+            rau.routing_status_command(args)
+            return
+        if subcommand == "doctor":
+            rau.routing_doctor_command(args)
+            return
+        if subcommand == "finalize":
+            report = rau.finalize_routing_auto_update(
+                getattr(args, "repo_root", PROJECT_ROOT),
+                getattr(args, "report_root", "") or None,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(report), indent=2))
+            else:
+                print(rau._render_markdown_report(report))
+            return
+    print("Usage: hermes routing update {install|run|status|doctor}")
 
 
 def cmd_status(args):
@@ -3496,9 +3531,20 @@ def cmd_update(args):
     """Update Hermes Agent to the latest version."""
     import shutil
     from hermes_cli.config import is_managed, managed_error
+    from hermes_cli.routing_auto_update import (
+        _render_markdown_report,
+        is_routing_update_topology,
+        run_routing_auto_update,
+    )
 
     if is_managed():
         managed_error("update Hermes Agent")
+        return
+
+    if is_routing_update_topology(PROJECT_ROOT) and not getattr(args, "legacy_stock_update", False):
+        print("Routing-aware fork topology detected. Running `hermes routing update run` instead.")
+        report = run_routing_auto_update(PROJECT_ROOT)
+        print(_render_markdown_report(report))
         return
 
     gateway_mode = getattr(args, "gateway", False)
@@ -4719,12 +4765,40 @@ For more help on a command:
     routing_subparsers = routing_parser.add_subparsers(dest="routing_command")
     routing_update = routing_subparsers.add_parser("update", help="Routing integration updater")
     routing_update_subparsers = routing_update.add_subparsers(dest="routing_update_command")
+    routing_update_install = routing_update_subparsers.add_parser(
+        "install",
+        help="Install or update the recurring routing-aware updater job",
+    )
+    routing_update_install.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_install.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_run = routing_update_subparsers.add_parser(
+        "run",
+        help="Run the routing-aware updater once",
+    )
+    routing_update_run.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_run.add_argument("--report-root", default="", help="Override report directory")
+    routing_update_run.add_argument("--json", action="store_true", help="Emit structured JSON")
     routing_update_status = routing_update_subparsers.add_parser(
         "status",
         help="Summarize the latest guarded routing update report",
     )
+    routing_update_status.add_argument("--repo-root", default=str(PROJECT_ROOT), help="Override repo root")
     routing_update_status.add_argument("--report-root", default="", help="Override report directory")
     routing_update_status.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_doctor = routing_update_subparsers.add_parser(
+        "doctor",
+        help="Check routing auto-update readiness",
+    )
+    routing_update_doctor.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_doctor.add_argument("--report-root", default="")
+    routing_update_doctor.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_finalize = routing_update_subparsers.add_parser(
+        "finalize",
+        help=argparse.SUPPRESS,
+    )
+    routing_update_finalize.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_finalize.add_argument("--report-root", default="")
+    routing_update_finalize.add_argument("--json", action="store_true", help="Emit structured JSON")
     routing_parser.set_defaults(func=cmd_routing)
 
     # =========================================================================
@@ -5570,6 +5644,12 @@ For more help on a command:
     update_parser.add_argument(
         "--gateway", action="store_true", default=False,
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)"
+    )
+    update_parser.add_argument(
+        "--legacy-stock-update",
+        action="store_true",
+        default=False,
+        help="Bypass the routing-aware fork updater and use the legacy stock update flow",
     )
     update_parser.set_defaults(func=cmd_update)
     

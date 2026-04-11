@@ -16,6 +16,7 @@ from hermes_cli.colors import Colors, color
 from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
 from hermes_cli.models import provider_label
 from hermes_cli.nous_subscription import get_nous_subscription_features
+from hermes_cli.routing_auto_update import routing_update_status
 from hermes_cli.runtime_provider import resolve_requested_provider
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
@@ -110,6 +111,42 @@ def show_status(args):
 
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
+
+    # =========================================================================
+    # Routing Maintenance
+    # =========================================================================
+    print()
+    print(color("◆ Routing Maintenance", Colors.CYAN, Colors.BOLD))
+    try:
+        maintenance = routing_update_status(repo_root=PROJECT_ROOT)
+        topology = maintenance.get("topology") or {}
+        drift = maintenance.get("branch_drift") or {}
+        auth = maintenance.get("auth") or {}
+        job = maintenance.get("job") or {}
+        print(f"  Live branch:  {topology.get('current_branch') or '(unknown)'}")
+        print(f"  Upstream:     {topology.get('origin_remote') or 'origin'} -> {topology.get('origin_url') or '(unknown)'}")
+        print(f"  Fork:         {topology.get('fork_remote') or 'fork'} -> {topology.get('fork_url') or '(unknown)'}")
+        print(
+            "  Drift:        "
+            f"upstream b{drift.get('upstream_behind', 0)}/a{drift.get('upstream_ahead', 0)}  "
+            f"fork b{drift.get('fork_behind', 0)}/a{drift.get('fork_ahead', 0)}  "
+            f"main b{drift.get('main_behind', 0)}/a{drift.get('main_ahead', 0)}"
+        )
+        print(
+            "  Auth:         "
+            f"{auth.get('backend', 'unavailable')} "
+            f"(fetch={auth.get('fetch_ready')}, push={auth.get('push_ready')})"
+        )
+        print(f"  Job:          {'installed' if job.get('installed') else 'not installed'}")
+        if job.get("installed"):
+            print(f"  Next run:     {job.get('next_run_at') or '(unknown)'}")
+        print(f"  Last status:  {maintenance.get('status') or '(unknown)'}")
+        if maintenance.get("last_run"):
+            print(f"  Last run:     {maintenance.get('last_run')}")
+        if maintenance.get("retained_worktree"):
+            print(f"  Retained:     {maintenance.get('retained_worktree')}")
+    except Exception as exc:
+        print(f"  Status:       {check_mark(False)} could not inspect routing maintenance ({exc})")
     
     # =========================================================================
     # API Keys

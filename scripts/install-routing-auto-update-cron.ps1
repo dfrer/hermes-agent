@@ -27,7 +27,7 @@ function Escape-ShSingleQuoted {
     return $Value.Replace("'", "'""'""'")
 }
 
-$args = @("-m", "hermes_cli.routing_auto_update", "install", "--repo-root", $RepoRoot)
+$args = @("-m", "hermes_cli.main", "routing", "update", "install", "--repo-root", $RepoRoot)
 if ($Json) {
     $args += "--json"
 }
@@ -35,7 +35,7 @@ if ($Json) {
 $repoWsl = Convert-ToWslPathInfo $RepoRoot
 if ($repoWsl) {
     $repoLinux = Escape-ShSingleQuoted $repoWsl.LinuxPath
-    $command = "cd '$repoLinux' && if [ -x venv/bin/python ]; then venv/bin/python -m hermes_cli.routing_auto_update install --repo-root '$repoLinux'; else python3 -m hermes_cli.routing_auto_update install --repo-root '$repoLinux'; fi"
+    $command = "cd '$repoLinux' && if [ -x venv/bin/python ]; then venv/bin/python -m hermes_cli.main routing update install --repo-root '$repoLinux'; else python3 -m hermes_cli.main routing update install --repo-root '$repoLinux'; fi"
     if ($Json) {
         $command = $command -replace '; else', " --json; else"
     }
