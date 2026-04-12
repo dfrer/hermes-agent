@@ -813,6 +813,7 @@ class TestProfileRestoration:
         # Mock the wrapper dir to be inside tmp_path
         wrapper_dir = tmp_path / ".local" / "bin"
         wrapper_dir.mkdir(parents=True)
+        monkeypatch.setenv("PATH", str(wrapper_dir))
 
         zip_path = tmp_path / "backup.zip"
         self._make_backup_zip(zip_path, {
@@ -848,6 +849,7 @@ class TestProfileRestoration:
 
         wrapper_dir = tmp_path / ".local" / "bin"
         wrapper_dir.mkdir(parents=True)
+        monkeypatch.setenv("PATH", str(wrapper_dir))
 
         zip_path = tmp_path / "backup.zip"
         self._make_backup_zip(zip_path, {
