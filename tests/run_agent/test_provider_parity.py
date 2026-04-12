@@ -44,11 +44,19 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="https://openrouter.ai/api/v1"):
+def _make_agent(
+    monkeypatch,
+    provider,
+    api_mode="chat_completions",
+    base_url="https://openrouter.ai/api/v1",
+    model=None,
+):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
-    return AIAgent(
+    if model is None and provider == "ai-gateway":
+        model = "google/gemini-2.5-pro"
+    kwargs = dict(
         api_key="test-key",
         base_url=base_url,
         provider=provider,
@@ -57,6 +65,11 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
+    )
+    if model is not None:
+        kwargs["model"] = model
+    return AIAgent(
+        **kwargs,
     )
 
 

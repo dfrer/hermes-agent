@@ -4250,14 +4250,40 @@ class AIAgent:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
-        if isinstance(primary_client, Mock):
+        if self._should_reuse_primary_openai_client(primary_client):
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._openai_client_lock():
+            if client is getattr(self, "client", None):
+                return
         self._close_openai_client(client, reason=reason, shared=False)
+
+    @staticmethod
+    def _should_reuse_primary_openai_client(client: Any) -> bool:
+        """Reuse lifecycle-less synthetic clients instead of cloning per request.
+
+        Real OpenAI SDK clients expose close/is_closed and usually wrap an
+        underlying httpx client on ``._client``. Lightweight test doubles often
+        omit that lifecycle surface entirely; cloning them per request resets
+        their scripted response state and breaks conversation-loop tests.
+        """
+        from unittest.mock import Mock
+
+        if isinstance(client, Mock):
+            return True
+        if client is None:
+            return False
+        if getattr(client, "_client", None) is not None:
+            return False
+        if getattr(client, "is_closed", None) is not None:
+            return False
+        if callable(getattr(client, "close", None)):
+            return False
+        return True
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
@@ -8234,8 +8260,9 @@ class AIAgent:
                         # No display/TTS consumer. Still prefer streaming for
                         # health checking, but skip for Mock clients in tests
                         # (mocks return SimpleNamespace, not stream iterators).
-                        from unittest.mock import Mock
-                        if isinstance(getattr(self, "client", None), Mock):
+                        if self._should_reuse_primary_openai_client(
+                            getattr(self, "client", None)
+                        ):
                             _use_streaming = False
 
                     if _use_streaming:
