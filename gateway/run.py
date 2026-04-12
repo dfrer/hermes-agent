@@ -917,6 +917,12 @@ class GatewayRunner:
             adapter.fatal_error_code or "unknown",
             adapter.fatal_error_message or "unknown error",
         )
+        self._update_platform_runtime_status(
+            adapter.platform.value,
+            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            error_code=adapter.fatal_error_code,
+            error_message=adapter.fatal_error_message,
+        )
 
         existing = self.adapters.get(adapter.platform)
         if existing is adapter:
@@ -991,6 +997,25 @@ class GatewayRunner:
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._running_agent_count(),
+            )
+        except Exception:
+            pass
+
+    def _update_platform_runtime_status(
+        self,
+        platform: str,
+        *,
+        platform_state: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(
+                platform=platform,
+                platform_state=platform_state,
+                error_code=error_code,
+                error_message=error_message,
             )
         except Exception:
             pass
@@ -1498,16 +1523,34 @@ class GatewayRunner:
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="connecting",
+                error_code=None,
+                error_message=None,
+            )
             try:
                 success = await adapter.connect()
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="connected",
+                        error_code=None,
+                        error_message=None,
+                    )
                     logger.info("✓ %s connected", platform.value)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     if adapter.has_fatal_error:
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+                            error_code=adapter.fatal_error_code,
+                            error_message=adapter.fatal_error_message,
+                        )
                         target = (
                             startup_retryable_errors
                             if adapter.fatal_error_retryable
@@ -1524,6 +1567,12 @@ class GatewayRunner:
                                 "next_retry": time.monotonic() + 30,
                             }
                     else:
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying",
+                            error_code=None,
+                            error_message="failed to connect",
+                        )
                         startup_retryable_errors.append(
                             f"{platform.value}: failed to connect"
                         )
@@ -1535,6 +1584,12 @@ class GatewayRunner:
                         }
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="retrying",
+                    error_code=None,
+                    error_message=str(e),
+                )
                 startup_retryable_errors.append(f"{platform.value}: {e}")
                 # Unexpected exceptions are typically transient — queue for retry
                 self._failed_platforms[platform] = {
@@ -1813,6 +1868,12 @@ class GatewayRunner:
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="connected",
+                            error_code=None,
+                            error_message=None,
+                        )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -1824,12 +1885,24 @@ class GatewayRunner:
                     else:
                         # Check if the failure is non-retryable
                         if adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="fatal",
+                                error_code=adapter.fatal_error_code,
+                                error_message=adapter.fatal_error_message,
+                            )
                             logger.warning(
                                 "Reconnect %s: non-retryable error (%s), removing from retry queue",
                                 platform.value, adapter.fatal_error_message,
                             )
                             del self._failed_platforms[platform]
                         else:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="retrying",
+                                error_code=adapter.fatal_error_code,
+                                error_message=adapter.fatal_error_message or "failed to reconnect",
+                            )
                             backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                             info["attempts"] = attempt
                             info["next_retry"] = time.monotonic() + backoff
@@ -1838,6 +1911,12 @@ class GatewayRunner:
                                 platform.value, backoff,
                             )
                 except Exception as e:
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="retrying",
+                        error_code=None,
+                        error_message=str(e),
+                    )
                     backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
@@ -5644,13 +5723,21 @@ class GatewayRunner:
             return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Handle /compress command -- manually compress conversation context."""
+        """Handle /compress command -- manually compress conversation context.
+
+        Accepts an optional focus topic: ``/compress <focus>`` guides the
+        summariser to preserve information related to *focus* while being
+        more aggressive about discarding everything else.
+        """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
+
+        # Extract optional focus topic from command args
+        focus_topic = (event.get_command_args() or "").strip() or None
 
         try:
             from run_agent import AIAgent
@@ -5693,7 +5780,7 @@ class GatewayRunner:
             loop = asyncio.get_event_loop()
             compressed, _ = await loop.run_in_executor(
                 None,
-                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens)
+                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
             )
 
             # _compress_context already calls end_session() on the old session
@@ -5717,7 +5804,10 @@ class GatewayRunner:
                 approx_tokens,
                 new_tokens,
             )
-            lines = [f"🗜️ {summary['headline']}", summary["token_line"]]
+            lines = [f"🗜️ {summary['headline']}"]
+            if focus_topic:
+                lines.append(f"Focus: \"{focus_topic}\"")
+            lines.append(summary["token_line"])
             if summary["note"]:
                 lines.append(summary["note"])
             return "\n".join(lines)
@@ -8539,6 +8629,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # verbosity=1    (-v):         INFO and above
     # verbosity=2+   (-vv/-vvv):   DEBUG
     if verbosity is not None:
+        from agent.redact import RedactingFormatter
+
         _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
         _stderr_handler = logging.StreamHandler()
         _stderr_handler.setLevel(_stderr_level)
