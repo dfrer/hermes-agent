@@ -382,7 +382,6 @@ class TestStubSchemaDrift(unittest.TestCase):
     # Parameters intentionally blocked in the sandbox
     _BLOCKED_TERMINAL_PARAMS = {
         "background",
-        "check_interval",
         "pty",
         "notify_on_complete",
         "watch_patterns",
