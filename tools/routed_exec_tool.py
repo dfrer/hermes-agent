@@ -19,6 +19,7 @@ from agent.entitlements import build_effective_route_plan
 from agent.redact import redact_sensitive_text
 from agent.routing_guard import (
     _classify_routed_failure_kind,
+    record_custom_system_issue,
     get_ability_handoff,
     get_routed_execution_plan,
     get_routing_decision,
@@ -702,6 +703,15 @@ def execute_routed_context(
         plan,
     )
     if entitlement_error:
+        if task_id:
+            record_custom_system_issue(
+                task_id,
+                component="routed_exec",
+                code="entitlement_blocked",
+                summary="Routed execution was blocked by entitlement policy before any executor was launched.",
+                detail=str(entitlement_metadata.get("failure_reason") or "approval_required"),
+                severity="warning",
+            )
         selected_route = get_selected_route(task_id) if task_id else dict(selected_route or {})
         return {
             "success": False,
@@ -741,6 +751,15 @@ def execute_routed_context(
         }
     plan = effective_plan
     if not plan:
+        if task_id:
+            record_custom_system_issue(
+                task_id,
+                component="routed_exec",
+                code="no_entitlement_approved_target",
+                summary="Routed execution had no entitlement-approved route target to run.",
+                detail=str(entitlement_metadata.get("failure_reason") or "locked_paid_spend"),
+                severity="warning",
+            )
         selected_route = get_selected_route(task_id) if task_id else dict(selected_route or {})
         failure_reason = str(entitlement_metadata.get("failure_reason") or "locked_paid_spend")
         return {
@@ -782,6 +801,15 @@ def execute_routed_context(
 
     workdir_info = _resolve_host_workdir(workdir)
     if not workdir_info:
+        if task_id:
+            record_custom_system_issue(
+                task_id,
+                component="routed_exec",
+                code="workdir_resolution_failed",
+                summary="Routed execution could not resolve the requested workdir on the current host.",
+                detail=str(workdir or ""),
+                severity="warning",
+            )
         return {
             "success": False,
             "error": (
@@ -871,6 +899,22 @@ def execute_routed_context(
     final_output_path = final_attempt.get("output_path") if final_attempt else ""
     final_failure_kind = final_attempt.get("failure_kind") if final_attempt else ""
     failure_reason = str(entitlement_metadata.get("failure_reason") or "")
+    if task_id and not success:
+        record_custom_system_issue(
+            task_id,
+            component="routed_exec",
+            code="execution_failed",
+            summary=(
+                f"All routed execution attempts failed for "
+                f"{decision.get('tier')}/{decision.get('path')}."
+            ),
+            detail=(
+                failure_reason
+                or str(final_failure_kind or "")
+                or ", ".join(str(item.get("kind") or "") for item in attempts if isinstance(item, dict))
+            ),
+            severity="warning",
+        )
     return {
         "success": success,
         "tier": decision.get("tier"),
@@ -931,10 +975,25 @@ def routed_exec_tool(
 
     decision = get_routing_decision(task_id)
     if not decision:
+        if task_id:
+            record_custom_system_issue(
+                task_id,
+                component="routed_exec",
+                code="missing_routing_decision",
+                summary="routed_exec was called before an active routing decision was recorded for the task.",
+                severity="warning",
+            )
         return tool_error("No active routing decision for this task. Emit the routing line first.")
 
     plan = get_routed_execution_plan(task_id)
     if not plan:
+        record_custom_system_issue(
+            task_id,
+            component="routed_exec",
+            code="missing_execution_plan",
+            summary="routed_exec was called but no routed execution plan was available for the current task.",
+            severity="warning",
+        )
         return tool_error("No routed execution plan is available for the current task.")
 
     result = execute_routed_context(

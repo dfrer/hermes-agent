@@ -301,6 +301,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- For UI, web, screenshot, canvas, layout, responsive, game, or visual QA work, use `ability_context` with the visual lane before routed implementation and again after a routed fix for final visual verification; use direct `visual_context` only when you need a narrower visual scout.\n"
     "- For CPU, memory, stutter, hangs, dev-server, docs/current facts, security, large logs/data, or media tasks, use `ability_context` to gather a bounded runtime/environment/docs/security/data_logs/audio_video preflight packet before strong claims or routed implementation.\n"
     "- For local file/localhost visual previews, use a local browser backend; if browser SSRF protection blocks a local URL, do not keep retrying equivalent local URL forms.\n"
+    "- For static local files, prefer `browser_navigate` with a `file:///absolute/path/...` URL. If you need a preview server, bind it to localhost explicitly, e.g. `python3 -m http.server 8765 --bind 127.0.0.1` or `npx http-server -a 127.0.0.1`.\n"
     "- For animated, WebGL, video, or otherwise expensive local pages, prefer `ability_context`/`visual_context` with `cleanup_policy=\"auto\"` or `cleanup_after=true`, or call `browser_close` immediately after `browser_vision` so the page does not keep consuming CPU/GPU.\n"
     "- If a routing decision has already been emitted for the current coding task, keep that route stable.\n"
     "- Do not silently change from `3A` to `3B`/`3C` or vice versa during ordinary investigation.\n"

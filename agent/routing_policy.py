@@ -134,7 +134,7 @@ DEFAULT_ROUTE_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     "3C": {
         "quick-edit": {
             "primary": "hermes_minimax_m27",
-            "fallbacks": ["codex_gpt54mini"],
+            "fallbacks": [],
             "default_timeout": 300,
         }
     },

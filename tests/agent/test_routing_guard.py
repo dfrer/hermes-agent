@@ -4,9 +4,11 @@ import json
 
 from agent.routing_guard import (
     activate_for_task,
+    build_custom_system_issue_report,
     deactivate_for_task,
     final_response_block_reason,
     get_active_skill_hints,
+    get_custom_system_issues,
     get_routed_execution_plan,
     get_routing_decision,
     get_routing_status_snapshot,
@@ -419,7 +421,7 @@ def test_allows_routed_plan_after_memory_loss_when_persisted_plan_exists(tmp_pat
     decision = {
         "tier": "3C",
         "path": "quick-edit",
-        "model": "Codex CLI (gpt-5.4-mini)",
+        "model": "Hermes CLI (MiniMax-M2.7 via minimax)",
         "reason": "resume persisted plan",
         "confidence": "high",
     }
@@ -433,7 +435,7 @@ def test_allows_routed_plan_after_memory_loss_when_persisted_plan_exists(tmp_pat
                 "goal": "resume",
                 "tier": "3C",
                 "path": "quick-edit",
-                "model": "Codex CLI (gpt-5.4-mini)",
+                "model": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "workdir": str(tmp_path),
                 "write_scope": ["src/a.py"],
                 "depends_on": [],
@@ -595,7 +597,6 @@ def test_records_quick_edit_route_for_minimax_primary():
         assert decision["path"] == "quick-edit"
         assert _plan_kind_labels(task_id) == [
             {"kind": "hermes_minimax_m27", "label": "Hermes CLI (MiniMax-M2.7 via minimax)"},
-            {"kind": "codex_gpt54mini", "label": "Codex CLI (gpt-5.4-mini)"},
         ]
     finally:
         deactivate_for_task(task_id)
@@ -706,7 +707,7 @@ def test_allows_local_visual_preview_command_before_route_lock():
             task_id,
         )
         assert blocked is not None
-        assert "localhost-only visual preview commands" in blocked
+        assert "local preview servers must bind to localhost only" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -928,7 +929,7 @@ def test_records_local_verification_attempts():
     try:
         record_routing_decision(
             task_id,
-            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small fix | CONFIDENCE: high",
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small fix | CONFIDENCE: high",
             session_id="session-terminal-verification-record",
         )
         record_tool_result(
@@ -1094,7 +1095,7 @@ def test_invalid_route_model_label_blocks_follow_on_tool_use():
         )
         assert blocked is not None
         assert "invalid routing decision" in blocked
-        assert "`Codex CLI (gpt-5.4-mini)`" in blocked
+        assert "`Hermes CLI (MiniMax-M2.7 via minimax)`" in blocked
     finally:
         deactivate_for_task(task_id)
 
@@ -1278,6 +1279,30 @@ def test_allows_local_visual_preview_command_after_route_lock():
         deactivate_for_task(task_id)
 
 
+def test_blocks_unbound_local_visual_preview_command_with_specific_guidance():
+    task_id = "task-routing-local-preview-missing-bind"
+    activate_for_task(task_id, session_id="session-local-preview-missing-bind", skills=["routing-layer"])
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope fix | CONFIDENCE: high",
+            session_id="session-local-preview-missing-bind",
+        )
+        blocked = pre_tool_call_block_reason(
+            "terminal",
+            {
+                "command": "cd /home/hunter/matrix-glitch && python3 -m http.server 8765 &",
+            },
+            task_id,
+        )
+        assert blocked is not None
+        assert "blocked visual preview through `terminal`" in blocked
+        assert "--bind 127.0.0.1" in blocked
+        assert "browser_navigate" in blocked
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_blocks_routed_codex_cat_substitution_prompt_shape():
     task_id = "task-routing-codex-cat-substitution"
     activate_for_task(task_id, session_id="session-codex-cat", skills=["routing-layer"])
@@ -1341,7 +1366,7 @@ def test_allows_git_commit_and_push_when_user_explicitly_requests_it():
     try:
         record_routing_decision(
             task_id,
-            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small fix | CONFIDENCE: high",
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small fix | CONFIDENCE: high",
             session_id="session-git-allowed",
         )
         assert pre_tool_call_block_reason(
@@ -1369,7 +1394,7 @@ def test_activate_for_task_refreshes_git_permissions_and_preserves_live_route():
     try:
         assert record_routing_decision(
             task_id,
-            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small fix | CONFIDENCE: high",
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small fix | CONFIDENCE: high",
             session_id="session-routing-refresh-git",
         )
         activate_for_task(
@@ -1433,6 +1458,54 @@ def test_repeated_terminal_block_escalates_after_second_attempt():
         deactivate_for_task(task_id)
 
 
+def test_repeated_terminal_block_records_custom_system_issue_report():
+    task_id = "task-routing-repeated-terminal-issue-report"
+    activate_for_task(task_id, session_id="session-repeated-terminal-issue-report", skills=["routing-layer"])
+    try:
+        pre_tool_call_block_reason(
+            "terminal",
+            {"command": "python scripts/mutate.py"},
+            task_id,
+        )
+        pre_tool_call_block_reason(
+            "terminal",
+            {"command": "python scripts/mutate.py"},
+            task_id,
+        )
+        issues = get_custom_system_issues(task_id)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue["component"] == "routing_guard"
+        assert issue["code"] == "blocked_terminal"
+        assert issue["count"] == 2
+        report = build_custom_system_issue_report(task_id)
+        assert "Custom system notes:" in report
+        assert "`routing_guard` (2x)" in report
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_invalid_routing_decision_records_custom_system_issue_in_snapshot():
+    task_id = "task-routing-invalid-decision-issue"
+    activate_for_task(task_id, session_id="session-invalid-decision-issue", skills=["routing-layer"])
+    try:
+        accepted = record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: stale route | CONFIDENCE: high",
+            session_id="session-invalid-decision-issue",
+        )
+        assert accepted is False
+        snapshot = get_routing_status_snapshot(task_id)
+        assert "blocked invalid routing decision" in str(snapshot["decision_error"])
+        assert "Codex CLI (gpt-5.4-mini)" in str(snapshot["decision_error"])
+        assert len(snapshot["custom_system_issues"]) == 1
+        issue = snapshot["custom_system_issues"][0]
+        assert issue["component"] == "routing_guard"
+        assert issue["code"] == "routing_decision_error"
+    finally:
+        deactivate_for_task(task_id)
+
+
 def test_routing_status_tool_reports_hydrated_persisted_plan(tmp_path):
     from tools.routing_status_tool import routing_status_tool
 
@@ -1443,7 +1516,7 @@ def test_routing_status_tool_reports_hydrated_persisted_plan(tmp_path):
     decision = {
         "tier": "3C",
         "path": "quick-edit",
-        "model": "Codex CLI (gpt-5.4-mini)",
+        "model": "Hermes CLI (MiniMax-M2.7 via minimax)",
         "reason": "resume persisted plan",
         "confidence": "high",
     }
@@ -1457,7 +1530,7 @@ def test_routing_status_tool_reports_hydrated_persisted_plan(tmp_path):
                 "goal": "resume",
                 "tier": "3C",
                 "path": "quick-edit",
-                "model": "Codex CLI (gpt-5.4-mini)",
+                "model": "Hermes CLI (MiniMax-M2.7 via minimax)",
                 "workdir": str(tmp_path),
                 "write_scope": ["src/a.py"],
                 "depends_on": [],
@@ -1509,7 +1582,7 @@ def test_final_response_guard_blocks_fixed_claim_without_verification():
     try:
         assert record_routing_decision(
             task_id,
-            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: targeted fix | CONFIDENCE: high",
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: targeted fix | CONFIDENCE: high",
             session_id="session-routing-final-response-verification",
         )
         record_tool_result(
@@ -1520,7 +1593,7 @@ def test_final_response_guard_blocks_fixed_claim_without_verification():
                 {
                     "success": True,
                     "attempts": [
-                        {"kind": "codex_gpt54mini", "status": "success", "summary": "applied fix"}
+                        {"kind": "hermes_minimax_m27", "status": "success", "summary": "applied fix"}
                     ],
                 }
             ),

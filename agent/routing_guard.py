@@ -36,6 +36,7 @@ from agent.ability_context import (
 DEFAULT_ROUTING_SKILL = "routing-layer"
 
 _TASK_STATE_TTL_SECONDS = 2 * 60 * 60
+_MAX_CUSTOM_SYSTEM_ISSUES = 12
 _ROUTING_DECISION_RE = re.compile(
     r"(?im)^\s*(?:RECLASSIFY:\s*)?TIER:\s*(?P<tier>3A|3B|3C)\b\s*(?:\|\s*PATH:\s*(?P<path>[a-z0-9-]+)\s*)?\|\s*MODEL:\s*(?P<model>[^|]+?)\s*\|\s*REASON:\s*(?P<reason>[^|]+?)\s*\|\s*CONFIDENCE:\s*(?P<confidence>high|medium|low)\s*$"
 )
@@ -521,6 +522,7 @@ def _new_task_state(
         "route_attempts": _initial_route_attempts(),
         "verification_attempts": [],
         "entitlement_approvals": [],
+        "custom_system_issues": [],
         "git_permissions": _derive_git_permissions(user_message),
         "blocked_tool_attempts": {},
         "last_blocked_tool": None,
@@ -531,6 +533,87 @@ def _new_task_state(
 
 def _deep_copy_jsonable(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _normalize_custom_system_issue_text(text: str, *, limit: int = 280) -> str:
+    clean = " ".join(str(text or "").strip().split())
+    if len(clean) <= limit:
+        return clean
+    return f"{clean[: limit - 3].rstrip()}..."
+
+
+def _merge_issue_severity(current: str, incoming: str) -> str:
+    rank = {"info": 0, "warning": 1, "error": 2}
+    normalized_current = str(current or "warning").strip().lower()
+    normalized_incoming = str(incoming or "warning").strip().lower()
+    if normalized_current not in rank:
+        normalized_current = "warning"
+    if normalized_incoming not in rank:
+        normalized_incoming = "warning"
+    return normalized_incoming if rank[normalized_incoming] >= rank[normalized_current] else normalized_current
+
+
+def _record_custom_system_issue_locked(
+    state: dict[str, Any],
+    *,
+    component: str,
+    summary: str,
+    code: str = "",
+    detail: str = "",
+    severity: str = "warning",
+) -> None:
+    normalized_summary = _normalize_custom_system_issue_text(summary)
+    if not normalized_summary:
+        return
+
+    issues = state.setdefault("custom_system_issues", [])
+    if not isinstance(issues, list):
+        issues = []
+        state["custom_system_issues"] = issues
+
+    normalized_component = _normalize_custom_system_issue_text(component or "routing", limit=64) or "routing"
+    normalized_code = _normalize_custom_system_issue_text(code, limit=64).lower()
+    normalized_detail = _normalize_custom_system_issue_text(detail, limit=320)
+    normalized_severity = str(severity or "warning").strip().lower()
+    if normalized_severity not in {"info", "warning", "error"}:
+        normalized_severity = "warning"
+
+    issue_key = (normalized_component.lower(), normalized_code, normalized_summary.lower())
+    now = time.time()
+
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+        existing_key = (
+            str(item.get("component", "")).strip().lower(),
+            str(item.get("code", "")).strip().lower(),
+            str(item.get("summary", "")).strip().lower(),
+        )
+        if existing_key != issue_key:
+            continue
+        item["count"] = int(item.get("count", 1) or 1) + 1
+        item["severity"] = _merge_issue_severity(str(item.get("severity", "warning")), normalized_severity)
+        if normalized_detail:
+            item["detail"] = normalized_detail
+        item["last_seen_at"] = now
+        state["updated_at"] = now
+        return
+
+    issues.append(
+        {
+            "component": normalized_component,
+            "code": normalized_code,
+            "severity": normalized_severity,
+            "summary": normalized_summary,
+            "detail": normalized_detail or None,
+            "count": 1,
+            "first_seen_at": now,
+            "last_seen_at": now,
+        }
+    )
+    if len(issues) > _MAX_CUSTOM_SYSTEM_ISSUES:
+        del issues[:-_MAX_CUSTOM_SYSTEM_ISSUES]
+    state["updated_at"] = now
 
 
 def _refresh_task_state(
@@ -574,6 +657,7 @@ def _refresh_task_state(
         "policy_version",
         "selected_route",
         "entitlement_approvals",
+        "custom_system_issues",
         "routed_mutation_succeeded",
     ):
         if key in existing:
@@ -926,6 +1010,64 @@ def get_selected_route(task_id: str) -> dict[str, Any]:
         return dict(selected)
 
 
+def record_custom_system_issue(
+    task_id: str,
+    *,
+    component: str,
+    summary: str,
+    code: str = "",
+    detail: str = "",
+    severity: str = "warning",
+) -> None:
+    if not task_id:
+        return
+    with _task_state_lock:
+        _purge_expired()
+        state = _task_state.get(task_id)
+        if not isinstance(state, dict):
+            return
+        _record_custom_system_issue_locked(
+            state,
+            component=component,
+            summary=summary,
+            code=code,
+            detail=detail,
+            severity=severity,
+        )
+
+
+def get_custom_system_issues(task_id: str) -> list[dict[str, Any]]:
+    if not task_id:
+        return []
+    with _task_state_lock:
+        _purge_expired()
+        issues = _task_state.get(task_id, {}).get("custom_system_issues")
+        if not isinstance(issues, list):
+            return []
+        return [dict(item) for item in issues if isinstance(item, dict)]
+
+
+def build_custom_system_issue_report(task_id: str, *, max_items: int = 5) -> str:
+    issues = get_custom_system_issues(task_id)
+    if not issues:
+        return ""
+
+    lines = ["Custom system notes:"]
+    for item in issues[-max_items:]:
+        component = str(item.get("component", "routing") or "routing")
+        summary = str(item.get("summary", "") or "").strip()
+        detail = str(item.get("detail", "") or "").strip()
+        count = int(item.get("count", 1) or 1)
+        prefix = f"- `{component}`"
+        if count > 1:
+            prefix += f" ({count}x)"
+        line = f"{prefix}: {summary}"
+        if detail and detail != summary:
+            line += f"; {detail}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def has_task_entitlement_approval(task_id: str, approval_key: str) -> bool:
     if not task_id or not approval_key:
         return False
@@ -1155,6 +1297,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
             "verification_attempts": [],
             "routed_plan": None,
             "selected_route": {},
+            "custom_system_issues": [],
         }
 
     with _task_state_lock:
@@ -1172,6 +1315,7 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
                 "verification_attempts": [],
                 "routed_plan": None,
                 "selected_route": {},
+                "custom_system_issues": [],
             }
         snapshot = {
             "task_id": task_id,
@@ -1197,6 +1341,9 @@ def get_routing_status_snapshot(task_id: str) -> dict[str, Any]:
                 dict(item) for item in state.get("verification_attempts", []) if isinstance(item, dict)
             ],
             "entitlement_approvals": list(state.get("entitlement_approvals") or []),
+            "custom_system_issues": [
+                dict(item) for item in state.get("custom_system_issues", []) if isinstance(item, dict)
+            ],
             "visual_verification_required": bool(state.get("visual_verification_required")),
             "visual_verification_pending": bool(state.get("visual_verification_pending")),
             "routed_mutation_succeeded": bool(state.get("routed_mutation_succeeded")),
@@ -1447,7 +1594,13 @@ def final_response_block_reason(task_id: str, assistant_text: str) -> Optional[s
                     attempts = int(state.get("final_response_guard_attempts") or 0)
                     if attempts < 2:
                         state["final_response_guard_attempts"] = attempts + 1
-                        state["updated_at"] = time.time()
+                        _record_custom_system_issue_locked(
+                            state,
+                            component="routing_guard",
+                            code="visual_verification_gate",
+                            summary="Final response was held until a post-fix visual verification packet or explicit visual blocker was provided.",
+                            severity="warning",
+                        )
                         return (
                             "Routing guard requires a post-fix visual verification packet before a fixed/complete final answer. "
                             "Call `ability_context` with `phase=\"post\"` for the visual lane, or explicitly state that visual "
@@ -1471,7 +1624,13 @@ def final_response_block_reason(task_id: str, assistant_text: str) -> Optional[s
         if completion_attempts >= 2:
             return None
         state["completion_guard_attempts"] = completion_attempts + 1
-        state["updated_at"] = time.time()
+        _record_custom_system_issue_locked(
+            state,
+            component="routing_guard",
+            code="completion_verification_gate",
+            summary="Final response was held until local verification succeeded or the response explicitly described the verification blocker and residual risk.",
+            severity="warning",
+        )
         return (
             "Routing guard requires successful local verification before you claim the task is fixed/resolved/shipped. "
             "Run an approved local verification command, or explicitly state that verification could not be completed and describe the residual risk."
@@ -1562,7 +1721,13 @@ def _format_route_correction_hint(tier: str, path: str, normalized_model: str) -
 
 def _set_decision_error(state: dict[str, Any], message: str) -> None:
     state["decision_error"] = message
-    state["updated_at"] = time.time()
+    _record_custom_system_issue_locked(
+        state,
+        component="routing_guard",
+        code="routing_decision_error",
+        summary=message,
+        severity="warning",
+    )
 
 
 def _get_decision_error(task_id: str) -> Optional[str]:
@@ -1769,6 +1934,7 @@ def _validate_terminal_route_command(command: str, task_id: str) -> Optional[str
 def _record_blocked_tool(task_id: str, tool_name: str, reason: str) -> str:
     if not task_id or not reason:
         return reason
+    count = 1
     with _task_state_lock:
         _purge_expired()
         state = _task_state.get(task_id)
@@ -1782,7 +1948,13 @@ def _record_blocked_tool(task_id: str, tool_name: str, reason: str) -> str:
         attempts[tool_name] = count
         state["last_blocked_tool"] = str(tool_name or "")
         state["last_block_reason"] = str(reason or "")
-        state["updated_at"] = time.time()
+        _record_custom_system_issue_locked(
+            state,
+            component="routing_guard",
+            code=f"blocked_{str(tool_name or 'tool').strip().lower() or 'tool'}",
+            summary=f"{tool_name}: {reason}",
+            severity="warning",
+        )
 
     if count < 2:
         return reason
@@ -2289,6 +2461,79 @@ def _verification_terminal_block_reason(command: str) -> Optional[str]:
     )
 
 
+def _visual_verification_terminal_block_reason(command: str) -> Optional[str]:
+    raw = (command or "").strip()
+    if not raw:
+        return None
+
+    normalized = " ".join(raw.lower().split())
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
+    if _UNSAFE_REDIRECTION_RE.search(normalized) or _VERIFICATION_OUTPUT_PIPE_RE.search(normalized):
+        return None
+    if _classify_visual_verification_command(command) is not None:
+        return None
+
+    parts = _split_shell_segments(normalized, ("&&", ";"))
+    if not parts:
+        return None
+
+    for part in parts:
+        if _is_read_only_terminal_command(part):
+            continue
+        candidate = _normalize_verification_segment(part)
+        try:
+            tokens = shlex.split(candidate)
+        except ValueError:
+            return None
+
+        if len(tokens) >= 4 and tokens[:3] in (["python", "-m", "http.server"], ["python3", "-m", "http.server"]):
+            if "--directory" in tokens or "-d" in tokens:
+                return (
+                    "Routing guard blocked visual preview through `terminal`: local preview servers must stay scoped "
+                    "to the current working tree and bind to localhost only. Use "
+                    "`cd /path/to/project && python3 -m http.server 8765 --bind 127.0.0.1`, or use "
+                    "`browser_navigate` with a `file://` URL for static files."
+                )
+            if "--bind" not in tokens:
+                return (
+                    "Routing guard blocked visual preview through `terminal`: local preview servers must bind to "
+                    "localhost only. Use `python3 -m http.server 8765 --bind 127.0.0.1`, or use "
+                    "`browser_navigate` with a `file://` URL for static files."
+                )
+            bind_index = tokens.index("--bind")
+            host = tokens[bind_index + 1] if bind_index + 1 < len(tokens) else ""
+            if host not in {"127.0.0.1", "localhost", "::1"}:
+                return (
+                    "Routing guard blocked visual preview through `terminal`: local preview servers must bind to "
+                    "localhost only. Use `python3 -m http.server 8765 --bind 127.0.0.1`, or use "
+                    "`browser_navigate` with a `file://` URL for static files."
+                )
+            continue
+
+        if len(tokens) >= 2 and tokens[0] in {"http-server", "npx"}:
+            token_text = " ".join(tokens)
+            if token_text.startswith("npx http-server") or token_text.startswith("http-server"):
+                if "--host" in tokens:
+                    host_index = tokens.index("--host")
+                    host = tokens[host_index + 1] if host_index + 1 < len(tokens) else ""
+                elif "-a" in tokens:
+                    host_index = tokens.index("-a")
+                    host = tokens[host_index + 1] if host_index + 1 < len(tokens) else ""
+                else:
+                    host = ""
+                if host not in {"127.0.0.1", "localhost", "::1"}:
+                    return (
+                        "Routing guard blocked visual preview through `terminal`: local preview servers must bind to "
+                        "localhost only. Use `npx http-server -a 127.0.0.1`, or use "
+                        "`browser_navigate` with a `file://` URL for static files."
+                    )
+                continue
+
+        return None
+
+    return None
+
+
 def _classify_visual_verification_command(command: str) -> Optional[str]:
     raw = (command or "").strip()
     if not raw:
@@ -2653,6 +2898,9 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             verification_issue = _verification_terminal_block_reason(command)
             if verification_issue:
                 return _block(verification_issue)
+            preview_issue = _visual_verification_terminal_block_reason(command)
+            if preview_issue:
+                return _block(preview_issue)
             if _is_verification_terminal_command(command):
                 return None
             if _classify_visual_verification_command(command) is not None:
@@ -2666,6 +2914,9 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             )
         if routed:
             return None
+        preview_issue = _visual_verification_terminal_block_reason(command)
+        if preview_issue:
+            return _block(preview_issue)
         if _classify_visual_verification_command(command) is not None:
             return None
         if _is_read_only_terminal_command(command):

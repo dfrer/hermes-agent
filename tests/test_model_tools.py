@@ -10,6 +10,7 @@ from agent.entitlements import QuotaSnapshot
 from agent.routing_guard import (
     activate_for_task,
     deactivate_for_task,
+    get_custom_system_issues,
     get_verification_attempts,
     record_ability_packet,
     record_routing_decision,
@@ -228,7 +229,7 @@ class TestHandleFunctionCall:
         activate_for_task(task_id, session_id="session-guard-2", skills=["routing-layer"])
         record_routing_decision(
             task_id,
-            "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: trivial rename | CONFIDENCE: high",
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: trivial rename | CONFIDENCE: high",
             session_id="session-guard-2",
         )
         try:
@@ -303,6 +304,40 @@ class TestHandleFunctionCall:
         assert command[:3] == ["codex", "exec", "--skip-git-repo-check"]
         assert command[-1] == "-"
         assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
+    def test_routed_exec_failure_records_custom_system_issue(self, tmp_path):
+        task_id = "guarded-task-routed-exec-failure-issue"
+        activate_for_task(task_id, session_id="session-routed-exec-failure-issue", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped fix | CONFIDENCE: high",
+            session_id="session-routed-exec-failure-issue",
+        )
+        with (
+            patch(
+                "tools.routed_exec_tool.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout="executor failed", stderr=""),
+            ),
+            patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the fix",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+                issues = get_custom_system_issues(task_id)
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is False
+        assert any(item["code"] == "execution_failed" for item in issues)
 
     def test_routed_exec_degrades_3a_to_glm_after_task_scoped_approval(self, tmp_path):
         task_id = "guarded-task-codex-entitlement-downgrade"
@@ -673,7 +708,7 @@ class TestHandleFunctionCall:
         assert (
             record_routing_decision(
                 task_id,
-                "TIER: 3C | MODEL: Codex CLI (gpt-5.4-mini) | REASON: actually smaller | CONFIDENCE: high",
+                "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: actually smaller | CONFIDENCE: high",
                 session_id="session-route-drift",
             )
             is False

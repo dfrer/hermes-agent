@@ -303,6 +303,23 @@ class TestStripThinkBlocks:
         assert "visible" in result
 
 
+class TestAppendCustomSystemIssueFooter:
+    def test_appends_footer_once(self):
+        result = run_agent._append_custom_system_issue_footer(
+            "Work completed.",
+            "Custom system notes:\n- `routing_guard`: blocked a stale route.",
+        )
+        assert result.endswith("Custom system notes:\n- `routing_guard`: blocked a stale route.")
+
+    def test_does_not_duplicate_existing_footer(self):
+        text = "Work completed.\n\nCustom system notes:\n- `routing_guard`: blocked a stale route."
+        result = run_agent._append_custom_system_issue_footer(
+            text,
+            "Custom system notes:\n- `routing_guard`: blocked a stale route.",
+        )
+        assert result == text
+
+
 class TestExtractReasoning:
     def test_reasoning_field(self, agent):
         msg = _mock_assistant_msg(reasoning="thinking hard")

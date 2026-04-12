@@ -31,7 +31,7 @@ def test_config_override_validates_and_applies():
                     "marathon": {"primary": "hermes_glm_zai", "fallbacks": ["codex_gpt54mini"]},
                     "long-context": {"primary": "hermes_nous_mimo_v2_pro", "fallbacks": ["codex_gpt54mini"]},
                 },
-                "3C": {"quick-edit": {"primary": "hermes_minimax_m27", "fallbacks": ["codex_gpt54mini"]}},
+                "3C": {"quick-edit": {"primary": "hermes_minimax_m27", "fallbacks": []}},
             },
         }
     }
@@ -70,7 +70,7 @@ def test_allowed_route_models_come_from_policy():
         "Hermes CLI (MiniMax-M2.7 via minimax)",
     )
     assert "Hermes CLI (glm-5.1 via zai)" in allowed["3B"]
-    assert "Codex CLI (gpt-5.4-mini)" in allowed["3C"]
+    assert allowed["3C"] == ("Hermes CLI (MiniMax-M2.7 via minimax)",)
 
 
 def test_resolve_primary_turn_route_ignores_deprecated_smart_routing():

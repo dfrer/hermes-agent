@@ -167,6 +167,18 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
+def _append_custom_system_issue_footer(text: Optional[str], footer: str) -> str:
+    base = str(text or "").rstrip()
+    note = str(footer or "").strip()
+    if not note:
+        return base
+    if not base:
+        return note
+    if note in base:
+        return base
+    return f"{base}\n\n{note}"
+
+
 class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
@@ -10296,6 +10308,21 @@ class AIAgent:
             if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
                 print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
             final_response = self._handle_max_iterations(messages, api_call_count)
+
+        if _routing_guard_active and final_response:
+            try:
+                from agent.routing_guard import build_custom_system_issue_report
+
+                debug_footer = build_custom_system_issue_report(effective_task_id)
+            except Exception:
+                logger.debug(
+                    "Failed to build custom-system issue footer for task %s",
+                    effective_task_id,
+                    exc_info=True,
+                )
+                debug_footer = ""
+            if debug_footer:
+                final_response = _append_custom_system_issue_footer(final_response, debug_footer)
         
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations

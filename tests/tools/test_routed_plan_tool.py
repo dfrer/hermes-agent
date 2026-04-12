@@ -36,7 +36,7 @@ def _node(
     goal: str = "Apply the scoped fix",
     tier: str = "3C",
     path: str = "quick-edit",
-    model: str = "Codex CLI (gpt-5.4-mini)",
+    model: str = "Hermes CLI (MiniMax-M2.7 via minimax)",
     write_scope: list[str] | None = None,
     depends_on: list[str] | None = None,
     workdir: str = "",
@@ -66,7 +66,7 @@ def test_submit_status_and_reset(tmp_path):
     task_id = "routed-plan-submit"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         submitted = _parse(
@@ -160,7 +160,7 @@ def test_validates_missing_workdir_and_write_scope(tmp_path):
     task_id = "routed-plan-required-fields"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         plan = {
@@ -180,7 +180,7 @@ def test_validates_parent_tier_underrouting(tmp_path):
     task_id = "routed-plan-parent-tier"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         result = _parse(
@@ -349,7 +349,7 @@ def test_persists_submit_status_reset_roundtrip(tmp_path, _routed_plan_store):
     session_id = "session-routed-plan-persist-roundtrip"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         submitted = _parse(
@@ -382,7 +382,7 @@ def test_recovers_interrupted_running_node_from_persistence(tmp_path, _routed_pl
     session_id = "session-routed-plan-running-recovery"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -420,7 +420,7 @@ def test_completed_plan_reloads_from_persistence(tmp_path):
     session_id = "session-routed-plan-completed-reload"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: small scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: small scoped work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -433,7 +433,7 @@ def test_completed_plan_reloads_from_persistence(tmp_path):
             "tools.routed_plan_tool.execute_routed_context",
             return_value={
                 "success": True,
-                "executors_attempted": ["Codex CLI (gpt-5.4-mini)"],
+                "executors_attempted": ["Hermes CLI (MiniMax-M2.7 via minimax)"],
                 "summary": "done",
                 "verification": "ok",
                 "warnings": [],
@@ -455,7 +455,7 @@ def test_completed_plan_reloads_from_persistence(tmp_path):
 def _success_execution(summary: str) -> dict:
     return {
         "success": True,
-        "executors_attempted": ["Codex CLI (gpt-5.4-mini)"],
+        "executors_attempted": ["Hermes CLI (MiniMax-M2.7 via minimax)"],
         "summary": summary,
         "verification": "ok",
         "warnings": [],
@@ -467,7 +467,7 @@ def _success_execution(summary: str) -> dict:
 def _failure_execution(summary: str) -> dict:
     return {
         "success": False,
-        "executors_attempted": ["Codex CLI (gpt-5.4-mini)"],
+        "executors_attempted": ["Hermes CLI (MiniMax-M2.7 via minimax)"],
         "summary": summary,
         "verification": "",
         "warnings": ["failed"],
@@ -482,7 +482,7 @@ def test_run_parallel_uses_ready_disjoint_nodes_and_plan_order(tmp_path, _routed
     session_id = "session-routed-plan-parallel-ready"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: scoped parallel work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped parallel work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -531,7 +531,7 @@ def test_run_parallel_conservatively_skips_conflicting_write_scopes(tmp_path):
     session_id = "session-routed-plan-parallel-conflict"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: scoped parallel work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped parallel work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -575,7 +575,7 @@ def test_run_parallel_persists_lease_and_stops_after_wave_failure(tmp_path, _rou
     session_id = "session-routed-plan-parallel-failure"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: scoped parallel work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped parallel work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -627,7 +627,7 @@ def test_critique_uses_moa_read_only_without_mutating_plan(tmp_path):
     session_id = "session-routed-plan-critique"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool(
@@ -664,7 +664,7 @@ def test_critique_returns_unavailable_without_mutating_plan(tmp_path):
     task_id = "routed-plan-critique-unavailable"
     _activate(
         task_id,
-        "TIER: 3C | PATH: quick-edit | MODEL: Codex CLI (gpt-5.4-mini) | REASON: scoped work | CONFIDENCE: high",
+        "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: scoped work | CONFIDENCE: high",
     )
     try:
         routed_plan_tool("submit", _plan(tmp_path, [_node("a")], plan_id="critique-unavailable"), task_id=task_id)

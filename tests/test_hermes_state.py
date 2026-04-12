@@ -93,7 +93,7 @@ class TestRoutedPlanPersistence:
         decision = {
             "tier": "3C",
             "path": "quick-edit",
-            "model": "Codex CLI (gpt-5.4-mini)",
+            "model": "Hermes CLI (MiniMax-M2.7 via minimax)",
         }
         db.save_routed_plan(
             plan_id="plan-1",
@@ -118,7 +118,7 @@ class TestRoutedPlanPersistence:
         assert db.get_active_routed_plan_for_task("task-1") is None
 
     def test_routed_plan_upsert_preserves_created_at_and_updates_status(self, db):
-        decision = {"tier": "3C", "path": "quick-edit", "model": "Codex CLI (gpt-5.4-mini)"}
+        decision = {"tier": "3C", "path": "quick-edit", "model": "Hermes CLI (MiniMax-M2.7 via minimax)"}
         db.save_routed_plan(
             plan_id="plan-2",
             session_id="session-2",
