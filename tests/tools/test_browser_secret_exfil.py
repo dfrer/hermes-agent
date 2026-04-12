@@ -31,7 +31,14 @@ class TestBrowserSecretExfil:
     def test_allows_normal_url(self):
         """Normal URLs pass the secret check (may fail for other reasons)."""
         from tools.browser_tool import browser_navigate
-        result = browser_navigate("https://github.com/NousResearch/hermes-agent")
+        with patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"bb_session_id": "test", "_first_nav": False},
+        ), patch(
+            "tools.browser_tool._run_browser_command",
+            return_value={"success": False, "error": "browser unavailable"},
+        ):
+            result = browser_navigate("https://github.com/NousResearch/hermes-agent")
         parsed = json.loads(result)
         # Should NOT be blocked by secret detection
         assert "API key or token" not in parsed.get("error", "")

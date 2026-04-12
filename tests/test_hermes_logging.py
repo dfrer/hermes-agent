@@ -13,6 +13,19 @@ import pytest
 import hermes_logging
 
 
+_HERMES_LOGGER_PREFIXES = (
+    "gateway",
+    "tools",
+    "agent",
+    "hermes_cli",
+    "cli",
+    "cron",
+    "run_agent",
+    "model_tools",
+    "batch_runner",
+)
+
+
 @pytest.fixture(autouse=True)
 def _reset_logging_state():
     """Reset the module-level sentinel and clean up root logger handlers
@@ -35,6 +48,26 @@ def _reset_logging_state():
             h.close()
         else:
             pre_existing.append(h)
+    # Reset non-root Hermes logger state as well. Other tests in the same
+    # xdist worker can leave propagate=False, custom handlers, or elevated
+    # levels on tools.* / gateway.* loggers, which breaks the assumption that
+    # agent.log remains the catch-all sink in these tests.
+    logger_dict = logging.root.manager.loggerDict
+    for name, logger_obj in list(logger_dict.items()):
+        if not isinstance(logger_obj, logging.Logger):
+            continue
+        if not name.startswith(_HERMES_LOGGER_PREFIXES):
+            continue
+        for handler in list(logger_obj.handlers):
+            logger_obj.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+        logger_obj.filters.clear()
+        logger_obj.propagate = True
+        logger_obj.disabled = False
+        logger_obj.setLevel(logging.NOTSET)
     # Ensure the record factory is installed (it's idempotent).
     hermes_logging._install_session_record_factory()
     yield
