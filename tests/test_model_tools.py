@@ -1,6 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import subprocess
 import time
 from unittest.mock import MagicMock, call, patch
 
@@ -943,6 +944,50 @@ class TestHandleFunctionCall:
         assert "timed out" in (result["failure_guidance"] or "").lower()
         assert result["attempts"][0]["output_excerpt"]
         assert result["attempts"][0]["output_path"]
+
+    def test_routed_exec_accepts_structured_success_from_timeout_output(self, tmp_path):
+        task_id = "guarded-task-routed-timeout-success"
+        activate_for_task(task_id, session_id="session-routed-timeout-success", skills=["routing-layer"])
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | PATH: quick-edit | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: quick edit | CONFIDENCE: high",
+            session_id="session-routed-timeout-success",
+        )
+        timeout_exc = subprocess.TimeoutExpired(
+            cmd=["hermes", "chat"],
+            timeout=300,
+            output=(
+                "partial logs before wrapper timeout\n"
+                'HERMES_ROUTED_RESULT: {"status":"success","summary":"done","verification":"ok","warnings":[]}\n'
+            ),
+            stderr="",
+        )
+        with (
+            patch("tools.routed_exec_tool.subprocess.run", side_effect=timeout_exc),
+            patch("tools.routed_exec_tool._find_executable", return_value="hermes"),
+            patch("hermes_cli.plugins.invoke_hook"),
+        ):
+            try:
+                result = json.loads(
+                    handle_function_call(
+                        "routed_exec",
+                        {
+                            "task": "Apply the quick edit",
+                            "workdir": str(tmp_path),
+                        },
+                        task_id=task_id,
+                    )
+                )
+            finally:
+                deactivate_for_task(task_id)
+
+        assert result["success"] is True
+        assert len(result["attempts"]) == 1
+        assert result["attempts"][0]["exit_code"] == 124
+        assert result["attempts"][0]["failed"] is False
+        assert "timeout_after_success" in result["attempts"][0]["warning_kinds"]
+        assert result["summary"] == "done"
+        assert result["verification"] == "ok"
 
     def test_routed_exec_explicit_timeout_overrides_route_default(self, tmp_path):
         task_id = "guarded-task-routed-timeout-override"

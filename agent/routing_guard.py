@@ -2370,7 +2370,9 @@ def _is_non_coding_discovery_terminal_command(command: str) -> bool:
     if len(commands) != 1:
         return False
 
-    part = commands[0]
+    part = _normalize_verification_segment(commands[0])
+    if not part:
+        return False
     if any(marker in part for marker in _TERMINAL_MUTATION_MARKERS):
         return False
     if _classify_routed_terminal_command(part) is not None:

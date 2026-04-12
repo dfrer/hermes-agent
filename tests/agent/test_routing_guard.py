@@ -1808,6 +1808,18 @@ def test_read_only_non_coding_discovery_stays_local():
             task_id,
             session_id="session-non-coding",
         ) is None, "npx -y mcporter list should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "timeout 30 npx mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "timeout-wrapped npx mcporter list should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "env NO_COLOR=1 npx mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "env-wrapped npx mcporter list should stay local"
         blocked = pre_tool_call_block_reason(
             "terminal",
             {"command": "mkdir /tmp/mcporter-output"},

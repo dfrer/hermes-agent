@@ -404,7 +404,12 @@ def _finalize_attempt(
     status = "failed"
     failed = True
     failure_kind = ""
-    if timed_out:
+    if structured and str(structured.get("status", "") or "") == "success":
+        status = "success"
+        failed = False
+        if timed_out:
+            warning_kinds.append("timeout_after_success")
+    elif timed_out:
         status = "timeout"
         failure_kind = "timeout"
     elif structured:
