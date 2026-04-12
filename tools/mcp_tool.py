@@ -1934,7 +1934,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
-    _run_on_mcp_loop(_discover_all(), timeout=120)
+    discover_coro = _discover_all()
+    try:
+        _run_on_mcp_loop(discover_coro, timeout=120)
+    except Exception:
+        discover_coro.close()
+        raise
 
     _sync_mcp_toolsets(list(servers.keys()))
 
@@ -2100,9 +2105,11 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
             return_exceptions=True,
         )
 
+    probe_coro = _probe_all()
     try:
-        _run_on_mcp_loop(_probe_all(), timeout=120)
+        _run_on_mcp_loop(probe_coro, timeout=120)
     except Exception as exc:
+        probe_coro.close()
         logger.debug("MCP probe failed: %s", exc)
     finally:
         _stop_mcp_loop()
