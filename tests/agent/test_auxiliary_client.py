@@ -623,6 +623,7 @@ class TestGetTextAuxiliaryClient:
         monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
 
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
              patch("agent.auxiliary_client._read_codex_access_token", return_value=None), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
@@ -674,6 +675,7 @@ class TestGetTextAuxiliaryClient:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
              patch("agent.auxiliary_client._read_codex_access_token", return_value=None), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
@@ -1044,6 +1046,7 @@ class TestResolveForcedProvider:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
         monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
              patch("agent.auxiliary_client._read_codex_access_token", return_value=None), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
@@ -1090,7 +1093,8 @@ class TestResolveForcedProvider:
         assert model == "gpt-5.2-codex"
 
     def test_forced_codex_no_token(self, monkeypatch):
-        with patch("agent.auxiliary_client._read_codex_access_token", return_value=None):
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("agent.auxiliary_client._read_codex_access_token", return_value=None):
             client, model = _resolve_forced_provider("codex")
         assert client is None
         assert model is None
