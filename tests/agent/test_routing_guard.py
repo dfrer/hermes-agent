@@ -1790,6 +1790,24 @@ def test_read_only_non_coding_discovery_stays_local():
             task_id,
             session_id="session-non-coding",
         ) is None, "mcporter inspect-cli should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "npx mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "npx mcporter list (no -y/--yes) should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "npx --yes mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "npx --yes mcporter list should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "npx -y mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "npx -y mcporter list should stay local"
         blocked = pre_tool_call_block_reason(
             "terminal",
             {"command": "mkdir /tmp/mcporter-output"},

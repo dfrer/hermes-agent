@@ -67,7 +67,7 @@ _CODEX_EXEC_RE = re.compile(r"(?i)\bcodex\s+exec\b")
 _CODEX_GPT54_MINI_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4-mini\b")
 _CODEX_GPT54_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4\b")
 _MCPORTER_DISCOVERY_RE = re.compile(
-    r"(?i)^(?:npx\s+(?:--yes|-y)\s+)?mcporter\s+(?:list|inspect-cli|schema)\b"
+    r"(?i)^(?:npx\s+(?:(?:-y|--yes)\s+)?)?mcporter\s+(?:list|inspect-cli|schema)\b"
 )
 _ROUTED_MODEL_OUTPUT_PIPE_RE = re.compile(
     r"(?is)\b(?:hermes\s+chat|codex\s+exec)\b.*\|\s*(?:tail|head|select-object\b)"
@@ -2997,6 +2997,11 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
         if _classify_visual_verification_command(command) is not None:
             return None
         if _is_read_only_terminal_command(command):
+            return None
+        if (
+            get_task_class(task_id) == _TASK_CLASS_NON_CODING
+            and _is_non_coding_discovery_terminal_command(command)
+        ):
             return None
         return _block(
             f"Routing guard blocked `terminal` for task {task_id}: "
