@@ -10,9 +10,13 @@ hide_table_of_contents: true
 
 The self-improving AI agent built by [Nous Research](https://nousresearch.com). The only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, and builds a deepening model of who you are across sessions.
 
+:::info Maintained fork
+This documentation tree belongs to a maintained fork that tracks upstream Hermes while carrying a routing layer, entitlement-aware quota gating, and a routing-aware updater. If you are using this repository directly, start with [Maintained Fork](/docs/getting-started/fork-variant), then read [Fork Architecture](/docs/developer-guide/fork-architecture) and [Fork Maintenance](/docs/developer-guide/fork-maintenance).
+:::
+
 <div style={{display: 'flex', gap: '1rem', marginBottom: '2rem', flexWrap: 'wrap'}}>
   <a href="/docs/getting-started/installation" style={{display: 'inline-block', padding: '0.6rem 1.2rem', backgroundColor: '#FFD700', color: '#07070d', borderRadius: '8px', fontWeight: 600, textDecoration: 'none'}}>Get Started →</a>
-  <a href="https://github.com/NousResearch/hermes-agent" style={{display: 'inline-block', padding: '0.6rem 1.2rem', border: '1px solid rgba(255,215,0,0.2)', borderRadius: '8px', textDecoration: 'none'}}>View on GitHub</a>
+  <a href="https://github.com/dfrer/hermes-agent" style={{display: 'inline-block', padding: '0.6rem 1.2rem', border: '1px solid rgba(255,215,0,0.2)', borderRadius: '8px', textDecoration: 'none'}}>View on GitHub</a>
 </div>
 
 ## What is Hermes Agent?
@@ -25,6 +29,7 @@ It's not a coding copilot tethered to an IDE or a chatbot wrapper around a singl
 |---|---|
 | 🚀 **[Installation](/docs/getting-started/installation)** | Install in 60 seconds on Linux, macOS, or WSL2 |
 | 📖 **[Quickstart Tutorial](/docs/getting-started/quickstart)** | Your first conversation and key features to try |
+| 🌿 **[Maintained Fork](/docs/getting-started/fork-variant)** | What this fork adds on top of upstream Hermes and how to operate it safely |
 | 🗺️ **[Learning Path](/docs/getting-started/learning-path)** | Find the right docs for your experience level |
 | ⚙️ **[Configuration](/docs/user-guide/configuration)** | Config file, providers, models, and options |
 | 💬 **[Messaging Gateway](/docs/user-guide/messaging)** | Set up Telegram, Discord, Slack, or WhatsApp |
@@ -40,6 +45,8 @@ It's not a coding copilot tethered to an IDE or a chatbot wrapper around a singl
 | 🔒 **[Security](/docs/user-guide/security)** | Command approval, authorization, container isolation |
 | 💡 **[Tips & Best Practices](/docs/guides/tips)** | Quick wins to get the most out of Hermes |
 | 🏗️ **[Architecture](/docs/developer-guide/architecture)** | How it works under the hood |
+| 🧭 **[Fork Architecture](/docs/developer-guide/fork-architecture)** | Fork-only routing, entitlement, and maintenance layers |
+| 🔄 **[Fork Maintenance](/docs/developer-guide/fork-maintenance)** | Upstream sync, trust gate, retained worktrees, and promotion flow |
 | ❓ **[FAQ & Troubleshooting](/docs/reference/faq)** | Common questions and solutions |
 
 ## Key Features

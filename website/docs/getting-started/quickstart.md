@@ -14,8 +14,12 @@ Run the one-line installer:
 
 ```bash
 # Linux / macOS / WSL2 / Android (Termux)
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dfrer/hermes-agent/main/scripts/install.sh | bash
 ```
+
+:::info Maintained fork
+This installer targets the promoted `main` branch of this fork. If you want vanilla upstream Hermes instead, use the installer from `NousResearch/hermes-agent`. For the fork-specific topology and updater workflow, see [Maintained Fork](./fork-variant.md).
+:::
 
 :::tip Android / Termux
 If you're installing on a phone, see the dedicated [Termux guide](./termux.md) for the tested manual path, supported extras, and current Android-specific limitations.

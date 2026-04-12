@@ -8,13 +8,21 @@ description: "How to update Hermes Agent to the latest version or uninstall it"
 
 ## Updating
 
-Update to the latest version with a single command:
+For this fork, the canonical update command is:
+
+```bash
+hermes routing update run
+```
+
+Compatibility entrypoint:
 
 ```bash
 hermes update
 ```
 
-This pulls the latest code, updates dependencies, and prompts you to configure any new options that were added since your last update.
+:::info Maintained fork updater
+This repository does not use a plain `git pull` update path as its primary maintenance model. The authoritative updater is the routing-aware workflow, which understands the fork topology, retained repair worktrees, trust gate, and promotion rules. See [Maintained Fork](./fork-variant.md) and [Fork Maintenance](../developer-guide/fork-maintenance.md).
+:::
 
 :::tip
 `hermes update` automatically detects new configuration options and prompts you to add them. If you skipped that prompt, you can manually run `hermes config check` to see missing options, then `hermes config migrate` to interactively add them.
@@ -22,41 +30,46 @@ This pulls the latest code, updates dependencies, and prompts you to configure a
 
 ### What happens during an update
 
-When you run `hermes update`, the following steps occur:
+When you run `hermes routing update run`, the following steps occur:
 
-1. **Git pull** — pulls the latest code from the `main` branch and updates submodules
-2. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
-3. **Config migration** — detects new config options added since your version and prompts you to set them
-4. **Gateway auto-restart** — if the gateway service is running (systemd on Linux, launchd on macOS), it is **automatically restarted** after the update completes so the new code takes effect immediately
+1. **Topology + auth probe** — validates `origin`, `fork`, the live branch, and the active git backend
+2. **Retained worktree prep** — creates or refreshes a retained `codex/upstream-sync-*` worktree for the merge
+3. **Upstream merge** — merges `origin/main` into the retained worktree instead of mutating the live branch directly
+4. **Trust gate** — runs the full xdist pytest gate plus the routing contract script
+5. **Promotion** — only after validation passes, promotes the result to `fork/codex/routing-integration` and `fork/main`
+6. **Report writeout** — stores status, drift, and any repair artifacts under `~/.hermes/cron/output/routing-auto-update/`
 
 Expected output looks like:
 
 ```
-$ hermes update
-Updating Hermes Agent...
-📥 Pulling latest code...
-Already up to date.  (or: Updating abc1234..def5678)
-📦 Updating dependencies...
-✅ Dependencies updated
-🔍 Checking for new config options...
-✅ Config is up to date  (or: Found 2 new options — running migration...)
-🔄 Restarting gateway service...
-✅ Gateway restarted
-✅ Hermes Agent updated successfully!
+$ hermes routing update run
+# Routing Auto Update: updated
+- Message: Applied upstream changes, passed the trust gate, and promoted fork integration + main.
 ```
+
+### Status, health, and finalize
+
+```bash
+hermes routing update status
+hermes routing update doctor
+hermes routing update finalize
+```
+
+- `status` shows the last updater result, branch drift, auth backend, and job state
+- `doctor` checks whether the updater environment is healthy before you run it
+- `finalize` resumes from a retained repair worktree after a manual fix
 
 ### Recommended Post-Update Validation
 
-`hermes update` handles the main update path, but a quick validation confirms everything landed cleanly:
+The routing updater handles the full maintenance path, but a quick post-update check is still useful:
 
 1. `git status --short` — if the tree is unexpectedly dirty, inspect before continuing
-2. `hermes doctor` — checks config, dependencies, and service health
-3. `hermes --version` — confirm the version bumped as expected
+2. `hermes routing update status` — confirm the last run is `updated`
+3. `hermes doctor` — checks config, dependencies, and service health
 4. If you use the gateway: `hermes gateway status`
-5. If `doctor` reports npm audit issues: run `npm audit fix` in the flagged directory
 
 :::warning Dirty working tree after update
-If `git status --short` shows unexpected changes after `hermes update`, stop and inspect them before continuing. This usually means local modifications were reapplied on top of the updated code, or a dependency step refreshed lockfiles.
+If `git status --short` shows unexpected changes after an updater run, stop and inspect them before continuing. On this fork, the updater expects to own the maintenance flow; a dirty tree usually means local work or a manual change needs to be separated before the next run.
 :::
 
 ### Checking your current version
@@ -65,7 +78,7 @@ If `git status --short` shows unexpected changes after `hermes update`, stop and
 hermes version
 ```
 
-Compare against the latest release at the [GitHub releases page](https://github.com/NousResearch/hermes-agent/releases) or check for available updates:
+Compare against the latest promoted head in your fork or check for available updates:
 
 ```bash
 hermes update --check
@@ -83,24 +96,16 @@ This pulls the latest code, updates dependencies, and restarts the gateway. The 
 
 ### Manual Update
 
-If you installed manually (not via the quick installer):
+If you are doing emergency maintenance and intentionally bypassing the deterministic updater:
 
 ```bash
 cd /path/to/hermes-agent
-export VIRTUAL_ENV="$(pwd)/venv"
-
-# Pull latest code and submodules
-git pull origin main
-git submodule update --init --recursive
-
-# Reinstall (picks up new dependencies)
-uv pip install -e ".[all]"
-uv pip install -e "./tinker-atropos"
-
-# Check for new config options
-hermes config check
-hermes config migrate   # Interactively add any missing options
+git fetch origin --prune
+git fetch fork --prune
+hermes routing update run
 ```
+
+For this fork, manual maintenance should normally mean "invoke the updater and repair the retained worktree if needed," not "replace the updater with a hand-written merge flow."
 
 ### Rollback instructions
 

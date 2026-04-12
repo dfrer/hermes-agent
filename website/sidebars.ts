@@ -9,6 +9,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/fork-variant',
         'getting-started/termux',
         'getting-started/nix-setup',
         'getting-started/updating',
@@ -162,6 +163,8 @@ const sidebars: SidebarsConfig = {
           label: 'Architecture',
           items: [
             'developer-guide/architecture',
+            'developer-guide/fork-architecture',
+            'developer-guide/fork-maintenance',
             'developer-guide/agent-loop',
             'developer-guide/prompt-assembly',
             'developer-guide/context-compression-and-caching',

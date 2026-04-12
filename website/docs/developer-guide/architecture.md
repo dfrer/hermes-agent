@@ -8,6 +8,10 @@ description: "Hermes Agent internals — major subsystems, execution paths, data
 
 This page is the top-level map of Hermes Agent internals. Use it to orient yourself in the codebase, then dive into subsystem-specific docs for implementation details.
 
+:::info Maintained fork
+This repository carries fork-only architecture on top of upstream Hermes, most notably the routing layer, entitlement-aware quota gating, and the routing-aware updater. Read [Fork Architecture](./fork-architecture.md) and [Fork Maintenance](./fork-maintenance.md) if you are working on this fork directly.
+:::
+
 ## System Overview
 
 ```text
@@ -208,6 +212,16 @@ Prompt construction and maintenance across the conversation lifecycle:
 A shared runtime resolver used by CLI, gateway, cron, ACP, and auxiliary calls. Maps `(provider, model)` tuples to `(api_mode, api_key, base_url)`. Handles 18+ providers, OAuth flows, credential pools, and alias resolution.
 
 → [Provider Runtime Resolution](./provider-runtime.md)
+
+### Fork Routing and Maintenance Layers
+
+This fork adds three layers above the upstream provider/tool stack:
+
+- **routing policy + routing guard** for canonical task classification and execution state
+- **entitlements** for quota-aware and spend-aware execution gating
+- **routing-aware updater** for deterministic upstream sync and promotion
+
+→ [Fork Architecture](./fork-architecture.md), [Fork Maintenance](./fork-maintenance.md)
 
 ### Tool System
 

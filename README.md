@@ -15,6 +15,8 @@
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 
+> This repository is a maintained fork of `NousResearch/hermes-agent`, not a plain mirror. It tracks upstream while carrying fork-specific routing, entitlement-aware quota gating, and a deterministic routing-aware updater. If you want the vanilla upstream project, use [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
@@ -30,10 +32,12 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dfrer/hermes-agent/main/scripts/install.sh | bash
 ```
 
 Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the platform-specific setup for you.
+
+This installs the promoted `main` branch of this fork. For baseline upstream Hermes instead, use the upstream installer from `NousResearch/hermes-agent`.
 
 > **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
 >
@@ -58,7 +62,8 @@ hermes config set   # Set individual config values
 hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
 hermes setup        # Run the full setup wizard (configures everything at once)
 hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
-hermes update       # Update to the latest version
+hermes update       # Compatibility entrypoint — may redirect into routing-aware updates
+hermes routing update run  # Canonical updater for this fork
 hermes doctor       # Diagnose any issues
 ```
 
@@ -108,6 +113,18 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 ---
 
+## Fork-Specific Docs
+
+The upstream docs site is still useful for baseline Hermes behavior, but this fork carries additional architecture that is documented in-repo:
+
+- [Maintained Fork](./website/docs/getting-started/fork-variant.md)
+- [Fork Architecture](./website/docs/developer-guide/fork-architecture.md)
+- [Fork Maintenance](./website/docs/developer-guide/fork-maintenance.md)
+
+If you are maintaining this repository directly, start there before assuming the upstream update or execution workflow still applies unchanged.
+
+---
+
 ## Migrating from OpenClaw
 
 If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
@@ -144,7 +161,7 @@ We welcome contributions! See the [Contributing Guide](https://hermes-agent.nous
 Quick start for contributors:
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/dfrer/hermes-agent.git
 cd hermes-agent
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv venv --python 3.11
@@ -165,8 +182,8 @@ python -m pytest tests/ -q
 
 - 💬 [Discord](https://discord.gg/NousResearch)
 - 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 💡 [Discussions](https://github.com/NousResearch/hermes-agent/discussions)
+- 🐛 [Issues](https://github.com/dfrer/hermes-agent/issues)
+- 💡 [Discussions](https://github.com/dfrer/hermes-agent/discussions)
 
 ---
 
