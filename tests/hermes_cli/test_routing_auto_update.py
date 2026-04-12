@@ -496,6 +496,75 @@ def test_finalize_routing_auto_update_refuses_mismatched_retained_worktree(tmp_p
     assert "no longer matches" in report.message.lower()
 
 
+def test_latest_retained_failure_accepts_stale_report_when_retained_head_contains_upstream(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    retained = tmp_path / "retained"
+    retained.mkdir()
+
+    monkeypatch.setattr(
+        rau,
+        "_git_is_ancestor",
+        lambda repo_root_arg, ancestor, descendant: repo_root_arg == retained and ancestor == "new-upstream" and descendant == "HEAD",
+    )
+
+    latest = {
+        "status": "verification_failed",
+        "upstream_head": "old-upstream",
+        "retained_failed_worktree": str(retained),
+        "update_branch": "codex/upstream-sync-1",
+    }
+
+    result = rau._latest_retained_failure(repo_root, latest, "new-upstream")
+
+    assert result is not None
+    assert result["upstream_head"] == "new-upstream"
+    assert result["retained_failed_worktree"] == str(retained)
+    assert result["update_branch"] == "codex/upstream-sync-1"
+
+
+def test_latest_retained_failure_recovers_from_worktree_list_when_latest_report_was_overwritten(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    retained = tmp_path / "retained"
+    retained.mkdir()
+
+    worktree_output = (
+        f"worktree {repo_root}\n"
+        f"HEAD abc123\n"
+        f"branch refs/heads/{rau.LIVE_BRANCH}\n\n"
+        f"worktree {retained}\n"
+        f"HEAD def456\n"
+        f"branch refs/heads/{rau.UPDATE_BRANCH_PREFIX}-123\n"
+    )
+
+    monkeypatch.setattr(
+        rau,
+        "_git_output",
+        lambda repo_root_arg, *args, cwd=None: worktree_output if tuple(args) == ("worktree", "list", "--porcelain") else "",
+    )
+    monkeypatch.setattr(
+        rau,
+        "_git_is_ancestor",
+        lambda repo_root_arg, ancestor, descendant: repo_root_arg == retained and ancestor == "new-upstream" and descendant == "HEAD",
+    )
+
+    latest = {
+        "status": "finalize_failed",
+        "upstream_head": "old-upstream",
+        "retained_failed_worktree": "",
+        "update_worktree": "",
+    }
+
+    result = rau._latest_retained_failure(repo_root, latest, "new-upstream")
+
+    assert result is not None
+    assert result["status"] == "verification_failed"
+    assert result["upstream_head"] == "new-upstream"
+    assert result["retained_failed_worktree"] == str(retained)
+    assert result["update_branch"] == f"{rau.UPDATE_BRANCH_PREFIX}-123"
+
+
 def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)

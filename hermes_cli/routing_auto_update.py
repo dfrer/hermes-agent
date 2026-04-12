@@ -1117,21 +1117,105 @@ def _push_targets(
         report.push_status = "not_needed"
 
 
-def _latest_retained_failure(latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
+def _normalize_retained_failure(latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
     if not latest:
         return None
     status = str(latest.get("status") or "")
-    if status not in {"repair_required", "verification_failed", "ff_failed"}:
+    if status not in {"repair_required", "verification_failed", "ff_failed", "finalize_failed"}:
         return None
-    if str(latest.get("upstream_head") or "") != upstream_head:
-        return None
-    retained = str(latest.get("retained_failed_worktree") or "")
+
+    retained = str(latest.get("retained_failed_worktree") or latest.get("update_worktree") or "")
     if not retained:
         return None
     retained_path = _normalize_path(retained)
     if not retained_path.exists():
         return None
-    return latest
+
+    stored_upstream = str(latest.get("upstream_head") or "")
+    if stored_upstream and stored_upstream != upstream_head and not _git_is_ancestor(retained_path, upstream_head, "HEAD"):
+        return None
+
+    update_branch = str(latest.get("update_branch") or "").strip()
+    if not update_branch:
+        try:
+            update_branch = _git_output(retained_path, "branch", "--show-current", cwd=retained_path).strip()
+        except Exception:
+            update_branch = ""
+    if update_branch and not update_branch.startswith(UPDATE_BRANCH_PREFIX):
+        return None
+
+    normalized = dict(latest)
+    normalized["status"] = status if status in {"repair_required", "verification_failed", "ff_failed"} else "verification_failed"
+    normalized["upstream_head"] = upstream_head
+    normalized["update_worktree"] = str(retained_path)
+    normalized["retained_failed_worktree"] = str(retained_path)
+    if update_branch:
+        normalized["update_branch"] = update_branch
+    return normalized
+
+
+def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: str) -> dict[str, Any] | None:
+    try:
+        raw = _git_output(repo_root, "worktree", "list", "--porcelain")
+    except Exception:
+        return None
+    blocks: list[dict[str, str]] = []
+    block: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal block
+        if block:
+            blocks.append(block)
+        block = {}
+
+    for line in raw.splitlines():
+        if not line.strip():
+            flush()
+            continue
+        key, _, value = line.partition(" ")
+        if key in {"worktree", "branch", "HEAD"}:
+            block[key] = value.strip()
+    flush()
+
+    candidates: list[dict[str, Any]] = []
+    for entry in blocks:
+        worktree_value = entry.get("worktree") or ""
+        if not worktree_value:
+            continue
+        worktree_path = _normalize_path(worktree_value)
+        if worktree_path == repo_root or not worktree_path.exists():
+            continue
+
+        branch_ref = entry.get("branch") or ""
+        branch_name = branch_ref.removeprefix("refs/heads/")
+        if not branch_name.startswith(UPDATE_BRANCH_PREFIX):
+            continue
+
+        if not _git_is_ancestor(worktree_path, upstream_head, "HEAD"):
+            continue
+
+        candidates.append(
+            {
+                "status": "verification_failed",
+                "upstream_head": upstream_head,
+                "update_branch": branch_name,
+                "update_worktree": str(worktree_path),
+                "retained_failed_worktree": str(worktree_path),
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: str(item.get("update_branch") or ""), reverse=True)
+    return candidates[0]
+
+
+def _latest_retained_failure(repo_root: Path, latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
+    retained = _normalize_retained_failure(latest, upstream_head)
+    if retained:
+        return retained
+    return _discover_retained_failure_from_worktrees(repo_root, upstream_head)
 
 
 def _preflight_backend(repo_root: Path, report: UpdateReport) -> tuple[GitBackend | None, GitBackendProbe]:
@@ -1206,7 +1290,7 @@ def _run_state_machine(
     report.main_behind_count = int(drift["main"]["behind"])
     report.main_ahead_count = int(drift["main"]["ahead"])
 
-    retained = _latest_retained_failure(latest_report, report.upstream_head)
+    retained = _latest_retained_failure(repo_root, latest_report, report.upstream_head)
     if retained and not finalize_from_retained:
         report.status = str(retained.get("status") or "repair_required")
         report.message = "A retained maintenance worktree for the current upstream head is still pending repair or finalize."
