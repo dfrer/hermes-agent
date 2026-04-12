@@ -937,23 +937,11 @@ def _is_allowed_docs_text_mutation(mutation: dict[str, Any], task_id: str) -> bo
     targets = mutation.get("targets") or []
     if not targets:
         return False
-
-    skill_globs: list[str] = []
-    for hint in _get_active_skill_hints(task_id):
-        if str(hint.get("task_class", "") or "").strip().lower() != _TASK_CLASS_NON_CODING:
-            continue
-        skill_globs.extend(
-            str(item)
-            for item in (hint.get("non_code_write_globs") or [])
-            if str(item or "").strip()
-        )
-
     for path in targets:
-        if _is_default_docs_authoring_path(path):
-            continue
-        if skill_globs and _matches_non_code_globs(path, skill_globs):
-            continue
-        return False
+        # Large documentation packages should stay local as long as the write
+        # remains plain docs text and is not under a code-sensitive root.
+        if _is_code_sensitive_path(path):
+            return False
     return True
 
 
@@ -1730,6 +1718,54 @@ def _set_decision_error(state: dict[str, Any], message: str) -> None:
     )
 
 
+def _codex_reclassify_block_reason(
+    task_id: str,
+    state: dict[str, Any],
+    *,
+    decision: dict[str, str],
+    profile: Optional[dict[str, Any]],
+) -> Optional[str]:
+    current = state.get("decision") if isinstance(state.get("decision"), dict) else None
+    if not isinstance(current, dict):
+        return None
+    current_key = (current.get("tier"), current.get("path"), current.get("model"))
+    new_key = (decision.get("tier"), decision.get("path"), decision.get("model"))
+    if current_key == new_key:
+        return None
+    if not isinstance(profile, dict):
+        return None
+    primary = profile.get("primary") if isinstance(profile.get("primary"), dict) else {}
+    if str(primary.get("executor", "") or "").strip().lower() != "codex":
+        return None
+
+    selected_route = state.get("selected_route") if isinstance(state.get("selected_route"), dict) else {}
+    entitlement = selected_route.get("entitlement") if isinstance(selected_route.get("entitlement"), dict) else {}
+    evaluations = entitlement.get("evaluations") if isinstance(entitlement.get("evaluations"), list) else []
+    blocked_reason = ""
+    for item in evaluations:
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target") if isinstance(item.get("target"), dict) else {}
+        provider = str(target.get("provider", "") or "").strip().lower()
+        spend_class = str(item.get("spend_class", "") or "").strip().lower()
+        reason = str(item.get("reason", "") or "").strip().lower()
+        if provider != "openai-codex" and spend_class != "openai":
+            continue
+        if reason in {"quota_unknown", "locked_paid_spend", "included_quota_exhausted"}:
+            blocked_reason = reason
+            break
+    if not blocked_reason:
+        return None
+
+    return (
+        f"Routing guard blocked Codex reclassification for task "
+        f"{task_id}: the current route already observed "
+        f"Codex entitlement state `{blocked_reason}`. Do not switch to a Codex-primary route "
+        "hoping a different Codex model or tier will bypass the same quota gate. "
+        "Report fallback chain exhausted or wait for a refreshed Codex quota snapshot."
+    )
+
+
 def _get_decision_error(task_id: str) -> Optional[str]:
     if not task_id:
         return None
@@ -1841,6 +1877,15 @@ def record_routing_decision(task_id: str, assistant_content: str, *, session_id:
                 )
                 return False
             if current_key != new_key:
+                codex_block = _codex_reclassify_block_reason(
+                    task_id,
+                    state,
+                    decision=decision,
+                    profile=profile,
+                )
+                if codex_block:
+                    _set_decision_error(state, codex_block)
+                    return False
                 state["route_attempts"] = _initial_route_attempts()
         state["session_id"] = session_id or state.get("session_id", "")
         state["routed"] = True

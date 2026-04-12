@@ -19,6 +19,7 @@ from agent.routing_guard import (
     has_route_lock,
     pre_tool_call_block_reason,
     record_ability_packet,
+    update_selected_route_entitlement,
     record_tool_result,
     record_routing_decision,
 )
@@ -125,6 +126,25 @@ def test_allows_changelog_edit_before_routing_decision():
             pre_tool_call_block_reason(
                 "write_file",
                 {"path": "/home/hunter/project/CHANGELOG.md", "content": "## 1.2.3\n"},
+                task_id,
+            )
+            is None
+        )
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_allows_large_markdown_package_write_before_routing_decision():
+    task_id = "task-routing-large-doc-package-write"
+    activate_for_task(task_id, session_id="session-large-doc-package-write", skills=["routing-layer"])
+    try:
+        assert (
+            pre_tool_call_block_reason(
+                "write_file",
+                {
+                    "path": "/home/hunter/project/preproduction/phase1/PROJECT_BRIEF.md",
+                    "content": "# Project Brief\n",
+                },
                 task_id,
             )
             is None
@@ -1073,6 +1093,61 @@ def test_explicit_reclassification_updates_route():
         selected = get_selected_route(task_id)
         assert selected["tier"] == "3B"
         assert selected["path"] == "marathon"
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_blocks_reclassify_to_codex_primary_when_codex_is_already_blocked():
+    task_id = "task-routing-reclassify-codex-blocked"
+    activate_for_task(task_id, session_id="session-reclassify-codex-blocked", skills=["routing-layer"])
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3B | MODEL: Hermes CLI (glm-5.1 via zai) | REASON: medium-scope docs package | CONFIDENCE: high",
+            session_id="session-reclassify-codex-blocked",
+        )
+        update_selected_route_entitlement(
+            task_id,
+            entitlement={
+                "failure_reason": "quota_unknown",
+                "evaluations": [
+                    {
+                        "target": {
+                            "kind": "hermes_glm_zai",
+                            "label": "Hermes CLI (glm-5.1 via zai)",
+                            "provider": "zai",
+                        },
+                        "spend_class": "zai",
+                        "allowed": True,
+                        "status": "allowed",
+                        "reason": "allowed",
+                    },
+                    {
+                        "target": {
+                            "kind": "codex_gpt54mini",
+                            "label": "Codex CLI (gpt-5.4-mini)",
+                            "provider": "openai-codex",
+                        },
+                        "spend_class": "openai",
+                        "allowed": False,
+                        "status": "blocked",
+                        "reason": "quota_unknown",
+                    },
+                ],
+            },
+            failure_reason="quota_unknown",
+        )
+
+        accepted = record_routing_decision(
+            task_id,
+            "RECLASSIFY: TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: fallback chain exhausted so maybe Codex full still works | CONFIDENCE: high",
+            session_id="session-reclassify-codex-blocked",
+        )
+        snapshot = get_routing_status_snapshot(task_id)
+
+        assert accepted is False
+        assert "blocked Codex reclassification" in str(snapshot["decision_error"])
+        assert "same quota gate" in str(snapshot["decision_error"])
     finally:
         deactivate_for_task(task_id)
 
