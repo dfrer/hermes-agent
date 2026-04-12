@@ -264,7 +264,9 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with patch("hermes_cli.profiles.check_alias_collision", return_value=None), \
+             patch("hermes_cli.profiles._is_wrapper_dir_in_path", return_value=True):
+            run_import(args)
 
         assert (hermes_home / "config.yaml").read_text() == "model:\n  provider: openrouter\n"
         assert (hermes_home / ".env").read_text() == "OPENROUTER_API_KEY=sk-test\n"
