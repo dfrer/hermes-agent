@@ -1688,3 +1688,116 @@ def test_final_response_guard_blocks_fixed_claim_without_verification():
         assert final_response_block_reason(task_id, "Fixed.") is None
     finally:
         deactivate_for_task(task_id)
+
+
+def test_stale_routed_state_cleared_on_session_id_change():
+    task_id = "task-stale-session-change"
+    activate_for_task(
+        task_id,
+        session_id="session-A",
+        skills=["routing-layer"],
+        user_message="Fix the failing unit test.",
+    )
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3A | MODEL: Codex CLI (gpt-5.4) | REASON: high-risk change | CONFIDENCE: high",
+            session_id="session-A",
+        )
+        assert has_route_lock(task_id)
+
+    finally:
+        pass
+
+    activate_for_task(
+        task_id,
+        session_id="session-B",
+        skills=["routing-layer"],
+        user_message="Unrelated non-coding discovery task.",
+    )
+    try:
+        assert not has_route_lock(task_id), "Stale routed state should be cleared when session_id changes"
+
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_failed_3c_remains_retryable():
+    task_id = "task-3c-retry"
+    activate_for_task(
+        task_id,
+        session_id="session-3c-retry",
+        skills=["routing-layer"],
+        user_message="Quick edit to a file.",
+    )
+    try:
+        assert record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: targeted fix | CONFIDENCE: high",
+            session_id="session-3c-retry",
+        )
+        record_tool_result(
+            task_id,
+            "routed_exec",
+            {"task": "apply fix"},
+            json.dumps(
+                {
+                    "success": False,
+                    "attempts": [
+                        {"kind": "hermes_minimax_m27", "status": "failed", "summary": "timeout"}
+                    ],
+                }
+            ),
+        )
+        plan = get_routed_execution_plan(task_id)
+        assert len(plan) > 0, "Failed 3C route should still return primary (retryable)"
+        assert plan[0]["kind"] == "hermes_minimax_m27"
+
+    finally:
+        deactivate_for_task(task_id)
+
+
+def test_read_only_non_coding_discovery_stays_local():
+    task_id = "task-non-coding-discovery"
+    activate_for_task(
+        task_id,
+        session_id="session-non-coding",
+        skills=["routing-layer"],
+        active_skill_hints=[{"task_class": "non_coding_authoring"}],
+        user_message="Discover MCP servers on this machine.",
+    )
+    try:
+        record_routing_decision(
+            task_id,
+            "TIER: 3C | MODEL: Hermes CLI (MiniMax-M2.7 via minimax) | REASON: quick edit | CONFIDENCE: high",
+            session_id="session-non-coding",
+        )
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "mcporter list"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "Read-only non-coding discovery should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "mcporter list --json"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "mcporter list with output flag should stay local"
+        assert pre_tool_call_block_reason(
+            "terminal",
+            {"command": "mcporter inspect-cli /usr/local/bin/mcporter"},
+            task_id,
+            session_id="session-non-coding",
+        ) is None, "mcporter inspect-cli should stay local"
+        blocked = pre_tool_call_block_reason(
+            "terminal",
+            {"command": "mkdir /tmp/mcporter-output"},
+            task_id,
+            session_id="session-non-coding",
+        )
+        assert blocked is not None
+        assert "native `terminal` execution" in blocked
+
+    finally:
+        deactivate_for_task(task_id)

@@ -66,6 +66,9 @@ _HERMES_NOUS_PROVIDER_RE = re.compile(r"(?i)(?:^|\s)--provider\s+nous\b")
 _CODEX_EXEC_RE = re.compile(r"(?i)\bcodex\s+exec\b")
 _CODEX_GPT54_MINI_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4-mini\b")
 _CODEX_GPT54_RE = re.compile(r"(?i)(?:^|\s)-m\s+gpt-5\.4\b")
+_MCPORTER_DISCOVERY_RE = re.compile(
+    r"(?i)^(?:npx\s+(?:--yes|-y)\s+)?mcporter\s+(?:list|inspect-cli|schema)\b"
+)
 _ROUTED_MODEL_OUTPUT_PIPE_RE = re.compile(
     r"(?is)\b(?:hermes\s+chat|codex\s+exec)\b.*\|\s*(?:tail|head|select-object\b)"
 )
@@ -637,7 +640,10 @@ def _refresh_task_state(
     if not isinstance(existing, dict):
         return refreshed
 
-    preserve_live_route = bool(existing.get("routed")) or isinstance(existing.get("routed_plan"), dict)
+    preserve_live_route = (
+        (bool(existing.get("routed")) or isinstance(existing.get("routed_plan"), dict))
+        and (existing.get("session_id") == session_id)
+    )
     if not preserve_live_route:
         return refreshed
 
@@ -1250,7 +1256,7 @@ def get_routed_execution_plan(task_id: str) -> list[dict[str, str]]:
     primary = dict(profile["primary"])
     fallbacks = [dict(item) for item in profile.get("fallbacks", [])]
     if model == _normalize_route_model(primary["label"]):
-        if attempts.get("primary_failed"):
+        if attempts.get("primary_failed") and fallbacks:
             return fallbacks
         return [primary, *fallbacks]
 
@@ -2351,6 +2357,27 @@ def _is_read_only_terminal_command(command: str) -> bool:
     return True
 
 
+def _is_non_coding_discovery_terminal_command(command: str) -> bool:
+    normalized = " ".join((command or "").strip().lower().split())
+    if not normalized:
+        return False
+
+    normalized = _SAFE_REDIRECTION_RE.sub(" ", normalized)
+    if _UNSAFE_REDIRECTION_RE.search(normalized):
+        return False
+
+    commands = _split_shell_segments(normalized, ("&&", "||", ";", "|"))
+    if len(commands) != 1:
+        return False
+
+    part = commands[0]
+    if any(marker in part for marker in _TERMINAL_MUTATION_MARKERS):
+        return False
+    if _classify_routed_terminal_command(part) is not None:
+        return False
+    return bool(_MCPORTER_DISCOVERY_RE.match(part))
+
+
 def _normalize_verification_segment(segment: str) -> str:
     normalized = " ".join((segment or "").strip().lower().split())
     if not normalized:
@@ -2951,6 +2978,11 @@ def pre_tool_call_block_reason(tool_name: str, args: dict[str, Any], task_id: st
             if _classify_visual_verification_command(command) is not None:
                 return None
             if _is_read_only_terminal_command(command):
+                return None
+            if (
+                get_task_class(task_id) == _TASK_CLASS_NON_CODING
+                and _is_non_coding_discovery_terminal_command(command)
+            ):
                 return None
             return _block(
                 f"Routing guard blocked native `terminal` execution for task {task_id}: "
