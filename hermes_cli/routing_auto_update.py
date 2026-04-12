@@ -1131,10 +1131,6 @@ def _normalize_retained_failure(latest: dict[str, Any], upstream_head: str) -> d
     if not retained_path.exists():
         return None
 
-    stored_upstream = str(latest.get("upstream_head") or "")
-    if stored_upstream and stored_upstream != upstream_head and not _git_is_ancestor(retained_path, upstream_head, "HEAD"):
-        return None
-
     update_branch = str(latest.get("update_branch") or "").strip()
     if not update_branch:
         try:
@@ -1189,9 +1185,6 @@ def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: st
         branch_ref = entry.get("branch") or ""
         branch_name = branch_ref.removeprefix("refs/heads/")
         if not branch_name.startswith(UPDATE_BRANCH_PREFIX):
-            continue
-
-        if not _git_is_ancestor(worktree_path, upstream_head, "HEAD"):
             continue
 
         candidates.append(
@@ -1387,6 +1380,20 @@ def _run_state_machine(
         report.update_branch = update_branch
         report.update_worktree = str(update_worktree)
         report.retained_failed_worktree = str(update_worktree)
+        if not _git_is_ancestor(update_worktree, UPSTREAM_REF, "HEAD"):
+            merge_result = _git(update_worktree, "merge", "--no-ff", UPSTREAM_REF, cwd=update_worktree, check=False)
+            if merge_result.returncode != 0:
+                report.status = "repair_required"
+                stderr = (merge_result.stderr or merge_result.stdout or "").strip() or "manual resolution required"
+                report.message = f"Refreshing the retained update worktree to the latest upstream produced conflicts: {stderr}"
+                conflicted = _git_output(update_worktree, "diff", "--name-only", "--diff-filter=U", cwd=update_worktree).splitlines()
+                report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+                    report_root,
+                    report,
+                    failure_kind="merge_conflict",
+                    changed_paths=[path for path in conflicted if path.strip()],
+                )
+                return report
     else:
         pre_sync = _sync_policy_history(hermes_home)
         pre_sync["phase"] = "pre-update"

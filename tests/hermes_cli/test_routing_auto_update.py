@@ -523,6 +523,27 @@ def test_latest_retained_failure_accepts_stale_report_when_retained_head_contain
     assert result["update_branch"] == "codex/upstream-sync-1"
 
 
+def test_latest_retained_failure_accepts_stale_report_even_when_upstream_advanced(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    retained = tmp_path / "retained"
+    retained.mkdir()
+
+    latest = {
+        "status": "verification_failed",
+        "upstream_head": "old-upstream",
+        "retained_failed_worktree": str(retained),
+        "update_branch": "codex/upstream-sync-2",
+    }
+
+    result = rau._latest_retained_failure(repo_root, latest, "new-upstream")
+
+    assert result is not None
+    assert result["upstream_head"] == "new-upstream"
+    assert result["retained_failed_worktree"] == str(retained)
+    assert result["update_branch"] == "codex/upstream-sync-2"
+
+
 def test_latest_retained_failure_recovers_from_worktree_list_when_latest_report_was_overwritten(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -563,6 +584,97 @@ def test_latest_retained_failure_recovers_from_worktree_list_when_latest_report_
     assert result["upstream_head"] == "new-upstream"
     assert result["retained_failed_worktree"] == str(retained)
     assert result["update_branch"] == f"{rau.UPDATE_BRANCH_PREFIX}-123"
+
+
+def test_finalize_routing_auto_update_refreshes_retained_worktree_when_upstream_has_advanced(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    retained = tmp_path / "retained"
+    retained.mkdir()
+
+    monkeypatch.setattr(
+        rau,
+        "read_latest_update_report",
+        lambda report_root=None: {
+            "status": "verification_failed",
+            "upstream_head": "old-upstream",
+            "retained_failed_worktree": str(retained),
+            "update_branch": "codex/upstream-sync-1",
+            "repo_root": str(repo_root),
+        },
+    )
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (False, False, False))
+    monkeypatch.setattr(rau, "_prune_retention", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH})
+    monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+    monkeypatch.setattr(
+        rau,
+        "_git_output",
+        lambda repo, *args, cwd=None: {
+            ("branch", "--show-current"): rau.LIVE_BRANCH if repo == repo_root else "codex/upstream-sync-1",
+            ("status", "--porcelain"): "",
+            ("diff", "--name-only", f"{rau.LIVE_BRANCH}...HEAD"): "",
+        }.get(tuple(args), ""),
+    )
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_current_ref", lambda repo_root, ref: {"HEAD": "abc123", rau.UPSTREAM_REF: "new-upstream", rau.PUSH_REF: "abc123", rau.MAIN_REF: "abc123"}.get(ref, ""))
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "abc123",
+            "upstream_head": "new-upstream",
+            "integration_head": "abc123",
+            "main_head": "abc123",
+            "upstream": {"behind": 1, "ahead": 0},
+            "integration": {"behind": 0, "ahead": 0},
+            "main": {"behind": 0, "ahead": 0},
+        },
+    )
+
+    def fake_is_ancestor(repo_root_arg, ancestor, descendant):
+        if repo_root_arg == repo_root and (ancestor, descendant) == (rau.UPSTREAM_REF, "HEAD"):
+            return False
+        if repo_root_arg == retained and (ancestor, descendant) == (rau.UPSTREAM_REF, "HEAD"):
+            return False
+        return True
+
+    monkeypatch.setattr(rau, "_git_is_ancestor", fake_is_ancestor)
+
+    recorded = []
+
+    def fake_git(repo_root_arg, *args, cwd=None, check=True):
+        recorded.append((repo_root_arg, args, cwd))
+        if repo_root_arg == retained and args == ("merge", "--no-ff", rau.UPSTREAM_REF):
+            return _ok_completed(args)
+        if repo_root_arg == repo_root and args == ("merge", "--ff-only", "codex/upstream-sync-1"):
+            return _ok_completed(args)
+        return _ok_completed(args)
+
+    monkeypatch.setattr(rau, "_git", fake_git)
+    monkeypatch.setattr(rau, "_run_trust_gate", lambda worktree: ["pytest"])
+    monkeypatch.setattr(rau, "_sync_policy_history", lambda hermes_home: {"status": "noop", "head": ""})
+    monkeypatch.setattr(
+        rau,
+        "_push_targets",
+        lambda repo_root, backend, report, target_head, **kwargs: (
+            setattr(report, "integration_push_status", "ok"),
+            setattr(report, "main_promotion_status", "ok"),
+            setattr(report, "push_status", "ok"),
+            setattr(report, "promoted_head", target_head),
+        ),
+    )
+    monkeypatch.setattr(rau, "_remove_worktree_and_branch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_clear_update_check", lambda hermes_home: None)
+
+    report = rau.finalize_routing_auto_update(repo_root, report_root)
+
+    assert report.status == "updated"
+    assert any(repo == retained and args == ("merge", "--no-ff", rau.UPSTREAM_REF) for repo, args, _ in recorded)
 
 
 def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
