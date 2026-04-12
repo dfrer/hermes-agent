@@ -77,7 +77,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write
+from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -353,19 +353,14 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _dequeue_pending_text(adapter, session_key: str) -> str | None:
-    """Consume and return the text of a pending queued message.
+def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
+    """Consume and return the full pending event for a session.
 
-    Preserves media context for captionless photo/document events by
-    building a placeholder so the message isn't silently dropped.
+    Queued follow-ups must preserve their media metadata so they can re-enter
+    the normal image/STT/document preprocessing path instead of being reduced
+    to a placeholder string.
     """
-    event = adapter.get_pending_message(session_key)
-    if not event:
-        return None
-    text = event.text
-    if not text and getattr(event, "media_urls", None):
-        text = _build_media_placeholder(event)
-    return text
+    return adapter.get_pending_message(session_key)
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -1431,6 +1426,7 @@ class GatewayRunner:
                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
                        "FEISHU_ALLOWED_USERS",
                        "WECOM_ALLOWED_USERS",
+                       "WECOM_CALLBACK_ALLOWED_USERS",
                        "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
@@ -1444,6 +1440,7 @@ class GatewayRunner:
                        "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
                        "FEISHU_ALLOW_ALL_USERS",
                        "WECOM_ALLOW_ALL_USERS",
+                       "WECOM_CALLBACK_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
                        "BLUEBUBBLES_ALLOW_ALL_USERS")
         )
@@ -2048,6 +2045,16 @@ class GatewayRunner:
                 return None
             return FeishuAdapter(config)
 
+        elif platform == Platform.WECOM_CALLBACK:
+            from gateway.platforms.wecom_callback import (
+                WecomCallbackAdapter,
+                check_wecom_callback_requirements,
+            )
+            if not check_wecom_callback_requirements():
+                logger.warning("WeComCallback: aiohttp/httpx not installed")
+                return None
+            return WecomCallbackAdapter(config)
+
         elif platform == Platform.WECOM:
             from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
             if not check_wecom_requirements():
@@ -2137,6 +2144,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
         }
@@ -2153,6 +2161,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
         }
@@ -2781,6 +2790,162 @@ class GatewayRunner:
                 del self._running_agents[_quick_key]
             self._running_agents_ts.pop(_quick_key, None)
 
+    async def _prepare_inbound_message_text(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Prepare inbound event text for the agent.
+
+        Keep the normal inbound path and the queued follow-up path on the same
+        preprocessing pipeline so sender attribution, image enrichment, STT,
+        document notes, reply context, and @ references all behave the same.
+        """
+        history = history or []
+        message_text = event.text or ""
+
+        _is_shared_thread = (
+            source.chat_type != "dm"
+            and source.thread_id
+            and not getattr(self.config, "thread_sessions_per_user", False)
+        )
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
+                    image_paths.append(path)
+                if mtype.startswith("audio/") or event.message_type in (MessageType.VOICE, MessageType.AUDIO):
+                    audio_paths.append(path)
+
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text,
+                    image_paths,
+                )
+
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text,
+                    audio_paths,
+                )
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(marker in message_text for marker in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id,
+                                _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            import mimetypes as _mimetypes
+
+            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if mtype in ("", "application/octet-stream"):
+                    import os as _os2
+
+                    _ext = _os2.path.splitext(path)[1].lower()
+                    if _ext in _TEXT_EXTENSIONS:
+                        mtype = "text/plain"
+                    else:
+                        guessed, _ = _mimetypes.guess_type(path)
+                        if guessed:
+                            mtype = guessed
+                if not mtype.startswith(("application/", "text/")):
+                    continue
+
+                import os as _os
+                import re as _re
+
+                basename = _os.path.basename(path)
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+            reply_snippet = event.reply_to_text[:500]
+            found_in_history = any(
+                reply_snippet[:200] in (msg.get("content") or "")
+                for msg in history
+                if msg.get("role") in ("assistant", "user", "tool")
+            )
+            if not found_in_history:
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+
+        if "@" in message_text:
+            try:
+                from agent.context_references import preprocess_context_references_async
+                from agent.model_metadata import get_model_context_length
+
+                _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                _msg_ctx_len = get_model_context_length(
+                    self._model,
+                    base_url=self._base_url or "",
+                )
+                _ctx_result = await preprocess_context_references_async(
+                    message_text,
+                    cwd=_msg_cwd,
+                    context_length=_msg_ctx_len,
+                    allowed_root=_msg_cwd,
+                )
+                if _ctx_result.blocked:
+                    _adapter = self.adapters.get(source.platform)
+                    if _adapter:
+                        await _adapter.send(
+                            source.chat_id,
+                            "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                        )
+                    return None
+                if _ctx_result.expanded:
+                    message_text = _ctx_result.message
+            except Exception as exc:
+                logger.debug("@ context reference expansion failed: %s", exc)
+
+        return message_text
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -3221,149 +3386,13 @@ class GatewayRunner:
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = event.text or ""
-
-        # -----------------------------------------------------------------
-        # Sender attribution for shared thread sessions.
-        #
-        # When multiple users share a single thread session (the default for
-        # threads), prefix each message with [sender name] so the agent can
-        # tell participants apart.  Skip for DMs (single-user by nature) and
-        # when per-user thread isolation is explicitly enabled.
-        # -----------------------------------------------------------------
-        _is_shared_thread = (
-            source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
+        message_text = await self._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=history,
         )
-        if _is_shared_thread and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
-
-        if event.media_urls:
-            image_paths = []
-            for i, path in enumerate(event.media_urls):
-                # Check media_types if available; otherwise infer from message type
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_image = (
-                    mtype.startswith("image/")
-                    or event.message_type == MessageType.PHOTO
-                )
-                if is_image:
-                    image_paths.append(path)
-            if image_paths:
-                message_text = await self._enrich_message_with_vision(
-                    message_text, image_paths
-                )
-        
-        # -----------------------------------------------------------------
-        # Auto-transcribe voice/audio messages sent by the user
-        # -----------------------------------------------------------------
-        if event.media_urls:
-            audio_paths = []
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_audio = (
-                    mtype.startswith("audio/")
-                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
-                )
-                if is_audio:
-                    audio_paths.append(path)
-            if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text, audio_paths
-                )
-                # If STT failed, send a direct message to the user so they
-                # know voice isn't configured — don't rely on the agent to
-                # relay the error clearly.
-                _stt_fail_markers = (
-                    "No STT provider",
-                    "STT is disabled",
-                    "can't listen",
-                    "VOICE_TOOLS_OPENAI_KEY",
-                )
-                if any(m in message_text for m in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                    if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
-                            )
-                            # Point to setup skill if it's installed
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id, _stt_msg,
-                                metadata=_stt_meta,
-                            )
-                        except Exception:
-                            pass
-
-        # -----------------------------------------------------------------
-        # Enrich document messages with context notes for the agent
-        # -----------------------------------------------------------------
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            import mimetypes as _mimetypes
-            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                # Fall back to extension-based detection when MIME type is unreliable.
-                if mtype in ("", "application/octet-stream"):
-                    import os as _os2
-                    _ext = _os2.path.splitext(path)[1].lower()
-                    if _ext in _TEXT_EXTENSIONS:
-                        mtype = "text/plain"
-                    else:
-                        guessed, _ = _mimetypes.guess_type(path)
-                        if guessed:
-                            mtype = guessed
-                if not mtype.startswith(("application/", "text/")):
-                    continue
-                # Extract display filename by stripping the doc_{uuid12}_ prefix
-                import os as _os
-                basename = _os.path.basename(path)
-                # Format: doc_<12hex>_<original_filename>
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                # Sanitize to prevent prompt injection via filenames
-                import re as _re
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
-                else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
-
-        # -----------------------------------------------------------------
-        # Inject reply context when user replies to a message not in history.
-        # Telegram (and other platforms) let users reply to specific messages,
-        # but if the quoted message is from a previous session, cron delivery,
-        # or background task, the agent has no context about what's being
-        # referenced. Prepend the quoted text so the agent understands. (#1594)
-        # -----------------------------------------------------------------
-        if getattr(event, 'reply_to_text', None) and event.reply_to_message_id:
-            reply_snippet = event.reply_to_text[:500]
-            found_in_history = any(
-                reply_snippet[:200] in (msg.get("content") or "")
-                for msg in history
-                if msg.get("role") in ("assistant", "user", "tool")
-            )
-            if not found_in_history:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+        if message_text is None:
+            return
 
         try:
             # Emit agent:start hook
@@ -3374,30 +3403,6 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
-
-            # Expand @ context references (@file:, @folder:, @diff, etc.)
-            if "@" in message_text:
-                try:
-                    from agent.context_references import preprocess_context_references_async
-                    from agent.model_metadata import get_model_context_length
-                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
-                    _msg_ctx_len = get_model_context_length(
-                        self._model, base_url=self._base_url or "")
-                    _ctx_result = await preprocess_context_references_async(
-                        message_text, cwd=_msg_cwd,
-                        context_length=_msg_ctx_len, allowed_root=_msg_cwd)
-                    if _ctx_result.blocked:
-                        _adapter = self.adapters.get(source.platform)
-                        if _adapter:
-                            await _adapter.send(
-                                source.chat_id,
-                                "\n".join(_ctx_result.warnings) or "Context injection refused.",
-                            )
-                        return
-                    if _ctx_result.expanded:
-                        message_text = _ctx_result.message
-                except Exception as exc:
-                    logger.debug("@ context reference expansion failed: %s", exc)
 
             # Run the agent
             agent_result = await self._run_agent(
@@ -6240,7 +6245,7 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.LOCAL,
     })
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
@@ -6645,6 +6650,7 @@ class GatewayRunner:
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
+            session_key=context.session_key,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -7087,10 +7093,14 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+        display_config = user_config.get("display", {})
+        if not isinstance(display_config, dict):
+            display_config = {}
+
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len
-            _tpl = user_config.get("display", {}).get("tool_preview_length", 0)
+            _tpl = display_config.get("tool_preview_length", 0)
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
         except Exception:
             pass
@@ -7103,11 +7113,12 @@ class GatewayRunner:
         # Per-platform overrides (display.tool_progress_overrides) take
         # priority over the global setting — e.g. Signal users can set
         # tool_progress to "off" while keeping Telegram on "all".
-        _display_cfg = user_config.get("display", {})
-        _overrides = _display_cfg.get("tool_progress_overrides", {})
+        _overrides = display_config.get("tool_progress_overrides", {})
+        if not isinstance(_overrides, dict):
+            _overrides = {}
         _raw_tp = _overrides.get(platform_key)
         if _raw_tp is None:
-            _raw_tp = _display_cfg.get("tool_progress")
+            _raw_tp = display_config.get("tool_progress")
         if _raw_tp is False:
             _raw_tp = "off"
         progress_mode = (
@@ -7119,6 +7130,16 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        # Natural assistant status messages are intentionally independent from
+        # tool progress and token streaming. Users can keep tool_progress quiet
+        # in chat platforms while opting into concise mid-turn updates.
+        interim_assistant_messages_enabled = (
+            source.platform != Platform.WEBHOOK
+            and is_truthy_value(
+                display_config.get("interim_assistant_messages"),
+                default=True,
+            )
+        )
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
@@ -7388,8 +7409,8 @@ class GatewayRunner:
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # Pass session_key to process registry via env var so background
-            # processes can be mapped back to this gateway session
+            # session_key is now set via contextvars in _set_session_env()
+            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
             # Read from env var or use default (same as CLI)
@@ -7463,7 +7484,7 @@ class GatewayRunner:
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            # Set up streaming consumer if enabled
+            # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
@@ -7471,7 +7492,10 @@ class GatewayRunner:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
 
-            if _scfg.enabled and _scfg.transport != "off":
+            _want_stream_deltas = _scfg.enabled and _scfg.transport != "off"
+            _want_interim_messages = interim_assistant_messages_enabled
+            _want_interim_consumer = _want_interim_messages
+            if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
@@ -7487,10 +7511,32 @@ class GatewayRunner:
                             config=_consumer_cfg,
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
                         )
-                        _stream_delta_cb = _stream_consumer.on_delta
+                        if _want_stream_deltas:
+                            _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+
+            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                if _stream_consumer is not None:
+                    if already_streamed:
+                        _stream_consumer.on_segment_break()
+                    else:
+                        _stream_consumer.on_commentary(text)
+                    return
+                if already_streamed or not _status_adapter or not str(text or "").strip():
+                    return
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter.send(
+                            _status_chat_id,
+                            text,
+                            metadata=_status_thread_metadata,
+                        ),
+                        _loop_for_step,
+                    )
+                except Exception as _e:
+                    logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
@@ -7551,6 +7597,7 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
+            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
@@ -7875,6 +7922,7 @@ class GatewayRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "session_id": effective_session_id,
+                "response_previewed": result.get("response_previewed", False),
             }
         
         # Start progress message sender if enabled
@@ -8126,17 +8174,16 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
+            pending_event = None
             pending = None
             if result and adapter and session_key:
-                if result.get("interrupted"):
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if not pending and result.get("interrupt_message"):
-                        pending = result.get("interrupt_message")
-                else:
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if pending:
-                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-            
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                    pending = result.get("interrupt_message")
+                elif pending_event:
+                    pending = pending_event.text or _build_media_placeholder(pending_event)
+                    logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
@@ -8154,27 +8201,29 @@ class GatewayRunner:
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
+                            pending_event = None
                             pending = None
                     except Exception:
                         pass
 
-            if self._draining and pending:
+            if self._draining and (pending_event or pending):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key[:20] if session_key else "?",
                     self._status_action_label(),
                 )
+                pending_event = None
                 pending = None
 
-            if pending:
+            if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
-                
+
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
                 # even makes its first API call (this was causing an infinite loop).
                 if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
                     adapter._active_sessions[session_key].clear()
-                
+
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
                 if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
@@ -8183,9 +8232,10 @@ class GatewayRunner:
                         "queueing message instead of recursing.",
                         _interrupt_depth, session_key,
                     )
-                    # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
-                    if adapter and hasattr(adapter, 'queue_message'):
+                    if adapter and pending_event:
+                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                    elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
@@ -8195,28 +8245,66 @@ class GatewayRunner:
                     # response before processing the queued follow-up.
                     # Skip if streaming already delivered it.
                     _sc = stream_consumer_holder[0]
-                    _already_streamed = _sc and getattr(_sc, "already_sent", False)
+                    if _sc and stream_task:
+                        try:
+                            await asyncio.wait_for(stream_task, timeout=5.0)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            stream_task.cancel()
+                            try:
+                                await stream_task
+                            except asyncio.CancelledError:
+                                pass
+                        except Exception as e:
+                            logger.debug("Stream consumer wait before queued message failed: %s", e)
+                    _response_previewed = bool(result.get("response_previewed"))
+                    _already_streamed = bool(
+                        _sc
+                        and (
+                            getattr(_sc, "final_response_sent", False)
+                            or (
+                                _response_previewed
+                                and getattr(_sc, "already_sent", False)
+                            )
+                        )
+                    )
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata={"thread_id": source.thread_id} if source.thread_id else None)
+                            await adapter.send(
+                                source.chat_id,
+                                first_response,
+                                metadata=_status_thread_metadata,
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
-                # Process the pending message with updated history
                 updated_history = result.get("messages", history)
+                next_source = source
+                next_message = pending
+                next_message_id = None
+                if pending_event is not None:
+                    next_source = getattr(pending_event, "source", None) or source
+                    next_message = await self._prepare_inbound_message_text(
+                        event=pending_event,
+                        source=next_source,
+                        history=updated_history,
+                    )
+                    if next_message is None:
+                        return result
+                    next_message_id = getattr(pending_event, "message_id", None)
+
                 return await self._run_agent(
-                    message=pending,
+                    message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
-                    source=source,
+                    source=next_source,
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
+                    event_message_id=next_message_id,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -8259,8 +8347,15 @@ class GatewayRunner:
         # message is new content the user hasn't seen, and it must reach
         # them even if streaming had sent earlier partial output.
         _sc = stream_consumer_holder[0]
-        if _sc and _sc.already_sent and isinstance(response, dict):
-            if not response.get("failed"):
+        if _sc and isinstance(response, dict) and not response.get("failed"):
+            _response_previewed = bool(response.get("response_previewed"))
+            if (
+                getattr(_sc, "final_response_sent", False)
+                or (
+                    _response_previewed
+                    and getattr(_sc, "already_sent", False)
+                )
+            ):
                 response["already_sent"] = True
         
         return response
