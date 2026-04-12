@@ -13,7 +13,7 @@ Get Hermes Agent up and running in under two minutes with the one-line installer
 ### Linux / macOS / WSL2
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dfrer/hermes-agent/main/scripts/install.sh | bash
 ```
 
 ### Android / Termux
@@ -21,8 +21,12 @@ curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scri
 Hermes now ships a Termux-aware installer path too:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dfrer/hermes-agent/main/scripts/install.sh | bash
 ```
+
+:::info Maintained fork
+These installer commands target this fork, not the upstream NousResearch repository. If you are using this repo directly, keep the fork installer and the routing-aware updater together. If you want the upstream project instead, switch both the GitHub source and install script back to `NousResearch/hermes-agent`.
+:::
 
 The installer detects Termux automatically and switches to a tested Android flow:
 - uses Termux `pkg` for system dependencies (`git`, `python`, `nodejs`, `ripgrep`, `ffmpeg`, build tools)
@@ -91,7 +95,7 @@ If you prefer full control over the installation process, follow these steps.
 Clone with `--recurse-submodules` to pull the required submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/dfrer/hermes-agent.git
 cd hermes-agent
 ```
 
@@ -252,7 +256,7 @@ For those who just want the commands:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone & enter
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/dfrer/hermes-agent.git
 cd hermes-agent
 
 # Create venv with Python 3.11
