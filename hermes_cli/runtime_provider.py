@@ -26,7 +26,7 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import load_config
+from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 
 
@@ -301,14 +301,56 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             return None
 
     config = load_config()
+
+    # First check providers: dict (new-style user-defined providers)
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for ep_name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            # Match exact name or normalized name
+            name_norm = _normalize_custom_provider_name(ep_name)
+            # Resolve the API key from the env var name stored in key_env
+            key_env = str(entry.get("key_env", "") or "").strip()
+            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+
+            if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
+                # Found match by provider key
+                base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                if base_url:
+                    return {
+                        "name": entry.get("name", ep_name),
+                        "base_url": base_url.strip(),
+                        "api_key": resolved_api_key,
+                        "model": entry.get("default_model", ""),
+                    }
+            # Also check the 'name' field if present
+            display_name = entry.get("name", "")
+            if display_name:
+                display_norm = _normalize_custom_provider_name(display_name)
+                if requested_norm in {display_name, display_norm, f"custom:{display_norm}"}:
+                    # Found match by display name
+                    base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                    if base_url:
+                        return {
+                            "name": display_name,
+                            "base_url": base_url.strip(),
+                            "api_key": resolved_api_key,
+                            "model": entry.get("default_model", ""),
+                        }
+
+    # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
-    if not isinstance(custom_providers, list):
-        if isinstance(custom_providers, dict):
-            logger.warning(
-                "custom_providers in config.yaml is a dict, not a list. "
-                "Each entry must be prefixed with '-' in YAML. "
-                "Run 'hermes doctor' for details."
-            )
+    if isinstance(custom_providers, dict):
+        logger.warning(
+            "custom_providers in config.yaml is a dict, not a list. "
+            "Each entry must be prefixed with '-' in YAML. "
+            "Run 'hermes doctor' for details."
+        )
+        return None
+
+    custom_providers = get_compatible_custom_providers(config)
+    if not custom_providers:
         return None
 
     for entry in custom_providers:
@@ -320,13 +362,21 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             continue
         name_norm = _normalize_custom_provider_name(name)
         menu_key = f"custom:{name_norm}"
-        if requested_norm not in {name_norm, menu_key}:
+        provider_key = str(entry.get("provider_key", "") or "").strip()
+        provider_key_norm = _normalize_custom_provider_name(provider_key) if provider_key else ""
+        provider_menu_key = f"custom:{provider_key_norm}" if provider_key_norm else ""
+        if requested_norm not in {name_norm, menu_key, provider_key_norm, provider_menu_key}:
             continue
         result = {
             "name": name.strip(),
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
+        key_env = str(entry.get("key_env", "") or "").strip()
+        if key_env:
+            result["key_env"] = key_env
+        if provider_key:
+            result["provider_key"] = provider_key
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
@@ -366,12 +416,20 @@ def _resolve_named_custom_runtime(
         return pool_result
 
     api_key = ""
-    for source, candidate in (
+    key_env = str(custom_provider.get("key_env", "") or "").strip()
+    candidates = [
         ("explicit", (explicit_api_key or "").strip()),
         ("config", str(custom_provider.get("api_key", "") or "").strip()),
-        ("env:OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "").strip()),
-        ("env:OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "").strip()),
-    ):
+    ]
+    if key_env:
+        candidates.append((f"env:{key_env}", os.getenv(key_env, "").strip()))
+    candidates.extend(
+        [
+            ("env:OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "").strip()),
+            ("env:OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "").strip()),
+        ]
+    )
+    for source, candidate in candidates:
         if has_usable_secret(candidate):
             api_key = candidate
             if source == "config":
@@ -600,7 +658,7 @@ def _resolve_explicit_runtime(
 
         base_url = explicit_base_url
         if not base_url:
-            if provider == "kimi-coding":
+            if provider in ("kimi-coding", "kimi-coding-cn"):
                 creds = resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:

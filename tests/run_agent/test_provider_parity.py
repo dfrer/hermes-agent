@@ -68,9 +68,7 @@ def _make_agent(
     )
     if model is not None:
         kwargs["model"] = model
-    return AIAgent(
-        **kwargs,
-    )
+    return AIAgent(**kwargs)
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────
@@ -260,7 +258,7 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
 
 class TestBuildApiKwargsAIGateway:
     def test_uses_chat_completions_format(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "messages" in kwargs
@@ -268,7 +266,7 @@ class TestBuildApiKwargsAIGateway:
         assert kwargs["messages"][-1]["content"] == "hi"
 
     def test_no_responses_api_fields(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "input" not in kwargs
@@ -276,7 +274,7 @@ class TestBuildApiKwargsAIGateway:
         assert "store" not in kwargs
 
     def test_includes_reasoning_in_extra_body(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
@@ -284,7 +282,7 @@ class TestBuildApiKwargsAIGateway:
         assert extra["reasoning"]["enabled"] is True
 
     def test_includes_tools(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "tools" in kwargs

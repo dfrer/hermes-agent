@@ -196,7 +196,8 @@ async def test_command_messages_do_not_leave_sentinel():
     _handle_message.  They must NOT leave a sentinel behind."""
     runner = _make_runner()
     source = SessionSource(
-        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"
+        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm",
+        user_id="u1",
     )
     event = MessageEvent(
         text="/help", message_type=MessageType.TEXT, source=source
@@ -244,9 +245,7 @@ async def test_stop_during_sentinel_force_cleans_session():
         stop_event = _make_event(text="/stop")
         result = await runner._handle_message(stop_event)
         assert result is not None, "/stop during sentinel should return a message"
-        assert "force-stopped" in result.lower() or "unlocked" in result.lower()
-
-        # Sentinel must be cleaned up
+        assert "stopped" in result.lower()
         assert session_key not in runner._running_agents, (
             "/stop must remove sentinel so the session is unlocked"
         )
@@ -272,7 +271,7 @@ async def test_stop_hard_kills_running_agent():
     forever — showing 'writing...' but never producing output."""
     runner = _make_runner()
     session_key = build_session_key(
-        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
     )
 
     # Simulate a running (possibly hung) agent
@@ -293,7 +292,7 @@ async def test_stop_hard_kills_running_agent():
 
     # Must return a confirmation
     assert result is not None
-    assert "force-stopped" in result.lower() or "unlocked" in result.lower()
+    assert "stopped" in result.lower()
 
 
 # ------------------------------------------------------------------
@@ -305,7 +304,7 @@ async def test_stop_clears_pending_messages():
     queued during the run must be discarded."""
     runner = _make_runner()
     session_key = build_session_key(
-        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
     )
 
     fake_agent = MagicMock()
