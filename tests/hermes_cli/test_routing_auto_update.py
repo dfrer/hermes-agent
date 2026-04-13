@@ -365,6 +365,33 @@ def test_push_targets_creates_backup_refs_before_promoting(monkeypatch, tmp_path
     assert report.backup_refs
 
 
+def test_quarantine_worktree_creates_quarantine_parent(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    worktree = hermes_home / rau.ROUTING_WORKTREE_DIRNAME / rau.ROUTING_WORKTREE_ACTIVE_DIRNAME / "update-worktree"
+    worktree.mkdir(parents=True)
+    calls = []
+
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "_nearest_existing_parent", lambda path: path.parent)
+
+    def fake_git(repo_root_arg, *args, cwd=None, check=True):
+        calls.append(args)
+        target = Path(args[-1])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        worktree.rename(target)
+        return _ok_completed(args)
+
+    monkeypatch.setattr(rau, "_git", fake_git)
+
+    quarantined = rau._quarantine_worktree(repo_root, hermes_home, worktree)
+
+    assert quarantined.parent.name == rau.ROUTING_WORKTREE_QUARANTINE_DIRNAME
+    assert quarantined.exists()
+    assert calls and calls[0][:2] == ("worktree", "move")
+
+
 def test_run_state_machine_realigns_to_promoted_main_and_repairs_integration_branch(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)

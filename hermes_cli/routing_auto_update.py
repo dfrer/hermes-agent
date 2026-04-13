@@ -559,6 +559,7 @@ def _validate_retained_worktree(
 def _quarantine_worktree(repo_root: Path, hermes_home: Path, worktree: Path) -> Path:
     worktree = _normalize_path(worktree)
     quarantine_root = _routing_worktree_bucket(hermes_home, ROUTING_WORKTREE_QUARANTINE_DIRNAME)
+    quarantine_root.mkdir(parents=True, exist_ok=True)
     try:
         worktree.relative_to(quarantine_root)
         return worktree
