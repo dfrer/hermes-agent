@@ -428,3 +428,14 @@ def get_running_pid() -> Optional[int]:
 def is_gateway_running() -> bool:
     """Check if the gateway daemon is currently running."""
     return get_running_pid() is not None
+
+
+
+def is_runtime_state_live(payload=None):
+    if payload is None:
+        payload = read_runtime_status()
+    if not payload or not isinstance(payload, dict):
+        return False
+    if payload.get("gateway_state") != "running":
+        return False
+    return get_running_pid() is not None

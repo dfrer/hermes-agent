@@ -258,6 +258,15 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
     except (OSError, subprocess.TimeoutExpired):
         pass
 
+    if not pids and not all_profiles:
+        try:
+            from gateway.status import get_running_pid
+            fallback_pid = get_running_pid()
+            if fallback_pid is not None and fallback_pid != os.getpid() and fallback_pid not in _exclude:
+                pids.append(fallback_pid)
+        except Exception:
+            pass
+
     return pids
 
 
