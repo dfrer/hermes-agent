@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cron.jobs import compute_next_run, create_job, list_jobs, parse_schedule, pause_job, update_job
-from gateway.status import read_runtime_status
+from gateway.status import is_runtime_state_live, read_runtime_status
 from hermes_cli.config import get_hermes_home, load_config, save_config
 from hermes_cli.gateway import (
     find_gateway_pids,
@@ -918,7 +918,7 @@ def _current_gateway_health() -> tuple[bool, bool, bool]:
         service_installed = get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()
     elif is_macos():
         service_installed = get_launchd_plist_path().exists()
-    gateway_running = bool(find_gateway_pids()) or runtime.get("gateway_state") == "running"
+    gateway_running = bool(find_gateway_pids()) or is_runtime_state_live(runtime)
     telegram_state = ((runtime.get("platforms") or {}).get("telegram") or {}).get("state", "")
     telegram_connected = telegram_state == "connected"
     return gateway_running, service_installed, telegram_connected
