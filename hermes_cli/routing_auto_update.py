@@ -2005,7 +2005,6 @@ def routing_update_status(
         )
         summary["promotion_pending"] = cherry_pending > 0
         summary["promotion_pending_count"] = cherry_pending
-
         retained = _latest_retained_failure(
             effective_repo,
             latest,
