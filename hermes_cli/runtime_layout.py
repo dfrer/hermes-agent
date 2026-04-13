@@ -47,6 +47,8 @@ DEV_SEED_PATHS: tuple[str, ...] = (
     "auth.json",
     "config.yaml",
     ".env",
+    "SOUL.md",
+    "skills/routing-layer/SKILL.md",
 )
 
 
@@ -129,6 +131,29 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _seed_profile_material(
+    source_root: Path,
+    dest_root: Path,
+    relative_paths: Iterable[str],
+    *,
+    overwrite: bool,
+    backup_dest_root: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    seeded: list[str] = []
+    skipped: list[str] = []
+    for relative in relative_paths:
+        seed_src = source_root / relative
+        if not seed_src.exists():
+            skipped.append(relative)
+            continue
+        dest = dest_root / relative
+        if dest.exists() and not overwrite:
+            continue
+        _replace_with_copy(seed_src, dest, backup_dest_root=backup_dest_root)
+        seeded.append(relative)
+    return seeded, skipped
+
+
 def bootstrap_split_runtime(root: Path | str | None = None) -> RuntimeLayoutResult:
     admin_root = get_admin_root(root)
     main_home = get_profile_home(MAIN_RUNTIME_PROFILE, admin_root)
@@ -145,15 +170,26 @@ def bootstrap_split_runtime(root: Path | str | None = None) -> RuntimeLayoutResu
         message="Split runtime layout already bootstrapped.",
     )
     if not source_entries:
+        seeded, skipped = _seed_profile_material(main_home, dev_home, DEV_SEED_PATHS, overwrite=False)
+        result.seeded_dev_paths.extend(seeded)
+        result.skipped_paths.extend([f"dev-seed:{item}" for item in skipped])
+        if seeded:
+            result.status = "repaired"
+            result.message = "Split runtime layout was already migrated; repaired missing dev automation files."
         marker = _marker_path(admin_root)
         if not marker.exists():
             _write_json(
                 marker,
                 {
-                    "status": "noop",
-                    "admin_root": str(admin_root),
-                    "main_home": str(main_home),
-                    "dev_home": str(dev_home),
+                    **asdict(result),
+                    "updated_at": _iso(_utc_now()),
+                },
+            )
+        elif seeded:
+            _write_json(
+                marker,
+                {
+                    **asdict(result),
                     "updated_at": _iso(_utc_now()),
                 },
             )
@@ -174,14 +210,16 @@ def bootstrap_split_runtime(root: Path | str | None = None) -> RuntimeLayoutResu
         _replace_with_copy(src, main_home / relative, backup_dest_root=preexisting_main_dir)
         result.migrated_paths.append(relative)
 
-    # Seed dev auth/config from the newly-migrated main runtime.
-    for relative in DEV_SEED_PATHS:
-        seed_src = main_home / relative
-        if not seed_src.exists():
-            result.skipped_paths.append(f"dev-seed:{relative}")
-            continue
-        _replace_with_copy(seed_src, dev_home / relative, backup_dest_root=preexisting_dev_dir)
-        result.seeded_dev_paths.append(relative)
+    # Seed dev auth/config/policy material from the newly-migrated main runtime.
+    seeded, skipped = _seed_profile_material(
+        main_home,
+        dev_home,
+        DEV_SEED_PATHS,
+        overwrite=False,
+        backup_dest_root=preexisting_dev_dir,
+    )
+    result.seeded_dev_paths.extend(seeded)
+    result.skipped_paths.extend([f"dev-seed:{item}" for item in skipped])
 
     for relative, src in source_entries:
         archived_dest = archived_root_dir / relative
@@ -190,7 +228,7 @@ def bootstrap_split_runtime(root: Path | str | None = None) -> RuntimeLayoutResu
         result.archived_root_paths.append(relative)
 
     result.status = "migrated"
-    result.message = "Moved the legacy root runtime into profiles/main and seeded profiles/dev auth."
+    result.message = "Moved the legacy root runtime into profiles/main and seeded profiles/dev automation files."
     _write_json(
         _marker_path(admin_root),
         {
