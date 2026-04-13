@@ -2862,6 +2862,14 @@ def cmd_routing(args):
         from hermes_cli import routing_auto_update as rau
 
         subcommand = getattr(args, "routing_update_command", None)
+        if subcommand in ("install", "run", "finalize"):
+            repo_root = getattr(args, "repo_root", PROJECT_ROOT)
+            from pathlib import Path
+            try:
+                rau._require_dev_repo(Path(repo_root).resolve(), f"routing update {subcommand}")
+            except rau.UpdateError as exc:
+                print(f"Error: {exc}")
+                return
         if subcommand == "install":
             result = rau.install_routing_auto_update(getattr(args, "repo_root", PROJECT_ROOT))
             if getattr(args, "json", False):
@@ -4766,6 +4774,12 @@ For more help on a command:
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
+
+    # gateway tmux helpers (Linux/WSL)
+    gateway_subparsers.add_parser("tmux-start", help="Start gateway in a profile-scoped tmux session (Linux/WSL)")
+    gateway_subparsers.add_parser("tmux-stop", help="Stop the profile-scoped tmux gateway session")
+    gateway_subparsers.add_parser("tmux-status", help="Show tmux gateway session and PID status")
+    gateway_subparsers.add_parser("tmux-attach", help="Attach to the profile-scoped tmux gateway session")
 
     gateway_parser.set_defaults(func=cmd_gateway)
     

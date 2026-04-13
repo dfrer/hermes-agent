@@ -2566,6 +2566,132 @@ def gateway_setup():
 
 
 # =============================================================================
+# Profile-aware tmux Gateway Helpers (Linux/WSL)
+# =============================================================================
+
+def _tmux_session_name() -> str:
+    suffix = _profile_suffix()
+    return f"hermes-{suffix}-gateway" if suffix else "hermes-gateway"
+
+
+def _tmux_bin() -> str | None:
+    return shutil.which("tmux")
+
+
+def _tmux_session_exists(session_name: str) -> bool:
+    tmux = _tmux_bin()
+    if not tmux:
+        return False
+    result = subprocess.run(
+        [tmux, "has-session", "-t", session_name],
+        capture_output=True, text=True, timeout=5,
+    )
+    return result.returncode == 0
+
+
+def _tmux_gateway_command() -> list[str]:
+    venv_python = str(PROJECT_ROOT / "venv" / "bin" / "python")
+    profile_arg = _profile_arg()
+    cmd = [venv_python, "-m", "hermes_cli.main"]
+    if profile_arg:
+        cmd.extend(profile_arg.split())
+    cmd.extend(["gateway", "run"])
+    return cmd
+
+
+def tmux_start() -> None:
+    if not is_linux() and not is_wsl():
+        print("tmux gateway helpers are only supported on Linux/WSL.")
+        sys.exit(1)
+    tmux = _tmux_bin()
+    if not tmux:
+        print("tmux is not installed. Install it with: sudo apt install tmux")
+        sys.exit(1)
+
+    session_name = _tmux_session_name()
+    pids = find_gateway_pids()
+    if pids and _tmux_session_exists(session_name):
+        print(f"Already running: session={session_name} PID={', '.join(map(str, pids))}")
+        return
+
+    cmd = _tmux_gateway_command()
+    cmd_str = " ".join(cmd)
+    subprocess.run(
+        [tmux, "new-session", "-d", "-s", session_name, "-c", str(PROJECT_ROOT), cmd_str],
+        check=True,
+    )
+    print(f"Started gateway in tmux session '{session_name}'")
+    print(f"  Attach: tmux attach -t {session_name}")
+    print(f"  Status: hermes gateway tmux-status")
+
+
+def tmux_stop() -> None:
+    if not is_linux() and not is_wsl():
+        print("tmux gateway helpers are only supported on Linux/WSL.")
+        sys.exit(1)
+    tmux = _tmux_bin()
+    if not tmux:
+        print("tmux is not installed.")
+        sys.exit(1)
+
+    session_name = _tmux_session_name()
+    if not _tmux_session_exists(session_name):
+        print(f"tmux session '{session_name}' does not exist.")
+        return
+
+    subprocess.run([tmux, "kill-session", "-t", session_name], check=False)
+    print(f"Stopped tmux session '{session_name}'")
+
+
+def tmux_status() -> None:
+    if not is_linux() and not is_wsl():
+        print("tmux gateway helpers are only supported on Linux/WSL.")
+        sys.exit(1)
+
+    session_name = _tmux_session_name()
+    session_exists = _tmux_session_exists(session_name)
+    pids = find_gateway_pids()
+
+    print(f"Session name: {session_name}")
+    print(f"Session exists: {session_exists}")
+    if pids:
+        print(f"Gateway PID: {', '.join(map(str, pids))}")
+    else:
+        print("Gateway PID: none found")
+
+    if pids:
+        from gateway.status import is_runtime_state_live, read_runtime_status
+        state = read_runtime_status()
+        if state:
+            healthy = is_runtime_state_live(state)
+            print(f"Runtime state: {'healthy' if healthy else 'degraded'}")
+        else:
+            print("Runtime state: no state file")
+    elif not session_exists:
+        print("Gateway is not running.")
+        if is_wsl():
+            print("Start with: hermes gateway tmux-start")
+
+
+def tmux_attach() -> None:
+    if not is_linux() and not is_wsl():
+        print("tmux gateway helpers are only supported on Linux/WSL.")
+        sys.exit(1)
+    tmux = _tmux_bin()
+    if not tmux:
+        print("tmux is not installed.")
+        sys.exit(1)
+
+    session_name = _tmux_session_name()
+    if not _tmux_session_exists(session_name):
+        print(f"tmux session '{session_name}' does not exist.")
+        print(f"Start it first: hermes gateway tmux-start")
+        return
+
+    os.execvp(tmux, [tmux, "attach", "-t", session_name])
+
+
+# =============================================================================
 # Main Command Handler
 # =============================================================================
 
@@ -2583,6 +2709,19 @@ def gateway_command(args):
 
     if subcmd == "setup":
         gateway_setup()
+        return
+
+    if subcmd == "tmux-start":
+        tmux_start()
+        return
+    if subcmd == "tmux-stop":
+        tmux_stop()
+        return
+    if subcmd == "tmux-status":
+        tmux_status()
+        return
+    if subcmd == "tmux-attach":
+        tmux_attach()
         return
 
     # Service management commands
@@ -2794,7 +2933,9 @@ def gateway_command(args):
                 elif is_wsl():
                     print("WSL note:")
                     print("  The gateway is running in foreground/manual mode (recommended for WSL).")
-                    print("  Use tmux or screen for persistence across terminal closes.")
+                    print("  Use tmux helpers for persistence:")
+                    print(f"    hermes gateway tmux-attach   # attach to session")
+                    print(f"    hermes gateway tmux-status   # check health")
                 else:
                     print("To install as a service:")
                     print("  hermes gateway install")
@@ -2813,7 +2954,8 @@ def gateway_command(args):
                 if is_termux():
                     print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # Best-effort background start")
                 elif is_wsl():
-                    print("  tmux new -s hermes 'hermes gateway run'         # persistent via tmux")
+                    print("  hermes gateway tmux-start                      # start in tmux (recommended)")
+                    print("  hermes gateway run                             # direct foreground")
                     print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # background")
                 else:
                     print("  hermes gateway install  # Install as user service")

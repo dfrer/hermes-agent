@@ -139,9 +139,18 @@ def cron_status():
         print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
         print()
         print("  To enable automatic execution:")
-        print("    hermes gateway install    # Install as a user service")
-        print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
-        print("    hermes gateway            # Or run in foreground")
+        try:
+            from hermes_constants import is_wsl
+            _is_wsl = is_wsl()
+        except Exception:
+            _is_wsl = False
+        if _is_wsl:
+            print("    hermes gateway tmux-start   # start in tmux (recommended for WSL)")
+            print("    hermes gateway              # or run in foreground")
+        else:
+            print("    hermes gateway install    # Install as a user service")
+            print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
+            print("    hermes gateway            # Or run in foreground")
 
     print()
 
