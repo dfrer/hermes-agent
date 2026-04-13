@@ -927,16 +927,65 @@ setup_path() {
     local command_link_display_dir
     command_link_dir="$(get_command_link_dir)"
     command_link_display_dir="$(get_command_link_display_dir)"
+    local default_hermes_root
+    default_hermes_root="${HERMES_ROOT:-$HOME/.hermes}"
 
-    # Create a user-facing shim for the hermes command.
     mkdir -p "$command_link_dir"
-    ln -sf "$HERMES_BIN" "$command_link_dir/hermes"
-    log_success "Symlinked hermes → $command_link_display_dir/hermes"
+
+    cat > "$command_link_dir/hermes" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+HERMES_ROOT="\${HERMES_ROOT:-$default_hermes_root}"
+LIVE_REPO="\$HERMES_ROOT/hermes-agent"
+DEV_REPO="\$HERMES_ROOT/hermes-agent-dev"
+LIVE_ENTRY="\$LIVE_REPO/venv/bin/hermes"
+DEV_ENTRY="\$DEV_REPO/venv/bin/hermes"
+BOOTSTRAP_PY="\$DEV_REPO/venv/bin/python"
+if [ ! -x "\$BOOTSTRAP_PY" ]; then
+    BOOTSTRAP_PY="\$LIVE_REPO/venv/bin/python"
+fi
+if [ -x "\$BOOTSTRAP_PY" ]; then
+    HERMES_HOME="\$HERMES_ROOT/profiles/dev" "\$BOOTSTRAP_PY" -m hermes_cli.runtime_layout bootstrap --root "\$HERMES_ROOT" >/dev/null 2>&1 || true
+fi
+if [ ! -x "\$LIVE_ENTRY" ]; then
+    LIVE_ENTRY="$HERMES_BIN"
+fi
+if [ ! -x "\$DEV_ENTRY" ]; then
+    DEV_ENTRY="\$LIVE_ENTRY"
+fi
+if [ "\${1:-}" = "update" ]; then
+    exec "\$DEV_ENTRY" -p dev "\$@"
+fi
+if [ "\${1:-}" = "routing" ] && [ "\${2:-}" = "update" ]; then
+    exec "\$DEV_ENTRY" -p dev "\$@"
+fi
+exec "\$LIVE_ENTRY" -p main "\$@"
+EOF
+    chmod +x "$command_link_dir/hermes"
+    log_success "Installed hermes shim → $command_link_display_dir/hermes"
+
+    cat > "$command_link_dir/hermes-dev" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+HERMES_ROOT="\${HERMES_ROOT:-$default_hermes_root}"
+DEV_REPO="\$HERMES_ROOT/hermes-agent-dev"
+DEV_ENTRY="\$DEV_REPO/venv/bin/hermes"
+BOOTSTRAP_PY="\$DEV_REPO/venv/bin/python"
+if [ -x "\$BOOTSTRAP_PY" ]; then
+    HERMES_HOME="\$HERMES_ROOT/profiles/dev" "\$BOOTSTRAP_PY" -m hermes_cli.runtime_layout bootstrap --root "\$HERMES_ROOT" >/dev/null 2>&1 || true
+fi
+if [ ! -x "\$DEV_ENTRY" ]; then
+    DEV_ENTRY="$HERMES_BIN"
+fi
+exec "\$DEV_ENTRY" -p dev "\$@"
+EOF
+    chmod +x "$command_link_dir/hermes-dev"
+    log_success "Installed hermes-dev shim → $command_link_display_dir/hermes-dev"
 
     if [ "$DISTRO" = "termux" ]; then
         export PATH="$command_link_dir:$PATH"
         log_info "$command_link_display_dir is the native Termux command path"
-        log_success "hermes command ready"
+        log_success "hermes commands ready"
         return 0
     fi
 

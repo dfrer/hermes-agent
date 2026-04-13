@@ -153,12 +153,12 @@ echo "You are a focused coding assistant." > ~/.hermes/profiles/coder/SOUL.md
 
 ## Updating
 
-`hermes update` pulls code once (shared) and syncs new bundled skills to **all** profiles automatically:
+`hermes update` updates the shared checkout once, but on this fork it does so through the dev maintenance runtime. Day-to-day usage runs from `profiles/main`, maintenance runs from `profiles/dev`, and bundled skill updates are still synced across profiles:
 
 ```bash
 hermes update
-# → Code updated (12 commits)
-# → Skills synced: default (up to date), coder (+2 new), assistant (+2 new)
+# → Delegates to the routing-aware updater in profiles/dev
+# → Promotes the validated result back into the live checkout used by profiles/main
 ```
 
 User-modified skills are never overwritten.

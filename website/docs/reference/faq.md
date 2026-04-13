@@ -559,7 +559,7 @@ No. Each profile has its own memory store, session database, and skills director
 
 ### What happens when I run `hermes update`?
 
-`hermes update` pulls the latest code and reinstalls dependencies **once** (not per-profile). It then syncs updated skills to all profiles automatically. You only need to run `hermes update` once — it covers every profile on the machine.
+On this maintained fork, `hermes update` is the user-facing entrypoint for the routing-aware updater. The live `hermes` wrapper delegates the maintenance flow into the dev runtime, and the authoritative low-level command is `hermes-dev routing update run`. The shared repo checkout is updated once, but runtime/auth state stays profile-local under `~/.hermes/profiles/main` and `~/.hermes/profiles/dev`.
 
 ### Can I move a profile to a different machine?
 

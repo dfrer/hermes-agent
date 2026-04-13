@@ -90,7 +90,7 @@ If you are contributing to this maintained fork rather than upstream Hermes:
 
 - branch from `codex/routing-integration`
 - treat `fork/main` as a promoted output, not the normal working branch
-- use `hermes routing update run` as the authoritative upstream-sync path
+- use `hermes-dev routing update run` as the authoritative upstream-sync path
 - keep fork-only documentation updated when changing routing, entitlements, or updater behavior
 
 For the fork-specific model, see [Maintained Fork](../getting-started/fork-variant.md), [Fork Architecture](./fork-architecture.md), and [Fork Maintenance](./fork-maintenance.md).

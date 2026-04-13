@@ -3692,18 +3692,70 @@ def cmd_update(args):
     import shutil
     from hermes_cli.config import is_managed, managed_error
     from hermes_cli.routing_auto_update import (
+        UpdateReport,
         _render_markdown_report,
-        is_routing_update_topology,
+        detect_routing_update_topology,
         run_routing_auto_update,
     )
+    from hermes_cli.runtime_layout import DEV_RUNTIME_PROFILE, bootstrap_split_runtime, get_admin_root, get_profile_home
 
     if is_managed():
         managed_error("update Hermes Agent")
         return
 
-    if is_routing_update_topology(PROJECT_ROOT) and not getattr(args, "legacy_stock_update", False):
-        print("Routing-aware fork topology detected. Running `hermes routing update run` instead.")
-        report = run_routing_auto_update(PROJECT_ROOT)
+    topology = detect_routing_update_topology(PROJECT_ROOT)
+    if topology.get("matches") and not getattr(args, "legacy_stock_update", False):
+        bootstrap_split_runtime()
+        if topology.get("repo_role") == "dev":
+            print("Routing-aware fork topology detected. Running `hermes-dev routing update run` from the dev checkout.")
+            report = run_routing_auto_update(PROJECT_ROOT)
+            print(_render_markdown_report(report))
+            return
+
+        dev_repo_root = Path(str(topology.get("dev_repo_root") or "")).expanduser().resolve()
+        dev_python = dev_repo_root / "venv" / "bin" / "python"
+        if not dev_python.exists():
+            print(
+                f"Routing-aware fork topology detected, but the dev updater entrypoint is missing: {dev_python}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(get_profile_home(DEV_RUNTIME_PROFILE, get_admin_root()))
+        result = subprocess.run(
+            [
+                str(dev_python),
+                "-m",
+                "hermes_cli.main",
+                "-p",
+                DEV_RUNTIME_PROFILE,
+                "routing",
+                "update",
+                "run",
+                "--json",
+                "--repo-root",
+                str(dev_repo_root),
+            ],
+            cwd=dev_repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+        if result.returncode != 0:
+            print("Routing-aware fork topology detected, but delegating to the dev updater failed.", file=sys.stderr)
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end="")
+            sys.exit(result.returncode)
+        try:
+            report = UpdateReport(**json.loads(result.stdout or "{}"))
+        except Exception:
+            if result.stdout:
+                print(result.stdout, end="")
+            return
         print(_render_markdown_report(report))
         return
 

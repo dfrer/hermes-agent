@@ -62,8 +62,56 @@ ROUTING_AUTO_UPDATE_DELIVERY = "telegram"
 REPORT_DIR_NAME = "routing-auto-update"
 REPORT_HISTORY_DIR = "history"
 ROUTING_BACKUP_DIRNAME = "routing-backups"
+ROUTING_WORKTREE_DIRNAME = "routing-worktrees"
+ROUTING_WORKTREE_ACTIVE_DIRNAME = "active"
+ROUTING_WORKTREE_QUARANTINE_DIRNAME = "quarantine"
 DEFAULT_RETENTION_DAYS = 30
 UPDATE_BRANCH_PREFIX = "codex/upstream-sync"
+REMOTE_BACKUP_REF_PREFIX = "archive/routing-auto-update"
+LEGACY_UPDATE_DIR_PATTERNS: tuple[str, ...] = (
+    f"{LIVE_REPO_BASENAME}-update-*",
+    f"{DEV_REPO_BASENAME}-update-*",
+)
+REPAIR_MAX_CHANGED_PATHS = 12
+REPAIR_ALLOWED_ROOT_FILES = frozenset(
+    {
+        "run_agent.py",
+        "model_tools.py",
+        "toolsets.py",
+    }
+)
+REPAIR_ALLOWED_PATH_PREFIXES = (
+    "agent/",
+    "gateway/",
+    "hermes_cli/",
+    "tests/",
+    "tools/",
+)
+REPAIR_ALLOWED_EXACT_PATHS = frozenset(
+    {
+        "scripts/test-routing-contract.ps1",
+    }
+)
+REPAIR_BLOCKED_PATH_PREFIXES = (
+    ".github/",
+    "docker/",
+    "nix/",
+    "profiles/",
+    "skills/",
+    "website/",
+)
+REPAIR_BLOCKED_BASENAMES = frozenset(
+    {
+        "dockerfile",
+        "docker-compose.yml",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "pyproject.toml",
+        "uv.lock",
+    }
+)
 
 ROUTING_CONTRACT_TESTS: tuple[str, ...] = (
     "scripts/test-routing-contract.ps1",
@@ -136,7 +184,7 @@ CRON_PROMPT_TEMPLATE = """You are running the daily Hermes routing-preserving up
 
 Do not implement merge, test, or push logic yourself. The deterministic updater is authoritative.
 
-1. Call `hermes routing update run --json --repo-root {repo_root}`.
+1. Call `hermes-dev routing update run --json --repo-root {repo_root}`.
 2. Read `{latest_json}` and `{latest_md}`.
 3. If `latest.json` reports `status == "noop"`, return exactly `[SILENT]`.
 4. If `status == "updated"`, send a concise summary based on `latest.md` and stop.
@@ -146,7 +194,7 @@ Do not implement merge, test, or push logic yourself. The deterministic updater 
    - node 1: inspect `repair_manifest_path` and latest report
    - node 2: apply the smallest repair inside the retained worktree
    - node 3: rerun the targeted failing validation command from the manifest
-   - node 4: call `hermes routing update finalize --json --repo-root {repo_root}`
+   - node 4: call `hermes-dev routing update finalize --json --repo-root {repo_root}`
    - node 5: summarize the finalized outcome
 6. If repair is ineligible or finalize fails, stop and report the exact retained worktree and manifest paths.
 """
@@ -197,9 +245,12 @@ class UpdateReport:
     message: str = ""
     policy_history_sync: list[dict[str, Any]] = field(default_factory=list)
     retained_failed_worktree: str = ""
+    retained_failed_worktree_valid: bool | None = None
+    retained_failed_worktree_reason: str = ""
     repair_manifest_path: str = ""
     repair_eligible: bool | None = None
     repair_blockers: list[str] = field(default_factory=list)
+    backup_refs: list[str] = field(default_factory=list)
     gateway_running: bool | None = None
     gateway_service_installed: bool | None = None
     telegram_connected: bool | None = None
@@ -305,6 +356,10 @@ def _render_markdown_report(report: UpdateReport) -> str:
         lines.append(f"- Backup dir: `{report.backup_dir}`")
     if report.retained_failed_worktree:
         lines.append(f"- Retained failed worktree: `{report.retained_failed_worktree}`")
+    if report.retained_failed_worktree_valid is not None:
+        lines.append(f"- Retained failed worktree valid: `{report.retained_failed_worktree_valid}`")
+    if report.retained_failed_worktree_reason:
+        lines.append(f"- Retained failed worktree note: {report.retained_failed_worktree_reason}")
     if report.repair_manifest_path:
         lines.append(f"- Repair manifest: `{report.repair_manifest_path}`")
     if report.repair_eligible is not None:
@@ -312,6 +367,9 @@ def _render_markdown_report(report: UpdateReport) -> str:
     if report.repair_blockers:
         lines.append("- Repair blockers:")
         lines.extend([f"  - `{item}`" for item in report.repair_blockers])
+    if report.backup_refs:
+        lines.append("- Backup refs:")
+        lines.extend([f"  - `{item}`" for item in report.backup_refs])
     if report.last_successful_sync_at:
         lines.append(f"- Last successful sync: `{report.last_successful_sync_at}`")
     if report.last_validation_command:
@@ -372,6 +430,12 @@ def _run_subprocess(
     return result
 
 
+def _extract_failed_command(exc: BaseException) -> str:
+    message = str(exc)
+    match = re.search(r"Command failed \(\d+\): ([^\n]+)", message)
+    return match.group(1).strip() if match else ""
+
+
 def _git(
     repo_root: Path,
     *args: str,
@@ -424,13 +488,97 @@ def _nearest_existing_parent(path: Path) -> Path:
     return candidate
 
 
-def _unique_worktree_path(repo_root: Path, stamp: str) -> Path:
-    candidate = repo_root.parent / f"{repo_root.name}-update-{stamp}"
+def _routing_worktree_root(hermes_home: Path) -> Path:
+    return hermes_home / ROUTING_WORKTREE_DIRNAME
+
+
+def _routing_worktree_bucket(hermes_home: Path, bucket: str) -> Path:
+    return _routing_worktree_root(hermes_home) / bucket
+
+
+def _unique_worktree_path(hermes_home: Path, repo_root: Path, stamp: str, *, bucket: str) -> Path:
+    base_dir = _routing_worktree_bucket(hermes_home, bucket)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    candidate = base_dir / f"{repo_root.name}-update-{stamp}"
     index = 1
     while candidate.exists():
-        candidate = repo_root.parent / f"{repo_root.name}-update-{stamp}-{index}"
+        candidate = base_dir / f"{repo_root.name}-update-{stamp}-{index}"
         index += 1
     return candidate
+
+
+def _worktree_records(repo_root: Path) -> list[dict[str, str]]:
+    try:
+        raw = _git_output(repo_root, "worktree", "list", "--porcelain")
+    except Exception:
+        return []
+    blocks: list[dict[str, str]] = []
+    block: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal block
+        if block:
+            branch_ref = block.get("branch", "")
+            block["branch_name"] = branch_ref.removeprefix("refs/heads/")
+            blocks.append(block)
+        block = {}
+
+    for line in raw.splitlines():
+        if not line.strip():
+            flush()
+            continue
+        key, _, value = line.partition(" ")
+        if key in {"worktree", "branch", "HEAD"}:
+            block[key] = value.strip()
+    flush()
+    return blocks
+
+
+def _validate_retained_worktree(
+    repo_root: Path,
+    retained_path: Path,
+    update_branch: str,
+) -> tuple[bool, str, str]:
+    if not retained_path.exists():
+        return False, "retained worktree directory is missing", update_branch
+
+    records = _worktree_records(repo_root)
+    retained_norm = str(_normalize_path(retained_path))
+    match = next((item for item in records if item.get("worktree") == retained_norm), None)
+    if match is None:
+        return False, "retained worktree is not registered in git worktree metadata", update_branch
+
+    branch_name = str(match.get("branch_name") or "")
+    if not branch_name.startswith(UPDATE_BRANCH_PREFIX):
+        return False, f"retained worktree is on unexpected branch '{branch_name or '(detached)'}'", branch_name
+    if update_branch and branch_name != update_branch:
+        return False, f"retained worktree branch '{branch_name}' does not match recorded branch '{update_branch}'", branch_name
+    return True, "", branch_name or update_branch
+
+
+def _quarantine_worktree(repo_root: Path, hermes_home: Path, worktree: Path) -> Path:
+    worktree = _normalize_path(worktree)
+    quarantine_root = _routing_worktree_bucket(hermes_home, ROUTING_WORKTREE_QUARANTINE_DIRNAME)
+    try:
+        worktree.relative_to(quarantine_root)
+        return worktree
+    except ValueError:
+        pass
+
+    target = quarantine_root / worktree.name
+    index = 1
+    while target.exists():
+        target = quarantine_root / f"{worktree.name}-{index}"
+        index += 1
+
+    host_cwd = _nearest_existing_parent(target)
+    _ensure_safe_directory(host_cwd)
+    move_result = _git(repo_root, "worktree", "move", str(worktree), str(target), check=False)
+    if move_result.returncode != 0:
+        stderr = (move_result.stderr or move_result.stdout or "").strip() or "unknown error"
+        raise UpdateError(f"Could not quarantine retained worktree {worktree}: {stderr}")
+    _ensure_safe_directory(target)
+    return target
 
 
 def _clear_update_check(hermes_home: Path) -> None:
@@ -630,6 +778,27 @@ def _eligible_text_path(path: str) -> bool:
     ) or "/tests/" in normalized or normalized.startswith("tests/")
 
 
+def _repair_path_blocker(path: str) -> str | None:
+    normalized = path.replace("\\", "/").lstrip("./")
+    lowered = normalized.lower()
+    basename = Path(normalized).name.lower()
+    if not _eligible_text_path(normalized):
+        return f"ineligible repair target: {path}"
+    if basename in REPAIR_BLOCKED_BASENAMES:
+        return f"high-blast-radius repair target: {path}"
+    if any(lowered.startswith(prefix) for prefix in REPAIR_BLOCKED_PATH_PREFIXES):
+        return f"high-blast-radius repair target: {path}"
+    if "/" not in normalized:
+        if normalized not in REPAIR_ALLOWED_ROOT_FILES:
+            return f"repo-root repair target is outside the allowlist: {path}"
+        return None
+    if normalized in REPAIR_ALLOWED_EXACT_PATHS:
+        return None
+    if not any(lowered.startswith(prefix) for prefix in REPAIR_ALLOWED_PATH_PREFIXES):
+        return f"repair target is outside the narrow allowlist: {path}"
+    return None
+
+
 def _collect_playbooks(paths: Sequence[str]) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
     normalized_paths = [path.replace("\\", "/") for path in paths]
@@ -644,11 +813,12 @@ def _repair_eligibility(paths: Sequence[str]) -> tuple[bool, list[str]]:
     if not paths:
         blockers.append("no changed paths recorded")
         return False, blockers
-    if len(paths) > 40:
+    if len(paths) > REPAIR_MAX_CHANGED_PATHS:
         blockers.append(f"changed path count {len(paths)} exceeds conservative repair cap")
     for path in paths:
-        if not _eligible_text_path(path):
-            blockers.append(f"ineligible repair target: {path}")
+        blocker = _repair_path_blocker(path)
+        if blocker:
+            blockers.append(blocker)
     return not blockers, blockers
 
 
@@ -922,6 +1092,23 @@ def _cleanup_old_dirs(paths: Iterable[Path], *, keep: set[Path], older_than: tim
             continue
 
 
+def _cleanup_legacy_update_dirs(repo_root: Path, *, keep: set[Path]) -> None:
+    registered = {str(_normalize_path(item.get("worktree") or "")) for item in _worktree_records(repo_root)}
+    legacy_dirs: list[Path] = []
+    for pattern in LEGACY_UPDATE_DIR_PATTERNS:
+        legacy_dirs.extend(repo_root.parent.glob(pattern))
+    for path in legacy_dirs:
+        normalized = _normalize_path(path)
+        if normalized in keep:
+            continue
+        if normalized.exists() and str(normalized) in registered:
+            continue
+        try:
+            shutil.rmtree(normalized)
+        except OSError:
+            continue
+
+
 def _prune_retention(hermes_home: Path, repo_root: Path, *, keep_failed_worktree: Path | None = None) -> None:
     retention = timedelta(days=DEFAULT_RETENTION_DAYS)
 
@@ -935,11 +1122,14 @@ def _prune_retention(hermes_home: Path, repo_root: Path, *, keep_failed_worktree
     history_entries = sorted([p for p in history_root.iterdir()] if history_root.exists() else [], key=lambda item: item.stat().st_mtime, reverse=True)
     _cleanup_old_dirs(history_entries, keep=set(), older_than=retention)
 
-    update_dirs = sorted([p for p in repo_root.parent.glob(f"{repo_root.name}-update-*") if p.is_dir()], key=lambda item: item.stat().st_mtime, reverse=True)
     keep_failed = {keep_failed_worktree} if keep_failed_worktree else set()
-    if update_dirs and not keep_failed:
-        keep_failed = {update_dirs[0]}
-    _cleanup_old_dirs(update_dirs, keep=keep_failed, older_than=retention)
+    active_root = _routing_worktree_bucket(hermes_home, ROUTING_WORKTREE_ACTIVE_DIRNAME)
+    quarantine_root = _routing_worktree_bucket(hermes_home, ROUTING_WORKTREE_QUARANTINE_DIRNAME)
+    active_dirs = sorted([p for p in active_root.iterdir()] if active_root.exists() else [], key=lambda item: item.stat().st_mtime, reverse=True)
+    quarantine_dirs = sorted([p for p in quarantine_root.iterdir()] if quarantine_root.exists() else [], key=lambda item: item.stat().st_mtime, reverse=True)
+    _cleanup_old_dirs(active_dirs, keep=set(), older_than=timedelta(seconds=0))
+    _cleanup_old_dirs(quarantine_dirs, keep=keep_failed, older_than=retention)
+    _cleanup_legacy_update_dirs(repo_root, keep=keep_failed)
 
 
 def _current_gateway_health() -> tuple[bool, bool, bool]:
@@ -1093,6 +1283,39 @@ def _realign_live_branch_to_promoted_head(repo_root: Path, current_head: str, in
     return ""
 
 
+def _backup_ref_name(label: str, stamp: str) -> str:
+    safe = label.replace("/", "-")
+    return f"{REMOTE_BACKUP_REF_PREFIX}/{stamp}/{safe}"
+
+
+def _push_backup_refs(repo_root: Path, backend: GitBackend, report: UpdateReport) -> bool:
+    stamp = _utc_now().strftime("%Y%m%d-%H%M%S")
+    targets = (
+        (PUSH_REF, f"{PUSH_REMOTE}-{LIVE_BRANCH}"),
+        (MAIN_REF, f"{PUSH_REMOTE}-{PROMOTION_BRANCH}"),
+        ("HEAD", "dev-head"),
+    )
+    for source_ref, label in targets:
+        source_head = _current_ref(repo_root, source_ref)
+        if not source_head:
+            continue
+        backup_ref = _backup_ref_name(label, stamp)
+        result = backend.run(
+            ["push", "--porcelain", PUSH_REMOTE, f"{source_head}:refs/heads/{backup_ref}"],
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip() or "unknown error"
+            report.auth_errors[f"backup:{label}"] = stderr
+            report.message = f"Failed to create durable backup ref '{backup_ref}' on {PUSH_REMOTE}: {stderr}"
+            report.push_status = "failed"
+            report.integration_push_status = "failed" if label.endswith(LIVE_BRANCH) else report.integration_push_status
+            report.main_promotion_status = "failed" if label.endswith(PROMOTION_BRANCH) else report.main_promotion_status
+            return False
+        report.backup_refs.append(f"{PUSH_REMOTE}/{backup_ref}")
+    return True
+
+
 def _push_targets(
     repo_root: Path,
     backend: GitBackend,
@@ -1103,6 +1326,13 @@ def _push_targets(
     push_main: bool,
 ) -> None:
     pushed_any = False
+    if (push_integration or push_main) and not _push_backup_refs(repo_root, backend, report):
+        if report.integration_push_status == "not_attempted":
+            report.integration_push_status = "not_attempted" if not push_integration else "blocked"
+        if report.main_promotion_status == "not_attempted":
+            report.main_promotion_status = "not_attempted" if not push_main else "blocked"
+        return
+
     if push_integration:
         integration_push = backend.run(
             ["push", "--porcelain", PUSH_REMOTE, f"HEAD:refs/heads/{LIVE_BRANCH}"],
@@ -1159,54 +1389,17 @@ def _normalize_retained_failure(latest: dict[str, Any], upstream_head: str) -> d
     retained = str(latest.get("retained_failed_worktree") or latest.get("update_worktree") or "")
     if not retained:
         return None
-    retained_path = _normalize_path(retained)
-    if not retained_path.exists():
-        return None
-
-    update_branch = str(latest.get("update_branch") or "").strip()
-    if not update_branch:
-        try:
-            update_branch = _git_output(retained_path, "branch", "--show-current", cwd=retained_path).strip()
-        except Exception:
-            update_branch = ""
-    if update_branch and not update_branch.startswith(UPDATE_BRANCH_PREFIX):
-        return None
 
     normalized = dict(latest)
-    normalized["status"] = status if status in {"repair_required", "verification_failed", "ff_failed"} else "verification_failed"
     normalized["upstream_head"] = upstream_head
-    normalized["update_worktree"] = str(retained_path)
-    normalized["retained_failed_worktree"] = str(retained_path)
-    if update_branch:
-        normalized["update_branch"] = update_branch
+    normalized["retained_failed_worktree"] = retained
+    normalized["update_worktree"] = retained
     return normalized
 
 
 def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: str) -> dict[str, Any] | None:
-    try:
-        raw = _git_output(repo_root, "worktree", "list", "--porcelain")
-    except Exception:
-        return None
-    blocks: list[dict[str, str]] = []
-    block: dict[str, str] = {}
-
-    def flush() -> None:
-        nonlocal block
-        if block:
-            blocks.append(block)
-        block = {}
-
-    for line in raw.splitlines():
-        if not line.strip():
-            flush()
-            continue
-        key, _, value = line.partition(" ")
-        if key in {"worktree", "branch", "HEAD"}:
-            block[key] = value.strip()
-    flush()
-
     candidates: list[dict[str, Any]] = []
-    for entry in blocks:
+    for entry in _worktree_records(repo_root):
         worktree_value = entry.get("worktree") or ""
         if not worktree_value:
             continue
@@ -1214,8 +1407,7 @@ def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: st
         if worktree_path == repo_root or not worktree_path.exists():
             continue
 
-        branch_ref = entry.get("branch") or ""
-        branch_name = branch_ref.removeprefix("refs/heads/")
+        branch_name = str(entry.get("branch_name") or "")
         if not branch_name.startswith(UPDATE_BRANCH_PREFIX):
             continue
 
@@ -1226,6 +1418,8 @@ def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: st
                 "update_branch": branch_name,
                 "update_worktree": str(worktree_path),
                 "retained_failed_worktree": str(worktree_path),
+                "retained_failed_worktree_valid": True,
+                "retained_failed_worktree_reason": "",
             }
         )
 
@@ -1239,6 +1433,27 @@ def _discover_retained_failure_from_worktrees(repo_root: Path, upstream_head: st
 def _latest_retained_failure(repo_root: Path, latest: dict[str, Any], upstream_head: str) -> dict[str, Any] | None:
     retained = _normalize_retained_failure(latest, upstream_head)
     if retained:
+        retained_path = _normalize_path(str(retained.get("retained_failed_worktree") or ""))
+        update_branch = str(retained.get("update_branch") or "").strip()
+        valid, reason, branch_name = _validate_retained_worktree(repo_root, retained_path, update_branch)
+        retained["retained_failed_worktree_valid"] = valid
+        retained["retained_failed_worktree_reason"] = reason
+        if branch_name:
+            retained["update_branch"] = branch_name
+        retained["status"] = (
+            str(retained.get("status") or "verification_failed")
+            if valid
+            else "stale_retained_worktree"
+        )
+        if not valid:
+            retained["repair_eligible"] = False
+            blockers = list(retained.get("repair_blockers") or [])
+            if reason:
+                blockers.append(reason)
+            retained["repair_blockers"] = blockers
+            discovered = _discover_retained_failure_from_worktrees(repo_root, upstream_head)
+            if discovered:
+                return discovered
         return retained
     return _discover_retained_failure_from_worktrees(repo_root, upstream_head)
 
@@ -1321,13 +1536,21 @@ def _run_state_machine(
     retained = _latest_retained_failure(repo_root, latest_report, report.upstream_head)
     if retained and not finalize_from_retained:
         report.status = str(retained.get("status") or "repair_required")
-        report.message = "A retained maintenance worktree for the current upstream head is still pending repair or finalize."
         report.update_branch = str(retained.get("update_branch") or "")
         report.update_worktree = str(retained.get("update_worktree") or "")
         report.retained_failed_worktree = str(retained.get("retained_failed_worktree") or "")
+        report.retained_failed_worktree_valid = retained.get("retained_failed_worktree_valid")
+        report.retained_failed_worktree_reason = str(retained.get("retained_failed_worktree_reason") or "")
         report.repair_manifest_path = str(retained.get("repair_manifest_path") or "")
         report.repair_eligible = retained.get("repair_eligible")
         report.repair_blockers = list(retained.get("repair_blockers") or [])
+        if report.status == "stale_retained_worktree":
+            report.message = (
+                "The latest retained maintenance worktree is stale and cannot be finalized automatically. "
+                + (report.retained_failed_worktree_reason or "Check the retained worktree path in the last report.")
+            )
+        else:
+            report.message = "A retained maintenance worktree for the current upstream head is still pending repair or finalize."
         return report
 
     realigned_to = _realign_live_branch_to_promoted_head(
@@ -1404,6 +1627,11 @@ def _run_state_machine(
     if finalize_from_retained:
         if not retained:
             raise UpdateError("No retained routed-maintenance worktree is available to finalize.")
+        if retained.get("retained_failed_worktree_valid") is False:
+            raise UpdateError(
+                "Retained worktree is stale and cannot be finalized automatically. "
+                + str(retained.get("retained_failed_worktree_reason") or "")
+            )
         update_worktree = _normalize_path(str(retained.get("retained_failed_worktree") or ""))
         update_branch = str(retained.get("update_branch") or "")
         if not update_worktree.exists():
@@ -1412,15 +1640,19 @@ def _run_state_machine(
             raise UpdateError("Latest retained repair report is missing update_branch.")
         if _git_output(update_worktree, "branch", "--show-current", cwd=update_worktree) != update_branch:
             raise UpdateError("Retained worktree no longer matches the prepared update branch.")
+        update_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
         report.update_branch = update_branch
         report.update_worktree = str(update_worktree)
         report.retained_failed_worktree = str(update_worktree)
+        report.retained_failed_worktree_valid = True
         if not _git_is_ancestor(update_worktree, UPSTREAM_REF, "HEAD"):
             merge_result = _git(update_worktree, "merge", "--no-ff", UPSTREAM_REF, cwd=update_worktree, check=False)
             if merge_result.returncode != 0:
                 report.status = "repair_required"
                 stderr = (merge_result.stderr or merge_result.stdout or "").strip() or "manual resolution required"
                 report.message = f"Refreshing the retained update worktree to the latest upstream produced conflicts: {stderr}"
+                report.retained_failed_worktree_valid = True
+                report.retained_failed_worktree_reason = ""
                 conflicted = _git_output(update_worktree, "diff", "--name-only", "--diff-filter=U", cwd=update_worktree).splitlines()
                 report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
                     report_root,
@@ -1439,7 +1671,12 @@ def _run_state_machine(
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         update_branch = f"{UPDATE_BRANCH_PREFIX}-{stamp}"
-        update_worktree = _unique_worktree_path(repo_root, stamp)
+        update_worktree = _unique_worktree_path(
+            hermes_home,
+            repo_root,
+            stamp,
+            bucket=ROUTING_WORKTREE_ACTIVE_DIRNAME,
+        )
         report.update_branch = update_branch
         report.update_worktree = str(update_worktree)
 
@@ -1450,11 +1687,15 @@ def _run_state_machine(
 
         merge_result = _git(update_worktree, "merge", "--no-ff", UPSTREAM_REF, cwd=update_worktree, check=False)
         if merge_result.returncode != 0:
+            retained_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
             report.status = "repair_required"
             stderr = (merge_result.stderr or merge_result.stdout or "").strip() or "manual resolution required"
             report.message = f"Upstream merge produced conflicts in the retained update worktree: {stderr}"
-            report.retained_failed_worktree = str(update_worktree)
-            conflicted = _git_output(update_worktree, "diff", "--name-only", "--diff-filter=U", cwd=update_worktree).splitlines()
+            report.update_worktree = str(retained_worktree)
+            report.retained_failed_worktree = str(retained_worktree)
+            report.retained_failed_worktree_valid = True
+            report.retained_failed_worktree_reason = ""
+            conflicted = _git_output(retained_worktree, "diff", "--name-only", "--diff-filter=U", cwd=retained_worktree).splitlines()
             report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
                 report_root,
                 report,
@@ -1467,10 +1708,15 @@ def _run_state_machine(
         report.tests_run = _run_trust_gate(update_worktree)
         report.last_validation_command = report.tests_run[-1] if report.tests_run else ""
     except UpdateError as exc:
+        retained_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
         report.status = "verification_failed"
         report.message = str(exc)
-        report.retained_failed_worktree = str(update_worktree)
-        changed = _git_output(update_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=update_worktree).splitlines()
+        report.last_validation_command = _extract_failed_command(exc)
+        report.update_worktree = str(retained_worktree)
+        report.retained_failed_worktree = str(retained_worktree)
+        report.retained_failed_worktree_valid = True
+        report.retained_failed_worktree_reason = ""
+        changed = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
         report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
             report_root,
             report,
@@ -1481,11 +1727,15 @@ def _run_state_machine(
 
     ff_result = _git(repo_root, "merge", "--ff-only", update_branch, check=False)
     if ff_result.returncode != 0:
+        retained_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
         report.status = "ff_failed"
         stderr = (ff_result.stderr or ff_result.stdout or "").strip() or "unknown error"
         report.message = f"Fast-forward of {LIVE_BRANCH} failed: {stderr}"
-        report.retained_failed_worktree = str(update_worktree)
-        changed = _git_output(update_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=update_worktree).splitlines()
+        report.update_worktree = str(retained_worktree)
+        report.retained_failed_worktree = str(retained_worktree)
+        report.retained_failed_worktree_valid = True
+        report.retained_failed_worktree_reason = ""
+        changed = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
         report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
             report_root,
             report,
@@ -1517,6 +1767,8 @@ def _run_state_machine(
 
     _remove_worktree_and_branch(repo_root, update_worktree, update_branch)
     report.retained_failed_worktree = ""
+    report.retained_failed_worktree_valid = None
+    report.retained_failed_worktree_reason = ""
     report.repair_manifest_path = ""
     report.repair_eligible = None
     report.repair_blockers = []
@@ -1647,6 +1899,8 @@ def _status_missing_payload(repo_root: Path, gateway_running: bool, service_inst
         "current_drift": {},
         "last_error": "",
         "retained_worktree": "",
+        "retained_worktree_valid": None,
+        "retained_worktree_reason": "",
         "repair_manifest_path": "",
         "repair_eligible": None,
         "repair_blockers": [],
@@ -1695,6 +1949,8 @@ def routing_update_status(
                 "upstream_ref": latest.get("upstream_ref") or UPSTREAM_REF,
                 "last_error": "" if status in {"noop", "updated"} else message,
                 "retained_worktree": latest.get("retained_failed_worktree") or "",
+                "retained_worktree_valid": latest.get("retained_failed_worktree_valid"),
+                "retained_worktree_reason": latest.get("retained_failed_worktree_reason") or "",
                 "repair_manifest_path": latest.get("repair_manifest_path") or "",
                 "repair_eligible": latest.get("repair_eligible"),
                 "repair_blockers": list(latest.get("repair_blockers") or []),
@@ -1750,6 +2006,25 @@ def routing_update_status(
         summary["promotion_pending"] = cherry_pending > 0
         summary["promotion_pending_count"] = cherry_pending
 
+        retained = _latest_retained_failure(
+            effective_repo,
+            latest,
+            str(live_drift.get("upstream_head") or latest.get("upstream_head") or ""),
+        )
+        if retained:
+            summary["retained_worktree"] = retained.get("retained_failed_worktree") or ""
+            summary["retained_worktree_valid"] = retained.get("retained_failed_worktree_valid")
+            summary["retained_worktree_reason"] = retained.get("retained_failed_worktree_reason") or ""
+            summary["repair_manifest_path"] = retained.get("repair_manifest_path") or ""
+            summary["repair_eligible"] = retained.get("repair_eligible")
+            summary["repair_blockers"] = list(retained.get("repair_blockers") or [])
+            if retained.get("status") == "stale_retained_worktree":
+                summary["status"] = "stale_retained_worktree"
+                summary["message"] = (
+                    "The latest retained maintenance worktree is stale and cannot be finalized automatically."
+                )
+                summary["last_error"] = summary["retained_worktree_reason"] or summary["message"]
+
     summary["auth"] = {
         "backend": auth_backend,
         "fetch_ready": fetch_ready,
@@ -1788,13 +2063,18 @@ def routing_update_doctor(
         "telegram_connected": bool(summary.get("telegram_connected")),
         "update_cache_hygiene": True,
         "retained_worktree_present": False,
+        "retained_worktree_valid": summary.get("retained_worktree_valid"),
     }
 
     retained = str(summary.get("retained_worktree") or "")
     if retained:
         retained_path = _normalize_path(retained)
         checks["retained_worktree_present"] = retained_path.exists()
-        if not retained_path.exists():
+        checks["retained_worktree_valid"] = summary.get("retained_worktree_valid")
+        retained_reason = str(summary.get("retained_worktree_reason") or "")
+        if summary.get("retained_worktree_valid") is False:
+            issues.append(f"Retained failed worktree is stale: {retained_reason or retained}")
+        elif not retained_path.exists():
             issues.append(f"Retained failed worktree is missing: {retained}")
     if not checks["topology"]:
         role_label = f" (role={repo_role})" if repo_role != "unknown" else ""
@@ -1881,6 +2161,9 @@ def routing_status_command(args) -> None:
         print(f"Last error: {summary['last_error']}")
     if summary.get("retained_worktree"):
         print(f"Retained worktree: {summary['retained_worktree']}")
+        print(f"Retained worktree valid: {summary.get('retained_worktree_valid')}")
+    if summary.get("retained_worktree_reason"):
+        print(f"Retained worktree note: {summary['retained_worktree_reason']}")
     if summary.get("repair_manifest_path"):
         print(f"Repair manifest: {summary['repair_manifest_path']}")
     print(f"Gateway running: {summary.get('gateway_running')}")

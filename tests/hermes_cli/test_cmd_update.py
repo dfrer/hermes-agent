@@ -1,6 +1,8 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
+import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -44,9 +46,14 @@ class TestCmdUpdateBranchFallback:
 
     @patch("hermes_cli.routing_auto_update._render_markdown_report", return_value="report")
     @patch("hermes_cli.routing_auto_update.run_routing_auto_update")
-    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=True)
+    @patch("hermes_cli.config.is_managed", return_value=False)
+    @patch(
+        "hermes_cli.routing_auto_update.detect_routing_update_topology",
+        return_value={"matches": True, "repo_role": "dev"},
+    )
+    @patch("hermes_cli.runtime_layout.bootstrap_split_runtime")
     def test_update_redirects_to_routing_updater_by_default(
-        self, _mock_topology, mock_run_update, _mock_render, capsys
+        self, _mock_bootstrap, _mock_topology, _mock_managed, mock_run_update, _mock_render, capsys
     ):
         mock_run_update.return_value = SimpleNamespace(status="updated", message="ok")
 
@@ -56,8 +63,59 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Routing-aware fork topology detected" in captured.out
 
+    @patch("hermes_cli.routing_auto_update._render_markdown_report", return_value="report")
+    @patch("hermes_cli.runtime_layout.get_profile_home", return_value=Path("/tmp/hermes/profiles/dev"))
+    @patch("hermes_cli.runtime_layout.get_admin_root", return_value=Path("/tmp/hermes"))
+    @patch("hermes_cli.runtime_layout.bootstrap_split_runtime")
+    @patch("subprocess.run")
+    @patch("hermes_cli.config.is_managed", return_value=False)
+    @patch(
+        "hermes_cli.routing_auto_update.detect_routing_update_topology",
+        return_value={"matches": True, "repo_role": "live", "dev_repo_root": "/tmp/hermes/hermes-agent-dev"},
+    )
+    @patch("pathlib.Path.exists", return_value=True)
+    def test_update_delegates_live_repo_to_dev_checkout(
+        self,
+        _mock_exists,
+        _mock_topology,
+        _mock_managed,
+        mock_run,
+        _mock_bootstrap,
+        _mock_admin_root,
+        _mock_profile_home,
+        _mock_render,
+        capsys,
+    ):
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["python"],
+            0,
+            stdout=json.dumps(
+                {
+                    "status": "updated",
+                    "started_at": "2026-04-13T01:00:00+00:00",
+                    "finished_at": "2026-04-13T01:00:01+00:00",
+                    "repo_root": "/tmp/hermes/hermes-agent-dev",
+                }
+            ),
+            stderr="",
+        )
+
+        cmd_update(SimpleNamespace(gateway=False, legacy_stock_update=False))
+
+        delegated = mock_run.call_args.args[0]
+        assert delegated[:5] == [
+            "/tmp/hermes/hermes-agent-dev/venv/bin/python",
+            "-m",
+            "hermes_cli.main",
+            "-p",
+            "dev",
+        ]
+        assert delegated[5:9] == ["routing", "update", "run", "--json"]
+        captured = capsys.readouterr()
+        assert "report" in captured.out
+
     @patch("shutil.which", return_value=None)
-    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
+    @patch("hermes_cli.routing_auto_update.detect_routing_update_topology", return_value={"matches": False})
     @patch("subprocess.run")
     def test_update_falls_back_to_main_when_branch_not_on_remote(
         self, mock_run, _mock_topology, _mock_which, mock_args, capsys
@@ -82,7 +140,7 @@ class TestCmdUpdateBranchFallback:
         assert "main" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
-    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
+    @patch("hermes_cli.routing_auto_update.detect_routing_update_topology", return_value={"matches": False})
     @patch("subprocess.run")
     def test_update_uses_current_branch_when_on_remote(
         self, mock_run, _mock_topology, _mock_which, mock_args, capsys
@@ -104,7 +162,7 @@ class TestCmdUpdateBranchFallback:
         assert "main" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
-    @patch("hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False)
+    @patch("hermes_cli.routing_auto_update.detect_routing_update_topology", return_value={"matches": False})
     @patch("subprocess.run")
     def test_update_already_up_to_date(
         self, mock_run, _mock_topology, _mock_which, mock_args, capsys
@@ -128,7 +186,7 @@ class TestCmdUpdateBranchFallback:
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
-            "hermes_cli.routing_auto_update.is_routing_update_topology", return_value=False
+            "hermes_cli.routing_auto_update.detect_routing_update_topology", return_value={"matches": False}
         ), patch(
             "hermes_cli.config.get_missing_env_vars", return_value=["MISSING_KEY"]
         ), patch("hermes_cli.config.get_missing_config_fields", return_value=[]), patch(

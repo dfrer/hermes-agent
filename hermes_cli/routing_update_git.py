@@ -212,12 +212,13 @@ def probe_git_backend(
         }
         candidates.append(("windows-bridge", bridge_fetch_ready, bridge_push_ready, bridge_targets, bridge_errors))
 
-    details["windows-bridge"] = {
-        "available": bool(windows_candidates),
-        "fetch_ready": False,
-        "push_ready": False,
-        "errors": "not running in WSL or git.exe not found",
-    }
+    if "windows-bridge" not in details:
+        details["windows-bridge"] = {
+            "available": bool(windows_candidates),
+            "fetch_ready": False,
+            "push_ready": False,
+            "errors": "not running in WSL or git.exe not found",
+        }
     kind, fetch_ready, push_ready, push_targets, errors = max(
         candidates,
         key=lambda item: _candidate_score(item[1], item[3], item[0]),

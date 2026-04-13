@@ -24,7 +24,7 @@ This fork uses a deterministic maintenance workflow. The updater is responsible 
 Use:
 
 ```bash
-hermes routing update run
+hermes-dev routing update run
 ```
 
 The updater does the following:
@@ -35,7 +35,7 @@ The updater does the following:
 4. runs the trust gate
 5. promotes the result into `fork/codex/routing-integration`
 6. promotes the same validated head into `fork/main`
-7. records status and repair artifacts under `~/.hermes/cron/output/routing-auto-update/`
+7. records status and repair artifacts under `~/.hermes/profiles/dev/cron/output/routing-auto-update/`
 
 ## Trust gate
 
@@ -51,11 +51,11 @@ The first command validates the Python test suite under the same xdist mode the 
 ## Operational commands
 
 ```bash
-hermes routing update install
-hermes routing update run
-hermes routing update status
-hermes routing update doctor
-hermes routing update finalize
+hermes-dev routing update install
+hermes-dev routing update run
+hermes-dev routing update status
+hermes-dev routing update doctor
+hermes-dev routing update finalize
 ```
 
 - `install`: installs the scheduled updater job

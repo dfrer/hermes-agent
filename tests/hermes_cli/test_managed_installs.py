@@ -37,7 +37,7 @@ def test_recommended_update_command_uses_routing_updater_on_custom_topology(monk
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
     monkeypatch.setattr("hermes_cli.routing_auto_update.is_routing_update_topology", lambda repo_root=None: True)
 
-    assert recommended_update_command() == "hermes routing update run"
+    assert recommended_update_command() == "hermes update"
 
 
 def test_cmd_update_blocks_managed_homebrew(monkeypatch, capsys):

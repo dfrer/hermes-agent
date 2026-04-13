@@ -8,16 +8,16 @@ description: "How to update Hermes Agent to the latest version or uninstall it"
 
 ## Updating
 
-For this fork, the canonical update command is:
-
-```bash
-hermes routing update run
-```
-
-Compatibility entrypoint:
+For this fork, the user-facing update command is:
 
 ```bash
 hermes update
+```
+
+The explicit maintenance entrypoint is:
+
+```bash
+hermes-dev routing update run
 ```
 
 :::info Maintained fork updater
@@ -30,19 +30,19 @@ This repository does not use a plain `git pull` update path as its primary maint
 
 ### What happens during an update
 
-When you run `hermes routing update run`, the following steps occur:
+When you run `hermes update` or `hermes-dev routing update run`, the following steps occur:
 
 1. **Topology + auth probe** — validates `origin`, `fork`, the live branch, and the active git backend
 2. **Retained worktree prep** — creates or refreshes a retained `codex/upstream-sync-*` worktree for the merge
 3. **Upstream merge** — merges `origin/main` into the retained worktree instead of mutating the live branch directly
 4. **Trust gate** — runs the full xdist pytest gate plus the routing contract script
 5. **Promotion** — only after validation passes, promotes the result to `fork/codex/routing-integration` and `fork/main`
-6. **Report writeout** — stores status, drift, and any repair artifacts under `~/.hermes/cron/output/routing-auto-update/`
+6. **Report writeout** — stores status, drift, and any repair artifacts under `~/.hermes/profiles/dev/cron/output/routing-auto-update/`
 
 Expected output looks like:
 
 ```
-$ hermes routing update run
+$ hermes-dev routing update run
 # Routing Auto Update: updated
 - Message: Applied upstream changes, passed the trust gate, and promoted fork integration + main.
 ```
@@ -50,9 +50,9 @@ $ hermes routing update run
 ### Status, health, and finalize
 
 ```bash
-hermes routing update status
-hermes routing update doctor
-hermes routing update finalize
+hermes-dev routing update status
+hermes-dev routing update doctor
+hermes-dev routing update finalize
 ```
 
 - `status` shows the last updater result, branch drift, auth backend, and job state
@@ -64,7 +64,7 @@ hermes routing update finalize
 The routing updater handles the full maintenance path, but a quick post-update check is still useful:
 
 1. `git status --short` — if the tree is unexpectedly dirty, inspect before continuing
-2. `hermes routing update status` — confirm the last run is `updated`
+2. `hermes-dev routing update status` — confirm the last run is `updated`
 3. `hermes doctor` — checks config, dependencies, and service health
 4. If you use the gateway: `hermes gateway status`
 
@@ -99,10 +99,10 @@ This pulls the latest code, updates dependencies, and restarts the gateway. The 
 If you are doing emergency maintenance and intentionally bypassing the deterministic updater:
 
 ```bash
-cd /path/to/hermes-agent
+cd /path/to/hermes-agent-dev
 git fetch origin --prune
 git fetch fork --prune
-hermes routing update run
+hermes-dev routing update run
 ```
 
 For this fork, manual maintenance should normally mean "invoke the updater and repair the retained worktree if needed," not "replace the updater with a hand-written merge flow."

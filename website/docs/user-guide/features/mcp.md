@@ -481,7 +481,7 @@ Or if you installed Hermes in a specific location:
 {
   "mcpServers": {
     "hermes": {
-      "command": "/home/user/.hermes/hermes-agent/venv/bin/hermes",
+      "command": "hermes",
       "args": ["mcp", "serve"]
     }
   }

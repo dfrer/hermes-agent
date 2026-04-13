@@ -110,13 +110,6 @@ def recommended_update_command() -> str:
     managed = get_managed_update_command()
     if managed:
         return managed
-    try:
-        from hermes_cli.routing_auto_update import is_routing_update_topology
-
-        if is_routing_update_topology(get_project_root()):
-            return "hermes routing update run"
-    except Exception:
-        pass
     return "hermes update"
 
 

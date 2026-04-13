@@ -44,26 +44,26 @@ curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scri
 
 ## Updating this fork
 
-The canonical update command for this repository is:
-
-```bash
-hermes routing update run
-```
-
-Compatibility entrypoint:
+The user-facing update command for this repository is:
 
 ```bash
 hermes update
 ```
 
-In this fork, `hermes update` is a convenience path. The authoritative maintenance flow is the routing-aware updater because it understands the fork topology, retained repair worktrees, trust gate, and promotion rules.
+The explicit maintenance entrypoint is:
+
+```bash
+hermes-dev routing update run
+```
+
+In this fork, `hermes update` delegates into the dev runtime and the authoritative maintenance flow is still the routing-aware updater because it understands the fork topology, retained repair worktrees, trust gate, and promotion rules.
 
 Useful companion commands:
 
 ```bash
-hermes routing update status
-hermes routing update doctor
-hermes routing update finalize
+hermes-dev routing update status
+hermes-dev routing update doctor
+hermes-dev routing update finalize
 ```
 
 ## Read next

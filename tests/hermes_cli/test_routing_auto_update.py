@@ -74,6 +74,31 @@ def test_run_trust_gate_uses_addopts_override_and_optional_xdist(monkeypatch, tm
     assert result[0].startswith(f"{rau.sys.executable} -m pytest -o addopts=")
 
 
+def test_repair_eligibility_rejects_docs_and_root_manifests():
+    eligible, blockers = rau._repair_eligibility(
+        [
+            "website/docs/getting-started/updating.md",
+            "pyproject.toml",
+        ]
+    )
+
+    assert eligible is False
+    assert any("high-blast-radius" in blocker or "allowlist" in blocker for blocker in blockers)
+
+
+def test_repair_eligibility_accepts_narrow_source_and_test_changes():
+    eligible, blockers = rau._repair_eligibility(
+        [
+            "agent/routing_guard.py",
+            "hermes_cli/routing_auto_update.py",
+            "tests/hermes_cli/test_routing_auto_update.py",
+        ]
+    )
+
+    assert eligible is True
+    assert blockers == []
+
+
 def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_home, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -108,8 +133,8 @@ def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_
     assert jobs[0]["name"] == rau.ROUTING_AUTO_UPDATE_JOB_NAME
     assert jobs[0]["deliver"] == rau.ROUTING_AUTO_UPDATE_DELIVERY
     assert jobs[0]["skills"] == ["routing-layer"]
-    assert "hermes routing update run --json" in jobs[0]["prompt"]
-    assert "hermes routing update finalize --json" in jobs[0]["prompt"]
+    assert "hermes-dev routing update run --json" in jobs[0]["prompt"]
+    assert "hermes-dev routing update finalize --json" in jobs[0]["prompt"]
     assert "[SILENT]" in jobs[0]["prompt"]
 
 
@@ -303,6 +328,43 @@ def test_run_state_machine_reports_main_promotion_failure(tmp_path, monkeypatch)
     assert result.main_promotion_status == "failed"
 
 
+def test_push_targets_creates_backup_refs_before_promoting(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+    calls = []
+
+    class FakeBackend:
+        def run(self, args, check=False):
+            calls.append(args)
+            return _ok_completed(args)
+
+    monkeypatch.setattr(
+        rau,
+        "_current_ref",
+        lambda repo_root_arg, ref: {
+            rau.PUSH_REF: "integration-head",
+            rau.MAIN_REF: "main-head",
+            "HEAD": "dev-head",
+        }.get(ref, ""),
+    )
+
+    rau._push_targets(
+        repo_root,
+        FakeBackend(),
+        report,
+        "new-head",
+        push_integration=True,
+        push_main=True,
+    )
+
+    backup_calls = [args for args in calls if args[0] == "push" and "archive/routing-auto-update" in " ".join(args)]
+    promotion_calls = [args for args in calls if args[0] == "push" and "refs/heads/main" in " ".join(args)]
+    assert len(backup_calls) == 3
+    assert promotion_calls
+    assert report.backup_refs
+
+
 def test_run_state_machine_realigns_to_promoted_main_and_repairs_integration_branch(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)
@@ -428,7 +490,8 @@ def test_run_state_machine_merge_conflict_writes_repair_manifest(tmp_path, monke
     monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
     monkeypatch.setattr(rau, "_sync_policy_history", lambda hermes_home: {"status": "noop", "head": ""})
     monkeypatch.setattr(rau, "_export_routing_backup", lambda repo_root, hermes_home: {"backup_dir": str(tmp_path / "backup")})
-    monkeypatch.setattr(rau, "_unique_worktree_path", lambda repo_root, stamp: update_worktree)
+    monkeypatch.setattr(rau, "_unique_worktree_path", lambda hermes_home, repo_root, stamp, bucket: update_worktree)
+    monkeypatch.setattr(rau, "_quarantine_worktree", lambda repo_root, hermes_home, worktree: worktree)
 
     def fake_git(repo_root_arg, *args, cwd=None, check=True):
         if args[:3] == ("worktree", "add", "-b"):
@@ -472,6 +535,11 @@ def test_finalize_routing_auto_update_refuses_mismatched_retained_worktree(tmp_p
     monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
     monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH})
     monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+    monkeypatch.setattr(
+        rau,
+        "_worktree_records",
+        lambda repo_root_arg: [{"worktree": str(retained), "branch_name": "codex/upstream-sync-1"}],
+    )
     monkeypatch.setattr(rau, "_git_output", lambda repo, *args, cwd=None: {("branch", "--show-current"): rau.LIVE_BRANCH, ("status", "--porcelain"): ""}.get(tuple(args), "different-branch"))
     monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
     monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
@@ -497,7 +565,7 @@ def test_finalize_routing_auto_update_refuses_mismatched_retained_worktree(tmp_p
     assert "no longer matches" in report.message.lower()
 
 
-def test_latest_retained_failure_accepts_stale_report_when_retained_head_contains_upstream(tmp_path, monkeypatch):
+def test_latest_retained_failure_accepts_registered_retained_report(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     retained = tmp_path / "retained"
@@ -505,8 +573,13 @@ def test_latest_retained_failure_accepts_stale_report_when_retained_head_contain
 
     monkeypatch.setattr(
         rau,
-        "_git_is_ancestor",
-        lambda repo_root_arg, ancestor, descendant: repo_root_arg == retained and ancestor == "new-upstream" and descendant == "HEAD",
+        "_worktree_records",
+        lambda repo_root_arg: [
+            {
+                "worktree": str(retained),
+                "branch_name": "codex/upstream-sync-1",
+            }
+        ],
     )
 
     latest = {
@@ -522,27 +595,26 @@ def test_latest_retained_failure_accepts_stale_report_when_retained_head_contain
     assert result["upstream_head"] == "new-upstream"
     assert result["retained_failed_worktree"] == str(retained)
     assert result["update_branch"] == "codex/upstream-sync-1"
+    assert result["retained_failed_worktree_valid"] is True
 
 
-def test_latest_retained_failure_accepts_stale_report_even_when_upstream_advanced(tmp_path):
+def test_latest_retained_failure_marks_missing_retained_worktree_as_stale(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    retained = tmp_path / "retained"
-    retained.mkdir()
 
     latest = {
         "status": "verification_failed",
         "upstream_head": "old-upstream",
-        "retained_failed_worktree": str(retained),
+        "retained_failed_worktree": str(tmp_path / "missing-retained"),
         "update_branch": "codex/upstream-sync-2",
     }
 
     result = rau._latest_retained_failure(repo_root, latest, "new-upstream")
 
     assert result is not None
-    assert result["upstream_head"] == "new-upstream"
-    assert result["retained_failed_worktree"] == str(retained)
-    assert result["update_branch"] == "codex/upstream-sync-2"
+    assert result["status"] == "stale_retained_worktree"
+    assert result["retained_failed_worktree_valid"] is False
+    assert "missing" in result["retained_failed_worktree_reason"]
 
 
 def test_latest_retained_failure_recovers_from_worktree_list_when_latest_report_was_overwritten(tmp_path, monkeypatch):
@@ -564,11 +636,6 @@ def test_latest_retained_failure_recovers_from_worktree_list_when_latest_report_
         rau,
         "_git_output",
         lambda repo_root_arg, *args, cwd=None: worktree_output if tuple(args) == ("worktree", "list", "--porcelain") else "",
-    )
-    monkeypatch.setattr(
-        rau,
-        "_git_is_ancestor",
-        lambda repo_root_arg, ancestor, descendant: repo_root_arg == retained and ancestor == "new-upstream" and descendant == "HEAD",
     )
 
     latest = {
@@ -610,6 +677,12 @@ def test_finalize_routing_auto_update_refreshes_retained_worktree_when_upstream_
     monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
     monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH})
     monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+    monkeypatch.setattr(
+        rau,
+        "_worktree_records",
+        lambda repo_root_arg: [{"worktree": str(retained), "branch_name": "codex/upstream-sync-1"}],
+    )
+    monkeypatch.setattr(rau, "_quarantine_worktree", lambda repo_root, hermes_home, worktree: worktree)
     monkeypatch.setattr(
         rau,
         "_git_output",
@@ -758,6 +831,56 @@ def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypat
     rau.routing_update_status(repo_root=repo_root, refresh_refs=True)
 
     assert refresh_calls == [True]
+
+
+def test_routing_update_status_reports_stale_retained_worktree(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    (report_root / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "verification_failed",
+                "message": "needs finalize",
+                "repo_root": str(repo_root),
+                "retained_failed_worktree": str(tmp_path / "missing-retained"),
+                "finished_at": "2026-04-10T10:00:00+00:00",
+                "update_branch": "codex/upstream-sync-99",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, False, False))
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH, "origin_remote": "origin", "fork_remote": "fork"},
+    )
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
+    monkeypatch.setattr(rau, "_cherry_pending_count", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "abc123",
+            "upstream_head": "def456",
+            "integration_head": "abc123",
+            "main_head": "oldmain",
+            "upstream": {"behind": 1, "ahead": 0},
+            "integration": {"behind": 0, "ahead": 0},
+            "main": {"behind": 0, "ahead": 0},
+        },
+    )
+
+    summary = rau.routing_update_status(report_root, repo_root)
+
+    assert summary["status"] == "stale_retained_worktree"
+    assert summary["retained_worktree_valid"] is False
+    assert "missing" in summary["retained_worktree_reason"]
 
 
 def test_routing_update_doctor_reports_degraded_when_auth_missing(tmp_path, monkeypatch):
