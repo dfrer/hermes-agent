@@ -1,23 +1,20 @@
 # Hermes Routing Update Playbook
 
-This fork is maintained through the routing-aware updater. The canonical entrypoint is:
-
-```powershell
-hermes routing update run
-```
-
-Or, from PowerShell wrappers:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run-routing-auto-update.ps1
-```
+The routing updater operates across two isolated repo worktrees with distinct
+profiles.  Operational updater runs are driven from the **dev profile/worktree**;
+live `main` is **not** the updater's working branch.
 
 ## Canonical Topology
 
-- live branch: `codex/routing-integration`
+| Role | Path | Branch | Profile |
+|------|------|--------|---------|
+| live | `/home/hunter/.hermes/hermes-agent` | `main` | `default` |
+| dev  | `/home/hunter/.hermes/hermes-agent-dev` | `codex/routing-integration` | `dev` |
+
 - upstream remote: `origin`
 - writable fork remote: `fork`
-- promotion target: `fork/main`
+- live backup target: `fork/main`
+- dev backup target: `fork/codex/routing-integration`
 
 ## Public Commands
 
@@ -25,27 +22,45 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-routing-auto-update.ps1
 - `hermes routing update run`
 - `hermes routing update status`
 - `hermes routing update doctor`
-
-Advanced repair/finalization:
-
 - `hermes routing update finalize`
 
-## Trust Gate
+All operational updater runs for this setup use the dev profile (`-p dev`).
+Live `main` is not the updater's working branch.
 
-Promotion to both `fork/codex/routing-integration` and `fork/main` only happens after:
+## Promotion Flow
 
-```powershell
-python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
-powershell -ExecutionPolicy Bypass -File .\scripts\test-routing-contract.ps1
-```
+Promotion uses **cherry-pick**, not merge:
+
+1. develop on `codex/routing-integration`
+2. optionally push dev backup to `fork/codex/routing-integration`
+3. create a temporary promote-check branch from `main`
+4. cherry-pick approved commit(s) onto the temp branch
+5. run targeted validation appropriate to the change
+6. require explicit user approval
+7. cherry-pick approved commit(s) onto `main`
+8. optionally push `fork/main`
 
 ## Scheduled Behavior
 
 - cadence: every 4 hours
 - timezone: `America/Vancouver`
+- default profile cron is **paused**
+- dev profile cron is the **active** updater path
 - `noop` runs stay silent
 - successful runs summarize briefly
 - degraded runs report the retained worktree and repair manifest
+
+### Running the dev gateway under WSL
+
+Do not use `gateway install` under WSL.  Run the gateway in a tmux session instead:
+
+```
+tmux new-session -d -s hermes-dev-gateway \
+  "cd /home/hunter/.hermes/hermes-agent-dev && \
+   /home/hunter/.hermes/hermes-agent-dev/venv/bin/python -m hermes_cli.main -p dev gateway run"
+```
+
+Attach later with: `tmux attach -t hermes-dev-gateway`
 
 ## Repair Flow
 
@@ -56,6 +71,11 @@ When `hermes routing update run --json` reports `repair_required` or `verificati
 3. apply the smallest repair
 4. rerun the targeted failing verification command
 5. call `hermes routing update finalize`
+
+Updater repairs happen against **dev retained worktrees only**.
+Retained worktrees are treated as narrow-scope recovery state.
+Archived retired retained worktrees (e.g. `archive/updater-retained-*`) are
+historical reference only and must not be modified.
 
 The deterministic updater remains authoritative for:
 
@@ -82,9 +102,3 @@ The updater automatically:
 - syncs `~/.hermes/SOUL.md`
 - syncs `~/.hermes/skills/routing-layer/SKILL.md`
 - records policy history under `~/.hermes/routing-policy-history/`
-
-Manual backup remains available:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\export-routing-backup.ps1
-```
