@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -696,7 +697,7 @@ def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     )
 
     monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, False, False))
-    monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH, "origin_remote": "origin", "fork_remote": "fork"})
+    monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH, "origin_remote": "origin", "fork_remote": "fork"})
     monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (None, _probe(backend="unavailable", fetch_ready=False, push_ready=False, errors={"push:main": "denied"})))
     monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
     monkeypatch.setattr(
@@ -712,6 +713,7 @@ def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
             "main": {"behind": 1, "ahead": 45},
         },
     )
+    monkeypatch.setattr(rau, "_cherry_pending_count", lambda *args, **kwargs: 1)
 
     summary = rau.routing_update_status(report_root, repo_root)
 
@@ -720,6 +722,7 @@ def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     assert summary["branch_drift"]["main_behind"] == 1
     assert summary["auth"]["backend"] == "unavailable"
     assert summary["promotion_pending"] is True
+    assert summary["promotion_pending_count"] == 1
 
 
 def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypatch):
@@ -731,11 +734,12 @@ def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypat
     monkeypatch.setattr(
         rau,
         "detect_routing_update_topology",
-        lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH, "origin_remote": "origin", "fork_remote": "fork"},
+        lambda repo_root=None: {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH, "origin_remote": "origin", "fork_remote": "fork"},
     )
     monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
     monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: refresh_calls.append(True))
     monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root, ancestor, descendant: False)
+    monkeypatch.setattr(rau, "_cherry_pending_count", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
         rau,
         "_compute_live_drift",
@@ -765,7 +769,7 @@ def test_routing_update_doctor_reports_degraded_when_auth_missing(tmp_path, monk
         "routing_update_status",
         lambda report_root=None, repo_root=None: {
             "repo_root": str(repo_root),
-            "topology": {"matches": True, "current_branch": rau.LIVE_BRANCH},
+            "topology": {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH},
             "auth": {"fetch_ready": False, "push_ready": False, "errors": {"push:main": "denied"}},
             "job": {"installed": True},
             "gateway_running": True,
@@ -780,3 +784,246 @@ def test_routing_update_doctor_reports_degraded_when_auth_missing(tmp_path, monk
 
     assert doctor["status"] == "degraded"
     assert any("push:main" in item for item in doctor["issues"])
+    assert doctor["checks"]["expected_branch"] is True
+
+
+# =============================================================================
+# Split-topology detection tests
+# =============================================================================
+
+class TestDetectRoutingUpdateTopology:
+    def test_live_repo_on_main(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent"
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+
+        monkeypatch.setattr(rau, "_git_output", lambda *args, **kwargs: {
+            ("branch", "--show-current"): "main",
+        }.get(tuple(args[1:]), ""))
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+
+        def fake_git_output(repo_root, *args):
+            mapping = {
+                ("branch", "--show-current"): "main",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        result = rau.detect_routing_update_topology(repo_root)
+        assert result["repo_role"] == "live"
+        assert result["expected_branch"] == "main"
+        assert result["current_branch"] == "main"
+        assert result["live_branch"] == "main"
+        assert result["dev_branch"] == "codex/routing-integration"
+        assert result["live_repo_root"] == str(repo_root)
+        assert result["dev_repo_root"] == str(tmp_path / "hermes-agent-dev")
+        assert result["matches"] is True
+
+    def test_dev_repo_on_dev_branch(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent-dev"
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+
+        def fake_git_output(repo_root, *args):
+            mapping = {
+                ("branch", "--show-current"): "codex/routing-integration",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        result = rau.detect_routing_update_topology(repo_root)
+        assert result["repo_role"] == "dev"
+        assert result["expected_branch"] == "codex/routing-integration"
+        assert result["current_branch"] == "codex/routing-integration"
+        assert result["matches"] is True
+
+    def test_live_repo_wrong_branch(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent"
+        repo_root.mkdir()
+
+        def fake_git_output(repo_root, *args):
+            mapping = {
+                ("branch", "--show-current"): "feature-branch",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        result = rau.detect_routing_update_topology(repo_root)
+        assert result["repo_role"] == "live"
+        assert result["current_branch"] == "feature-branch"
+        assert result["expected_branch"] == "main"
+        assert result["matches"] is False
+
+    def test_unknown_repo(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "other-repo"
+        repo_root.mkdir()
+
+        def fake_git_output(repo_root, *args):
+            mapping = {
+                ("branch", "--show-current"): "main",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        result = rau.detect_routing_update_topology(repo_root)
+        assert result["repo_role"] == "unknown"
+        assert result["expected_branch"] == ""
+        assert result["matches"] is False
+
+
+class TestLiveRepoGuard:
+    def test_refuses_run_from_live_repo(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent"
+        repo_root.mkdir()
+
+        def fake_git_output(repo_root_arg, *args):
+            mapping = {
+                ("branch", "--show-current"): "main",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        with pytest.raises(rau.UpdateError, match="dev repo"):
+            rau._require_dev_repo(repo_root, "routing update run")
+
+    def test_refuses_install_from_live_repo(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent"
+        repo_root.mkdir()
+
+        def fake_git_output(repo_root_arg, *args):
+            mapping = {
+                ("branch", "--show-current"): "main",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        with pytest.raises(rau.UpdateError, match="dev repo"):
+            rau._require_dev_repo(repo_root, "routing update install")
+
+    def test_allows_dev_repo(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "hermes-agent-dev"
+        repo_root.mkdir()
+
+        def fake_git_output(repo_root_arg, *args):
+            mapping = {
+                ("branch", "--show-current"): "codex/routing-integration",
+                ("remote", "get-url", "fork"): rau.EXPECTED_FORK_URL,
+            }
+            return mapping.get(tuple(args), "")
+
+        monkeypatch.setattr(rau, "_normalize_path", lambda p: p if isinstance(p, Path) else Path(p))
+        monkeypatch.setattr(rau, "_origin_url", lambda p: rau.EXPECTED_ORIGIN_URL)
+        monkeypatch.setattr(rau, "_normalize_remote_url", lambda u: u)
+        monkeypatch.setattr(rau, "_git_output", fake_git_output)
+
+        rau._require_dev_repo(repo_root, "routing update run")
+
+
+def test_cherry_pending_count(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    cherry_output = "- abc123 dev commit 1\n+ def456 dev commit 2\n+ 789abc dev commit 3\n"
+    monkeypatch.setattr(rau, "_git_output", lambda *args, **kwargs: cherry_output)
+
+    count = rau._cherry_pending_count(repo_root, "fork/main", "fork/codex/routing-integration")
+    assert count == 2
+
+
+def test_cherry_pending_count_empty(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(rau, "_git_output", lambda *args, **kwargs: "")
+
+    count = rau._cherry_pending_count(repo_root, "fork/main", "fork/codex/routing-integration")
+    assert count == 0
+
+
+def test_doctor_uses_role_aware_terminology(tmp_path, monkeypatch, capsys):
+    repo_root = tmp_path / "hermes-agent-dev"
+    (repo_root / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        rau,
+        "routing_update_status",
+        lambda report_root=None, repo_root=None: {
+            "repo_root": str(repo_root),
+            "topology": {"matches": True, "repo_role": "dev", "current_branch": "codex/routing-integration", "expected_branch": "codex/routing-integration", "live_branch": "main", "dev_branch": "codex/routing-integration"},
+            "auth": {"fetch_ready": True, "push_ready": True, "errors": {}},
+            "job": {"installed": True},
+            "gateway_running": True,
+            "telegram_connected": True,
+            "retained_worktree": "",
+        },
+    )
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(rau, "_is_safe_directory_configured", lambda path: True)
+
+    args = SimpleNamespace(report_root="", repo_root=str(repo_root), json=False)
+    rau.routing_doctor_command(args)
+
+    out = capsys.readouterr().out
+    assert "dev/updater branch" in out
+    assert "codex/routing-integration" in out
+    assert "Repo role: dev" in out
+
+
+def test_status_shows_repo_role(tmp_path, monkeypatch, capsys):
+    repo_root = tmp_path / "hermes-agent-dev"
+    (repo_root / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        rau,
+        "routing_update_status",
+        lambda report_root=None, repo_root=None: {
+            "status": "noop",
+            "message": "",
+            "repo_root": str(repo_root),
+            "topology": {"matches": True, "repo_role": "dev", "current_branch": "codex/routing-integration", "expected_branch": "codex/routing-integration", "live_branch": "main", "dev_branch": "codex/routing-integration"},
+            "branch_drift": {},
+            "auth": {"backend": "unavailable", "fetch_ready": False, "push_ready": False},
+            "job": {"installed": False},
+            "gateway_running": True,
+            "telegram_connected": True,
+            "promotion_pending": True,
+            "promotion_pending_count": 3,
+        },
+    )
+
+    args = SimpleNamespace(report_root="", repo_root=str(repo_root), json=False)
+    rau.routing_status_command(args)
+
+    out = capsys.readouterr().out
+    assert "Repo role: dev" in out
+    assert "Dev/updater branch: codex/routing-integration" in out
+    assert "Promotion candidates (cherry-pick): 3" in out

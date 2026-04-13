@@ -43,6 +43,10 @@ from hermes_cli.routing_update_git import (
 
 
 LIVE_BRANCH = "codex/routing-integration"
+DEV_UPDATER_BRANCH = LIVE_BRANCH
+LIVE_PROTECTED_BRANCH = "main"
+DEV_REPO_BASENAME = "hermes-agent-dev"
+LIVE_REPO_BASENAME = "hermes-agent"
 UPSTREAM_REMOTE = "origin"
 UPSTREAM_REF = "origin/main"
 PUSH_REMOTE = "fork"
@@ -480,6 +484,19 @@ def _origin_url(repo_root: Path) -> str:
     return (result.stdout or "").strip()
 
 
+def _resolve_sibling_repo(repo_root: Path, sibling_basename: str) -> Path:
+    return repo_root.parent / sibling_basename
+
+
+def _detect_repo_role(repo_root: Path) -> str:
+    basename = repo_root.name
+    if basename == LIVE_REPO_BASENAME:
+        return "live"
+    if basename == DEV_REPO_BASENAME:
+        return "dev"
+    return "unknown"
+
+
 def detect_routing_update_topology(repo_root: Path | str | None = None) -> dict[str, Any]:
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
     current_branch = ""
@@ -493,20 +510,34 @@ def detect_routing_update_topology(repo_root: Path | str | None = None) -> dict[
         fork_url = _git_output(repo_root, "remote", "get-url", PUSH_REMOTE)
     except UpdateError:
         fork_url = ""
+
+    repo_role = _detect_repo_role(repo_root)
+    expected_branch = LIVE_PROTECTED_BRANCH if repo_role == "live" else (DEV_UPDATER_BRANCH if repo_role == "dev" else "")
+    live_repo_root = _resolve_sibling_repo(repo_root, LIVE_REPO_BASENAME) if repo_role == "dev" else repo_root if repo_role == "live" else Path("")
+    dev_repo_root = _resolve_sibling_repo(repo_root, DEV_REPO_BASENAME) if repo_role == "live" else repo_root if repo_role == "dev" else Path("")
+
+    remotes_ok = (
+        _normalize_remote_url(origin_url) == _normalize_remote_url(EXPECTED_ORIGIN_URL)
+        and _normalize_remote_url(fork_url) == _normalize_remote_url(EXPECTED_FORK_URL)
+    )
+    branch_ok = bool(expected_branch) and current_branch == expected_branch
+    role_ok = repo_role in ("live", "dev")
+
     return {
         "repo_root": str(repo_root),
+        "repo_role": repo_role,
         "current_branch": current_branch,
-        "live_branch": LIVE_BRANCH,
+        "expected_branch": expected_branch,
+        "live_branch": LIVE_PROTECTED_BRANCH,
+        "dev_branch": DEV_UPDATER_BRANCH,
+        "live_repo_root": str(live_repo_root),
+        "dev_repo_root": str(dev_repo_root),
         "origin_remote": UPSTREAM_REMOTE,
         "origin_url": origin_url,
         "fork_remote": PUSH_REMOTE,
         "fork_url": fork_url,
         "promotion_branch": PROMOTION_BRANCH,
-        "matches": (
-            _normalize_remote_url(origin_url) == _normalize_remote_url(EXPECTED_ORIGIN_URL)
-            and _normalize_remote_url(fork_url) == _normalize_remote_url(EXPECTED_FORK_URL)
-            and bool(LIVE_BRANCH)
-        ),
+        "matches": remotes_ok and role_ok and branch_ok,
     }
 
 
@@ -990,6 +1021,7 @@ def _upsert_cron_job(repo_root: Path, hermes_home: Path) -> tuple[str, list[str]
 
 def install_routing_auto_update(repo_root: Path | None = None) -> InstallResult:
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    _require_dev_repo(repo_root, "routing update install")
     hermes_home = _normalize_path(get_hermes_home())
     _ensure_safe_directory(repo_root)
     _ensure_repo_merge_defaults(repo_root)
@@ -1249,12 +1281,15 @@ def _run_state_machine(
 
     current_branch = _git_output(repo_root, "branch", "--show-current")
     if current_branch != LIVE_BRANCH:
-        raise UpdateError(f"Live repo is on '{current_branch}', expected '{LIVE_BRANCH}'.")
+        raise UpdateError(
+            f"Updater repo is on '{current_branch}', expected dev/updater branch '{LIVE_BRANCH}'. "
+            f"Switch to the dev repo ({DEV_REPO_BASENAME}) on '{LIVE_BRANCH}' to run the updater."
+        )
 
     dirty = _git_output(repo_root, "status", "--porcelain")
     if dirty:
         report.status = "dirty_worktree"
-        report.message = "Live worktree is dirty; routing auto-update aborted before any mutation."
+        report.message = "Dev worktree is dirty; routing auto-update aborted before any mutation."
         return report
 
     merge_issues = _merge_readiness_issues(repo_root)
@@ -1487,9 +1522,28 @@ def _run_state_machine(
     report.repair_blockers = []
     return report
 
+def _require_dev_repo(repo_root: Path, operation: str) -> None:
+    topology = detect_routing_update_topology(repo_root)
+    role = topology.get("repo_role", "unknown")
+    if role == "live":
+        raise UpdateError(
+            f"{operation} must run from the dev repo ({DEV_REPO_BASENAME}) "
+            f"on branch '{DEV_UPDATER_BRANCH}', not from the live repo on '{LIVE_PROTECTED_BRANCH}'."
+        )
+
+
+def _cherry_pending_count(repo_root: Path, live_ref: str, dev_ref: str) -> int:
+    try:
+        output = _git_output(repo_root, "cherry", live_ref, dev_ref)
+    except UpdateError:
+        return 0
+    return sum(1 for line in output.strip().splitlines() if line.startswith("+"))
+
+
 def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
     started = _utc_now()
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    _require_dev_repo(repo_root, "routing update run")
     hermes_home = _normalize_path(get_hermes_home())
     report_root = _normalize_path(report_root or _default_report_root(hermes_home))
 
@@ -1529,6 +1583,7 @@ def run_routing_auto_update(repo_root: Path | None = None, report_root: Path | N
 def finalize_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
     started = _utc_now()
     repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    _require_dev_repo(repo_root, "routing update finalize")
     hermes_home = _normalize_path(get_hermes_home())
     report_root = _normalize_path(report_root or _default_report_root(hermes_home))
 
@@ -1685,14 +1740,15 @@ def routing_update_status(
             "main_behind": int(live_drift["main"]["behind"]),
             "main_ahead": int(live_drift["main"]["ahead"]),
         }
-        summary["promotion_pending"] = any(
-            _promotion_plan(
-                effective_repo,
-                live_drift.get("current_head") or "",
-                live_drift.get("integration_head") or "",
-                live_drift.get("main_head") or "",
-            ).values()
+        topology = detect_routing_update_topology(effective_repo)
+        summary["repo_role"] = topology.get("repo_role", "unknown")
+        cherry_pending = _cherry_pending_count(
+            effective_repo,
+            MAIN_REF,
+            PUSH_REF,
         )
+        summary["promotion_pending"] = cherry_pending > 0
+        summary["promotion_pending_count"] = cherry_pending
 
     summary["auth"] = {
         "backend": auth_backend,
@@ -1716,9 +1772,13 @@ def routing_update_doctor(
     effective_repo = _normalize_path(summary.get("repo_root") or repo_root or PROJECT_ROOT)
 
     issues: list[str] = []
+    topology = summary.get("topology", {})
+    repo_role = topology.get("repo_role", "unknown")
+    expected_branch = topology.get("expected_branch", "")
+    current_branch = topology.get("current_branch", "")
     checks = {
-        "topology": bool(summary.get("topology", {}).get("matches")),
-        "live_branch": summary.get("topology", {}).get("current_branch") == LIVE_BRANCH,
+        "topology": bool(topology.get("matches")),
+        "expected_branch": current_branch == expected_branch if expected_branch else False,
         "safe_directory": _is_safe_directory_configured(effective_repo) if (effective_repo / ".git").exists() else False,
         "merge_defaults": not _merge_readiness_issues(effective_repo) if (effective_repo / ".git").exists() else False,
         "fetch_auth": bool(summary.get("auth", {}).get("fetch_ready")),
@@ -1737,9 +1797,15 @@ def routing_update_doctor(
         if not retained_path.exists():
             issues.append(f"Retained failed worktree is missing: {retained}")
     if not checks["topology"]:
-        issues.append("Repo remotes/branch do not match the routing-maintenance fork topology.")
+        role_label = f" (role={repo_role})" if repo_role != "unknown" else ""
+        branch_label = f" (on '{current_branch}', expected '{expected_branch}')" if expected_branch else ""
+        issues.append(f"Repo remotes/branch do not match the split topology{role_label}{branch_label}.")
+    if not checks["expected_branch"] and expected_branch:
+        issues.append(
+            f"Current branch '{current_branch}' does not match expected '{expected_branch}' for repo role '{repo_role}'."
+        )
     if not checks["safe_directory"]:
-        issues.append("git safe.directory is not configured for the live repo.")
+        issues.append("git safe.directory is not configured for the repo.")
     merge_issues = _merge_readiness_issues(effective_repo) if (effective_repo / ".git").exists() else ["repo missing .git"]
     if merge_issues:
         issues.extend([f"merge readiness: {item}" for item in merge_issues])
@@ -1777,7 +1843,16 @@ def routing_status_command(args) -> None:
         return
 
     drift = summary.get("branch_drift") or {}
+    topology = summary.get("topology", {})
+    repo_role = topology.get("repo_role", "unknown")
     print(f"Routing update status: {summary.get('status')}")
+    print(f"Repo role: {repo_role}")
+    if repo_role == "live":
+        print(f"  Protected live branch: {topology.get('live_branch', '?')}")
+    elif repo_role == "dev":
+        print(f"  Dev/updater branch: {topology.get('dev_branch', '?')}")
+        cherry_count = summary.get("promotion_pending_count", 0)
+        print(f"  Promotion candidates (cherry-pick): {cherry_count}")
     if summary.get("last_run"):
         print(f"Last run: {summary['last_run']}")
     if summary.get("message"):
@@ -1821,7 +1896,15 @@ def routing_doctor_command(args) -> None:
         print(json.dumps(doctor, indent=2))
         return
 
+    summary = doctor.get("summary", {})
+    topology = summary.get("topology", {})
+    repo_role = topology.get("repo_role", "unknown")
     print(f"Routing update doctor: {doctor['status']}")
+    print(f"Repo role: {repo_role}")
+    if repo_role == "live":
+        print(f"  Inspecting protected live branch '{topology.get('live_branch', '?')}'")
+    elif repo_role == "dev":
+        print(f"  Inspecting dev/updater branch '{topology.get('dev_branch', '?')}'")
     print(f"Message: {doctor['message']}")
     for key, value in doctor.get("checks", {}).items():
         print(f"- {key}: {value}")

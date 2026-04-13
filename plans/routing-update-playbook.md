@@ -16,6 +16,21 @@ live `main` is **not** the updater's working branch.
 - live backup target: `fork/main`
 - dev backup target: `fork/codex/routing-integration`
 
+## Split-Topology Awareness
+
+`hermes routing update status` and `hermes routing update doctor` detect the
+repo role automatically based on the repo root basename:
+
+- `hermes-agent` → role `live`, expected branch `main`
+- `hermes-agent-dev` → role `dev`, expected branch `codex/routing-integration`
+
+Both commands work from **either** repo.  Doctor reports which role is being
+inspected and uses correct terminology:
+
+- `main` is the **protected live branch**
+- `codex/routing-integration` is the **dev/updater branch**
+- promotion candidates are counted via `git cherry`
+
 ## Public Commands
 
 - `hermes routing update install`
@@ -26,6 +41,15 @@ live `main` is **not** the updater's working branch.
 
 All operational updater runs for this setup use the dev profile (`-p dev`).
 Live `main` is not the updater's working branch.
+
+### Dev-repo-only guard
+
+`run`, `install`, and `finalize` **must** run from the dev repo
+(`/home/hunter/.hermes/hermes-agent-dev`) on `codex/routing-integration`.
+If invoked against the live repo, they refuse with a clear error explaining
+that updater operations are dev-repo-only.
+
+`status` and `doctor` work from both repos.
 
 ## Promotion Flow
 
@@ -52,15 +76,18 @@ Promotion uses **cherry-pick**, not merge:
 
 ### Running the dev gateway under WSL
 
-Do not use `gateway install` under WSL.  Run the gateway in a tmux session instead:
+Do not use `gateway install` under WSL.  Use the profile-aware tmux helpers
+instead:
 
 ```
-tmux new-session -d -s hermes-dev-gateway \
-  "cd /home/hunter/.hermes/hermes-agent-dev && \
-   /home/hunter/.hermes/hermes-agent-dev/venv/bin/python -m hermes_cli.main -p dev gateway run"
+hermes -p dev gateway tmux-start    # start the dev gateway in tmux
+hermes -p dev gateway tmux-status   # check session, PID, and health
+hermes -p dev gateway tmux-attach   # attach to the tmux session
+hermes -p dev gateway tmux-stop     # stop the tmux session
 ```
 
-Attach later with: `tmux attach -t hermes-dev-gateway`
+The session is automatically named `hermes-dev-gateway` for the dev profile.
+The default profile uses `hermes-gateway`.
 
 ## Repair Flow
 

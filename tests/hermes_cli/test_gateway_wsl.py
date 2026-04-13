@@ -233,7 +233,7 @@ class TestGatewayCommandWSLMessages:
 
         out = capsys.readouterr().out
         assert "WSL note" in out
-        assert "tmux or screen" in out
+        assert "tmux-attach" in out
 
     def test_status_wsl_not_running(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
@@ -331,3 +331,140 @@ class TestFindGatewayPidsFallback:
 
         pids = gateway.find_gateway_pids()
         assert 12345 in pids
+
+
+# =============================================================================
+# tmux gateway helpers
+# =============================================================================
+
+class TestTmuxSessionName:
+    def test_default_profile(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_profile_suffix", lambda: "")
+        assert gateway._tmux_session_name() == "hermes-gateway"
+
+    def test_dev_profile(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_profile_suffix", lambda: "dev")
+        assert gateway._tmux_session_name() == "hermes-dev-gateway"
+
+
+class TestTmuxStart:
+    def test_idempotent_when_already_running(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-dev-gateway")
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [4954])
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: True)
+
+        gateway.tmux_start()
+
+        out = capsys.readouterr().out
+        assert "Already running" in out
+        assert "4954" in out
+
+    def test_starts_when_not_running(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+        monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-gateway")
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [])
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: False)
+        monkeypatch.setattr(gateway, "_tmux_gateway_command", lambda: ["python", "-m", "hermes_cli.main", "gateway", "run"])
+
+        run_calls = []
+        monkeypatch.setattr(
+            gateway.subprocess, "run",
+            lambda *args, **kwargs: run_calls.append(args) or SimpleNamespace(returncode=0),
+        )
+
+        gateway.tmux_start()
+
+        out = capsys.readouterr().out
+        assert "Started gateway in tmux" in out
+        assert len(run_calls) == 1
+
+    def test_unsupported_platform(self, monkeypatch):
+        monkeypatch.setattr(gateway, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+        with pytest.raises(SystemExit):
+            gateway.tmux_start()
+
+
+class TestTmuxStatus:
+    def test_reports_session_and_pid(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-dev-gateway")
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: True)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [4954])
+
+        import gateway.status as gs
+        monkeypatch.setattr(gs, "is_runtime_state_live", lambda state: True)
+        monkeypatch.setattr(gs, "read_runtime_status", lambda: {"gateway_state": "running"})
+
+        gateway.tmux_status()
+
+        out = capsys.readouterr().out
+        assert "hermes-dev-gateway" in out
+        assert "4954" in out
+        assert "Session exists: True" in out
+        assert "healthy" in out
+
+    def test_reports_not_running(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-gateway")
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: False)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [])
+
+        gateway.tmux_status()
+
+        out = capsys.readouterr().out
+        assert "not running" in out.lower()
+
+
+class TestGatewayStatusRecommendsTmuxOnWsl:
+    def test_status_running_recommends_tmux_attach(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [12345])
+        monkeypatch.setattr(gateway, "_runtime_health_lines", lambda: [])
+        monkeypatch.setattr(
+            gateway, "get_systemd_unit_path",
+            lambda system=False: SimpleNamespace(exists=lambda: False),
+        )
+        monkeypatch.setattr(
+            gateway, "get_launchd_plist_path",
+            lambda: SimpleNamespace(exists=lambda: False),
+        )
+
+        args = SimpleNamespace(gateway_command="status", deep=False, system=False)
+        gateway.gateway_command(args)
+
+        out = capsys.readouterr().out
+        assert "tmux-attach" in out
+        assert "tmux-status" in out
+
+    def test_status_not_running_recommends_tmux_start(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [])
+        monkeypatch.setattr(gateway, "_runtime_health_lines", lambda: [])
+        monkeypatch.setattr(
+            gateway, "get_systemd_unit_path",
+            lambda system=False: SimpleNamespace(exists=lambda: False),
+        )
+        monkeypatch.setattr(
+            gateway, "get_launchd_plist_path",
+            lambda: SimpleNamespace(exists=lambda: False),
+        )
+
+        args = SimpleNamespace(gateway_command="status", deep=False, system=False)
+        gateway.gateway_command(args)
+
+        out = capsys.readouterr().out
+        assert "tmux-start" in out
