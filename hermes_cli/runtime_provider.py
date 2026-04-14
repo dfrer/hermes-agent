@@ -313,6 +313,17 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
             resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+            inline_api_key = str(entry.get("api_key", "") or "").strip()
+            api_mode = _parse_api_mode(entry.get("api_mode")) or _parse_api_mode(entry.get("transport"))
+
+            result = {
+                "api_key": resolved_api_key or inline_api_key,
+                "model": entry.get("default_model", ""),
+            }
+            if key_env:
+                result["key_env"] = key_env
+            if api_mode:
+                result["api_mode"] = api_mode
 
             if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
                 # Found match by provider key
@@ -321,8 +332,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     return {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
-                        "api_key": resolved_api_key,
-                        "model": entry.get("default_model", ""),
+                        **result,
                     }
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -335,8 +345,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         return {
                             "name": display_name,
                             "base_url": base_url.strip(),
-                            "api_key": resolved_api_key,
-                            "model": entry.get("default_model", ""),
+                            **result,
                         }
 
     # Fall back to custom_providers: list (legacy format)

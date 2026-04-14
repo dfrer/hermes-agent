@@ -440,15 +440,16 @@ FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
 
         try:
+            main_runtime = {
+                "model": getattr(self, "model", "") or "",
+                "provider": getattr(self, "provider", "") or "",
+                "base_url": getattr(self, "base_url", "") or "",
+                "api_key": getattr(self, "api_key", "") or "",
+                "api_mode": getattr(self, "api_mode", "") or "",
+            }
             call_kwargs = {
                 "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
+                "main_runtime": main_runtime,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": summary_budget * 2,
                 # timeout resolved from auxiliary.compression.timeout config by call_llm

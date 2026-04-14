@@ -163,6 +163,22 @@ def resolve_display_setting(
     return fallback
 
 
+def get_platform_defaults(platform_key: str) -> dict[str, Any]:
+    """Return the built-in defaults for *platform_key* as a fresh dict."""
+    defaults = dict(_GLOBAL_DEFAULTS)
+    plat_defaults = _PLATFORM_DEFAULTS.get(platform_key) or {}
+    defaults.update(plat_defaults)
+    return defaults
+
+
+def get_effective_display(user_config: dict, platform_key: str) -> dict[str, Any]:
+    """Return the resolved display settings for *platform_key*."""
+    return {
+        key: resolve_display_setting(user_config, platform_key, key)
+        for key in OVERRIDEABLE_KEYS
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

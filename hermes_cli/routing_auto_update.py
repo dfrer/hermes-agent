@@ -1134,13 +1134,15 @@ def _prune_retention(hermes_home: Path, repo_root: Path, *, keep_failed_worktree
 
 
 def _current_gateway_health() -> tuple[bool, bool, bool]:
-    runtime = read_runtime_status() or {}
+    from gateway import status as gateway_status
+
+    runtime = gateway_status.read_runtime_status() or {}
     service_installed = False
     if is_linux():
         service_installed = get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()
     elif is_macos():
         service_installed = get_launchd_plist_path().exists()
-    gateway_running = bool(find_gateway_pids()) or is_runtime_state_live(runtime)
+    gateway_running = bool(find_gateway_pids()) or gateway_status.is_runtime_state_live(runtime)
     telegram_state = ((runtime.get("platforms") or {}).get("telegram") or {}).get("state", "")
     telegram_connected = telegram_state == "connected"
     return gateway_running, service_installed, telegram_connected

@@ -25,6 +25,7 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     (fake_home / "cron").mkdir()
     (fake_home / "memories").mkdir()
     (fake_home / "skills").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
     # Reset plugin singleton so tests don't leak plugins from ~/.hermes/plugins/
     try:
@@ -40,6 +41,13 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     # Avoid making real calls during tests if this key is set in the env files
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_AUXILIARY_"):
+            monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture()

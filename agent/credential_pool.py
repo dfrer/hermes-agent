@@ -1168,7 +1168,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # store has no tokens.  This mirrors resolve_codex_runtime_credentials()
         # so that load_pool() and list_authenticated_providers() detect tokens
         # that only exist in the Codex CLI shared file.
-        if not (isinstance(tokens, dict) and tokens.get("access_token")):
+        if not entries and not (isinstance(tokens, dict) and tokens.get("access_token")):
             try:
                 from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
                 cli_tokens = _import_codex_cli_tokens()
