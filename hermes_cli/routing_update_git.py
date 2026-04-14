@@ -135,8 +135,15 @@ def _probe_backend(
         live_branch: False,
         promotion_branch: False,
     }
+
+    def _local_push_source(branch_name: str) -> str:
+        local_ref = f"refs/heads/{branch_name}"
+        result = backend.run(["show-ref", "--verify", "--quiet", local_ref], check=False)
+        return local_ref if result.returncode == 0 else "HEAD"
+
+    live_source = _local_push_source(live_branch)
     live_result = backend.run(
-        ["push", "--porcelain", "--dry-run", push_remote, f"HEAD:refs/heads/{live_branch}"],
+        ["push", "--porcelain", "--dry-run", push_remote, f"{live_source}:refs/heads/{live_branch}"],
         check=False,
     )
     if live_result.returncode == 0:
@@ -144,8 +151,9 @@ def _probe_backend(
     else:
         errors[f"push:{live_branch}"] = (live_result.stderr or live_result.stdout or "").strip() or "unknown error"
 
+    main_source = _local_push_source(promotion_branch)
     main_result = backend.run(
-        ["push", "--porcelain", "--dry-run", push_remote, f"HEAD:refs/heads/{promotion_branch}"],
+        ["push", "--porcelain", "--dry-run", push_remote, f"{main_source}:refs/heads/{promotion_branch}"],
         check=False,
     )
     if main_result.returncode == 0:
