@@ -2884,7 +2884,7 @@ def cmd_routing(args):
         from hermes_cli import routing_auto_update as rau
 
         subcommand = getattr(args, "routing_update_command", None)
-        if subcommand in ("install", "run", "finalize"):
+        if subcommand in ("install", "run", "cycle", "repair", "finalize"):
             repo_root = getattr(args, "repo_root", PROJECT_ROOT)
             from pathlib import Path
             try:
@@ -2910,6 +2910,26 @@ def cmd_routing(args):
             else:
                 print(rau._render_markdown_report(report))
             return
+        if subcommand == "cycle":
+            report = rau.cycle_routing_auto_update(
+                getattr(args, "repo_root", PROJECT_ROOT),
+                getattr(args, "report_root", "") or None,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(report), indent=2))
+            else:
+                print(rau._render_markdown_report(report))
+            return
+        if subcommand == "repair":
+            report = rau.repair_routing_auto_update(
+                getattr(args, "repo_root", PROJECT_ROOT),
+                getattr(args, "report_root", "") or None,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(report), indent=2))
+            else:
+                print(rau._render_markdown_report(report))
+            return
         if subcommand == "status":
             rau.routing_status_command(args)
             return
@@ -2926,7 +2946,7 @@ def cmd_routing(args):
             else:
                 print(rau._render_markdown_report(report))
             return
-    print("Usage: hermes routing update {install|run|status|doctor}")
+    print("Usage: hermes routing update {install|run|cycle|repair|status|doctor}")
 
 
 def cmd_status(args):
@@ -3767,8 +3787,8 @@ def cmd_update(args):
     from hermes_cli.routing_auto_update import (
         UpdateReport,
         _render_markdown_report,
+        cycle_routing_auto_update,
         detect_routing_update_topology,
-        run_routing_auto_update,
     )
     from hermes_cli.runtime_layout import DEV_RUNTIME_PROFILE, bootstrap_split_runtime, get_admin_root, get_profile_home
 
@@ -3780,8 +3800,8 @@ def cmd_update(args):
     if topology.get("matches") and not getattr(args, "legacy_stock_update", False):
         bootstrap_split_runtime()
         if topology.get("repo_role") == "dev":
-            print("Routing-aware fork topology detected. Running `hermes-dev routing update run` from the dev checkout.")
-            report = run_routing_auto_update(PROJECT_ROOT)
+            print("Routing-aware fork topology detected. Running `hermes-dev routing update cycle` from the dev checkout.")
+            report = cycle_routing_auto_update(PROJECT_ROOT)
             print(_render_markdown_report(report))
             return
 
@@ -3805,7 +3825,7 @@ def cmd_update(args):
                 DEV_RUNTIME_PROFILE,
                 "routing",
                 "update",
-                "run",
+                "cycle",
                 "--json",
                 "--repo-root",
                 str(dev_repo_root),
@@ -5121,6 +5141,20 @@ For more help on a command:
     routing_update_run.add_argument("--repo-root", default=str(PROJECT_ROOT))
     routing_update_run.add_argument("--report-root", default="", help="Override report directory")
     routing_update_run.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_cycle = routing_update_subparsers.add_parser(
+        "cycle",
+        help="Run the guarded unattended routing-aware update cycle once",
+    )
+    routing_update_cycle.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_cycle.add_argument("--report-root", default="", help="Override report directory")
+    routing_update_cycle.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_repair = routing_update_subparsers.add_parser(
+        "repair",
+        help="Run one guarded Codex repair attempt for the retained routing worktree",
+    )
+    routing_update_repair.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_repair.add_argument("--report-root", default="", help="Override report directory")
+    routing_update_repair.add_argument("--json", action="store_true", help="Emit structured JSON")
     routing_update_status = routing_update_subparsers.add_parser(
         "status",
         help="Summarize the latest guarded routing update report",

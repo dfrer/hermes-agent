@@ -64,7 +64,7 @@ def test_run_trust_gate_uses_addopts_override_and_optional_xdist(monkeypatch, tm
 
     monkeypatch.setattr(rau, "_trust_gate_supports_xdist", lambda: True)
     monkeypatch.setattr(rau, "_resolve_powershell_command", lambda path: ["pwsh", "-File", str(path)])
-    monkeypatch.setattr(rau, "_run_subprocess", lambda cmd, cwd=None: executed.append((cmd, cwd)) or _ok_completed(cmd))
+    monkeypatch.setattr(rau, "_run_validation_command", lambda cmd, cwd=None: executed.append((cmd, cwd)) or rau._shell_join(cmd))
 
     result = rau._run_trust_gate(tmp_path)
 
@@ -133,9 +133,11 @@ def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_
     assert jobs[0]["name"] == rau.ROUTING_AUTO_UPDATE_JOB_NAME
     assert jobs[0]["deliver"] == rau.ROUTING_AUTO_UPDATE_DELIVERY
     assert jobs[0]["skills"] == ["routing-layer"]
-    assert "hermes-dev routing update run --json" in jobs[0]["prompt"]
-    assert "hermes-dev routing update finalize --json" in jobs[0]["prompt"]
+    assert "hermes-dev routing update cycle --json" in jobs[0]["prompt"]
+    assert "routing update finalize" not in jobs[0]["prompt"]
     assert "[SILENT]" in jobs[0]["prompt"]
+    assert config["routing_auto_update"]["codex_repair"]["enabled"] is True
+    assert config["routing_auto_update"]["codex_repair"]["model"] == "gpt-5.4"
 
 
 def test_install_routing_auto_update_pauses_duplicate_jobs(tmp_path, tmp_hermes_home, monkeypatch):
@@ -1267,3 +1269,178 @@ def test_status_shows_repo_role(tmp_path, monkeypatch, capsys):
     assert "Repo role: dev" in out
     assert "Dev/updater branch: codex/routing-integration" in out
     assert "Promotion candidates (cherry-pick): 3" in out
+
+
+def test_cycle_routing_auto_update_noop_skips_repair_and_finalize(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(rau, "_require_dev_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_run_preflight_fixers", lambda *args, **kwargs: {"actions": ["preflight"], "background_conflicts": []})
+    monkeypatch.setattr(
+        rau,
+        "run_routing_auto_update",
+        lambda *args, **kwargs: rau.UpdateReport(
+            status="noop",
+            started_at=rau._iso(rau._utc_now()),
+            finished_at=rau._iso(rau._utc_now()),
+            repo_root=str(repo_root),
+            message="No upstream changes to apply and fork promotion is already in sync.",
+        ),
+    )
+    monkeypatch.setattr(rau, "repair_routing_auto_update", lambda *args, **kwargs: pytest.fail("repair should not run"))
+    monkeypatch.setattr(rau, "finalize_routing_auto_update", lambda *args, **kwargs: pytest.fail("finalize should not run"))
+    monkeypatch.setattr(rau, "_write_report_files", lambda *args, **kwargs: None)
+
+    report = rau.cycle_routing_auto_update(repo_root, tmp_hermes_home / "cron" / "output" / rau.REPORT_DIR_NAME)
+
+    assert report.status == "noop"
+    assert report.preflight_actions == ["preflight"]
+
+
+def test_repair_routing_auto_update_respects_attempt_limit(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    report_root = tmp_hermes_home / "cron" / "output" / rau.REPORT_DIR_NAME
+    latest = {
+        "status": "verification_failed",
+        "started_at": "2026-04-13T00:00:00+00:00",
+        "finished_at": "2026-04-13T00:01:00+00:00",
+        "repo_root": str(repo_root),
+        "retained_failed_worktree": str(retained),
+        "retained_failed_worktree_valid": True,
+        "repair_signature": "sig-1",
+        "repair_attempt_count": 1,
+        "repair_target_command": f"{rau.sys.executable} -m pytest -q -x --maxfail=1 tests/test_sample.py::test_case",
+        "repair_failure_kind": "verification_failed",
+    }
+
+    monkeypatch.setattr(rau, "_require_dev_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "read_latest_update_report", lambda report_root=None: latest)
+    monkeypatch.setattr(rau, "_run_preflight_fixers", lambda *args, **kwargs: {"actions": [], "background_conflicts": []})
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (False, False, False))
+    monkeypatch.setattr(rau, "_latest_retained_failure", lambda *args, **kwargs: dict(latest))
+    monkeypatch.setattr(
+        rau,
+        "_ensure_repair_manifest_for_report",
+        lambda *args, **kwargs: {
+            "failure_kind": "verification_failed",
+            "repair_signature": "sig-1",
+            "repair_target_command": latest["repair_target_command"],
+            "repair_target_argv": [rau.sys.executable, "-m", "pytest", "-q", "-x", "--maxfail=1", "tests/test_sample.py::test_case"],
+            "repair_eligible": True,
+            "repair_blockers": [],
+        },
+    )
+    monkeypatch.setattr(rau, "_load_codex_repair_config", lambda config=None: {**rau.DEFAULT_CODEX_REPAIR_CONFIG, "max_attempts_per_signature": 1})
+    monkeypatch.setattr(rau, "_codex_cli_available", lambda: True)
+    monkeypatch.setattr(rau, "_write_report_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_prune_retention", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_invoke_codex_repair", lambda *args, **kwargs: pytest.fail("codex should not run"))
+
+    report = rau.repair_routing_auto_update(repo_root, report_root)
+
+    assert report.repair_status == "skipped"
+    assert "limit reached" in report.escalation_reason
+
+
+def test_repair_routing_auto_update_validates_target_and_records_transcript(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    report_root = tmp_hermes_home / "cron" / "output" / rau.REPORT_DIR_NAME
+    target_cmd = f"{rau.sys.executable} -m pytest -q -x --maxfail=1 tests/test_sample.py::test_case"
+    latest = {
+        "status": "verification_failed",
+        "started_at": "2026-04-13T00:00:00+00:00",
+        "finished_at": "2026-04-13T00:01:00+00:00",
+        "repo_root": str(repo_root),
+        "retained_failed_worktree": str(retained),
+        "retained_failed_worktree_valid": True,
+        "repair_failure_kind": "verification_failed",
+        "repair_target_command": target_cmd,
+    }
+    transcript_dir = report_root / rau.REPAIR_TRANSCRIPT_DIR_NAME / "20260413-010000"
+    output_path = transcript_dir / "response.json"
+
+    monkeypatch.setattr(rau, "_require_dev_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "read_latest_update_report", lambda report_root=None: latest)
+    monkeypatch.setattr(rau, "_run_preflight_fixers", lambda *args, **kwargs: {"actions": [], "background_conflicts": []})
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (False, False, False))
+    monkeypatch.setattr(rau, "_latest_retained_failure", lambda *args, **kwargs: dict(latest))
+    monkeypatch.setattr(
+        rau,
+        "_ensure_repair_manifest_for_report",
+        lambda *args, **kwargs: {
+            "failure_kind": "verification_failed",
+            "repair_signature": "sig-2",
+            "repair_target_command": target_cmd,
+            "repair_target_argv": [rau.sys.executable, "-m", "pytest", "-q", "-x", "--maxfail=1", "tests/test_sample.py::test_case"],
+            "repair_eligible": True,
+            "repair_blockers": [],
+        },
+    )
+    monkeypatch.setattr(rau, "_load_codex_repair_config", lambda config=None: dict(rau.DEFAULT_CODEX_REPAIR_CONFIG))
+    monkeypatch.setattr(rau, "_codex_cli_available", lambda: True)
+    monkeypatch.setattr(rau, "_invoke_codex_repair", lambda **kwargs: ({"status": "fixed", "summary": "patched"}, transcript_dir, output_path))
+    monkeypatch.setattr(rau, "_run_validation_command", lambda argv, cwd=None: rau._shell_join(argv))
+    monkeypatch.setattr(rau, "_write_report_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_prune_retention", lambda *args, **kwargs: None)
+
+    report = rau.repair_routing_auto_update(repo_root, report_root)
+
+    assert report.repair_status == "validated"
+    assert report.repair_attempt_count == 1
+    assert report.repair_signature == "sig-2"
+    assert report.repair_transcript_dir == str(transcript_dir)
+    assert report.repair_output_path == str(output_path)
+
+
+def test_cycle_routing_auto_update_finalizes_after_validated_repair(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report_root = tmp_hermes_home / "cron" / "output" / rau.REPORT_DIR_NAME
+
+    monkeypatch.setattr(rau, "_require_dev_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_run_preflight_fixers", lambda *args, **kwargs: {"actions": ["preflight"], "background_conflicts": []})
+    monkeypatch.setattr(
+        rau,
+        "run_routing_auto_update",
+        lambda *args, **kwargs: rau.UpdateReport(
+            status="verification_failed",
+            started_at=rau._iso(rau._utc_now()),
+            finished_at=rau._iso(rau._utc_now()),
+            repo_root=str(repo_root),
+        ),
+    )
+    monkeypatch.setattr(
+        rau,
+        "repair_routing_auto_update",
+        lambda *args, **kwargs: rau.UpdateReport(
+            status="verification_failed",
+            started_at=rau._iso(rau._utc_now()),
+            finished_at=rau._iso(rau._utc_now()),
+            repo_root=str(repo_root),
+            repair_status="validated",
+        ),
+    )
+    monkeypatch.setattr(
+        rau,
+        "finalize_routing_auto_update",
+        lambda *args, **kwargs: rau.UpdateReport(
+            status="updated",
+            started_at=rau._iso(rau._utc_now()),
+            finished_at=rau._iso(rau._utc_now()),
+            repo_root=str(repo_root),
+            message="finalized",
+        ),
+    )
+    monkeypatch.setattr(rau, "_write_report_files", lambda *args, **kwargs: None)
+
+    report = rau.cycle_routing_auto_update(repo_root, report_root)
+
+    assert report.status == "updated"
+    assert report.preflight_actions == ["preflight"]

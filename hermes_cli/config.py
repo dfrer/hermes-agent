@@ -426,6 +426,16 @@ DEFAULT_CONFIG = {
         # Empty means use the built-in canonical defaults.
         "routes": {},
     },
+    "routing_auto_update": {
+        "codex_repair": {
+            "enabled": True,
+            "model": "gpt-5.4",
+            "reasoning_effort": "xhigh",
+            "scope": "medium",
+            "timeout_minutes": 15,
+            "max_attempts_per_signature": 1,
+        },
+    },
     "entitlements": {
         "enabled": True,
         "locked_spend_classes": ["openai", "anthropic"],
