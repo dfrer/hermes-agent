@@ -1269,8 +1269,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return json.dumps({"result": structured})
             return json.dumps({"result": text_result})
 
+        call_coro = _call()
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop(call_coro, timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP tool %s/%s call failed: %s",
@@ -1281,6 +1282,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     f"MCP call failed: {type(exc).__name__}: {exc}"
                 )
             })
+        finally:
+            if inspect.iscoroutine(call_coro):
+                call_coro.close()
 
     return _handler
 
