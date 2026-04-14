@@ -10,6 +10,7 @@ import pytest
 
 import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
+import hermes_constants
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
@@ -138,6 +139,58 @@ def test_run_doctor_reports_routing_auto_update_readiness(monkeypatch, tmp_path,
     assert "push:main: denied" in out
 
 
+def test_run_doctor_uses_canonical_updater_context(monkeypatch, tmp_path):
+    live_repo = tmp_path / "hermes-agent"
+    dev_repo = tmp_path / "hermes-agent-dev"
+    live_repo.mkdir()
+    dev_repo.mkdir()
+
+    current_home = tmp_path / ".hermes" / "profiles" / "main"
+    dev_home = tmp_path / ".hermes" / "profiles" / "dev"
+    current_home.mkdir(parents=True)
+    dev_home.mkdir(parents=True)
+    (current_home / "config.yaml").write_text("memory: {}\n")
+    (current_home / ".env").write_text("")
+
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", live_repo)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", current_home)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(current_home))
+    monkeypatch.setenv("HERMES_HOME", str(current_home))
+    monkeypatch.setattr(
+        "hermes_cli.routing_auto_update.detect_routing_update_topology",
+        lambda repo_root=None: {
+            "repo_role": "live",
+            "dev_repo_root": str(dev_repo),
+        },
+    )
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.setattr("hermes_cli.auth.get_nous_auth_status", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth.get_codex_auth_status", lambda: {})
+
+    seen = {}
+
+    def fake_routing_update_doctor(report_root=None, repo_root=None):
+        seen["repo_root"] = repo_root
+        seen["hermes_home"] = os.environ.get("HERMES_HOME")
+        return {"status": "ready", "issues": []}
+
+    monkeypatch.setattr(
+        "hermes_cli.routing_auto_update.routing_update_doctor",
+        fake_routing_update_doctor,
+    )
+
+    doctor_mod.run_doctor(Namespace(fix=False))
+
+    assert seen["repo_root"] == dev_repo
+    assert seen["hermes_home"] == str(dev_home)
+    assert os.environ.get("HERMES_HOME") != str(dev_home)
+
+
 def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
     unit_path.write_text("[Unit]\n")
@@ -156,6 +209,29 @@ def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path,
     assert issues == [
         "Enable linger for the gateway user service: sudo loginctl enable-linger $USER"
     ]
+
+
+def test_check_gateway_service_linger_uses_info_on_wsl_without_systemd(monkeypatch, tmp_path, capsys):
+    unit_path = tmp_path / "hermes-gateway.service"
+    unit_path.write_text("[Unit]\n")
+
+    monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+    monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_systemd_linger_status",
+        lambda: (None, "System has not been booted with systemd as init system (PID 1). Can't operate."),
+    )
+    monkeypatch.setattr(hermes_constants, "is_wsl", lambda: True)
+
+    issues = []
+    doctor._check_gateway_service_linger(issues)
+
+    out = capsys.readouterr().out
+    assert "Gateway Service" in out
+    assert "WSL detected without systemd" in out
+    assert "Could not verify systemd linger" not in out
+    assert issues == []
 
 
 def test_check_gateway_service_linger_skips_when_service_not_installed(monkeypatch, tmp_path, capsys):
