@@ -45,7 +45,7 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     for key in tuple(os.environ):
-        if key.startswith("HERMES_AUXILIARY_"):
+        if key.startswith(("HERMES_AUXILIARY_", "AUXILIARY_", "CONTEXT_")):
             monkeypatch.delenv(key, raising=False)
 
 

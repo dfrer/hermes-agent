@@ -16,7 +16,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     for key in tuple(os.environ):
-        if key.startswith("HERMES_AUXILIARY_"):
+        if key.startswith(("HERMES_AUXILIARY_", "AUXILIARY_", "CONTEXT_")):
             monkeypatch.delenv(key, raising=False)
     try:
         from agent import auxiliary_client as aux

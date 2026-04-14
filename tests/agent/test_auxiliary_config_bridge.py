@@ -59,13 +59,13 @@ def _run_auxiliary_bridge(config_dict, monkeypatch):
             base_url = str(task_cfg.get("base_url", "")).strip()
             api_key = str(task_cfg.get("api_key", "")).strip()
             if prov and prov != "auto":
-                os.environ[env_map["provider"]] = prov
+                monkeypatch.setenv(env_map["provider"], prov)
             if model:
-                os.environ[env_map["model"]] = model
+                monkeypatch.setenv(env_map["model"], model)
             if base_url:
-                os.environ[env_map["base_url"]] = base_url
+                monkeypatch.setenv(env_map["base_url"], base_url)
             if api_key:
-                os.environ[env_map["api_key"]] = api_key
+                monkeypatch.setenv(env_map["api_key"], api_key)
 
 
 # ── Config bridging tests ────────────────────────────────────────────────────
