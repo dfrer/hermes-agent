@@ -8,6 +8,8 @@ import os
 import sys
 import subprocess
 import shutil
+from contextlib import contextmanager
+from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_constants import display_hermes_home
@@ -113,6 +115,51 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
     return updated_available, updated_unavailable
 
 
+@contextmanager
+def _temporary_hermes_home(path: Path | None):
+    """Temporarily point HERMES_HOME at *path* for profile-scoped checks."""
+    if path is None:
+        yield
+        return
+
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+def _resolve_canonical_routing_update_context() -> tuple[Path, Path]:
+    """Prefer the dev/updater repo and matching profile when present."""
+    repo_root = PROJECT_ROOT
+    hermes_home = HERMES_HOME
+
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        from hermes_cli.routing_auto_update import DEV_REPO_BASENAME, detect_routing_update_topology
+    except Exception:
+        return repo_root, hermes_home
+
+    topology = detect_routing_update_topology(PROJECT_ROOT)
+    repo_role = str(topology.get("repo_role") or "")
+    dev_repo_raw = str(topology.get("dev_repo_root") or "")
+    if repo_role == "live" and dev_repo_raw:
+        candidate_repo = Path(dev_repo_raw)
+        if candidate_repo.exists():
+            repo_root = candidate_repo
+
+    if repo_root.name == DEV_REPO_BASENAME and profile_exists("dev"):
+        candidate_home = get_profile_dir("dev")
+        if candidate_home.exists():
+            hermes_home = candidate_home
+
+    return repo_root, hermes_home
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -134,6 +181,7 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
             get_systemd_unit_path,
             is_linux,
         )
+        from hermes_constants import is_wsl
     except Exception as e:
         check_warn("Gateway service linger", f"(could not import gateway helpers: {e})")
         return
@@ -156,7 +204,10 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_info("Run: sudo loginctl enable-linger $USER")
         issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
     else:
-        check_warn("Could not verify systemd linger", f"({linger_detail})")
+        if is_wsl() and "System has not been booted with systemd as init system" in str(linger_detail):
+            check_info("WSL detected without systemd; linger does not apply to tmux/manual gateway mode")
+        else:
+            check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
 def run_doctor(args):
@@ -408,7 +459,9 @@ def run_doctor(args):
     try:
         from hermes_cli.routing_auto_update import routing_update_doctor
 
-        update_doctor = routing_update_doctor(repo_root=PROJECT_ROOT)
+        updater_repo_root, updater_hermes_home = _resolve_canonical_routing_update_context()
+        with _temporary_hermes_home(updater_hermes_home):
+            update_doctor = routing_update_doctor(repo_root=updater_repo_root)
         if update_doctor.get("status") == "ready":
             check_ok("Canonical routing updater", "(ready)")
         else:
