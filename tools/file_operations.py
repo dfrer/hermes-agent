@@ -83,6 +83,13 @@ def _write_denied_prefixes() -> list[str]:
     ]
 
 
+# Backward-compatible exports for tests and callers that introspect the deny
+# list directly. _is_write_denied() remains authoritative because it resolves
+# against the current HOME/HERMES_HOME at call time.
+WRITE_DENIED_PATHS = _write_denied_paths()
+WRITE_DENIED_PREFIXES = _write_denied_prefixes()
+
+
 def _get_safe_write_root() -> Optional[str]:
     """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
 

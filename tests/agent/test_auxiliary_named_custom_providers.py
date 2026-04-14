@@ -12,6 +12,19 @@ def _isolate(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_AUXILIARY_"):
+            monkeypatch.delenv(key, raising=False)
+    try:
+        from agent import auxiliary_client as aux
+
+        aux.shutdown_cached_clients()
+        aux._client_cache.clear()
+    except Exception:
+        pass
     # Write a minimal config so load_config doesn't fail
     (hermes_home / "config.yaml").write_text("model:\n  default: test-model\n")
 
