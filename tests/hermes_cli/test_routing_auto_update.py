@@ -9,6 +9,7 @@ import pytest
 
 from cron.jobs import create_job, list_jobs
 from hermes_cli import routing_auto_update as rau
+from hermes_cli import routing_update_git as rug
 from hermes_cli.config import load_config
 from hermes_cli.routing_update_git import GitBackend, GitBackendProbe, _linux_to_windows_path
 
@@ -97,6 +98,52 @@ def test_repair_eligibility_accepts_narrow_source_and_test_changes():
 
     assert eligible is True
     assert blockers == []
+
+
+def test_probe_backend_uses_local_branch_refs_for_push_checks():
+    calls = []
+
+    class FakeBackend:
+        def run(self, args, check=False):
+            calls.append(list(args))
+            if args[:2] == ["ls-remote", "--heads"]:
+                return _ok_completed(args)
+            if args[:3] == ["show-ref", "--verify", "--quiet"]:
+                return _ok_completed(args)
+            if args[:3] == ["push", "--porcelain", "--dry-run"]:
+                return _ok_completed(args)
+            raise AssertionError(f"Unexpected git args: {args}")
+
+    fetch_ready, push_ready, push_targets, errors = rug._probe_backend(
+        FakeBackend(),
+        upstream_remote=rau.UPSTREAM_REMOTE,
+        push_remote=rau.PUSH_REMOTE,
+        live_branch=rau.LIVE_BRANCH,
+        promotion_branch=rau.PROMOTION_BRANCH,
+    )
+
+    push_calls = [args for args in calls if args[:3] == ["push", "--porcelain", "--dry-run"]]
+
+    assert fetch_ready is True
+    assert push_ready is True
+    assert push_targets == {rau.LIVE_BRANCH: True, rau.PROMOTION_BRANCH: True}
+    assert errors == {}
+    assert push_calls == [
+        [
+            "push",
+            "--porcelain",
+            "--dry-run",
+            rau.PUSH_REMOTE,
+            f"refs/heads/{rau.LIVE_BRANCH}:refs/heads/{rau.LIVE_BRANCH}",
+        ],
+        [
+            "push",
+            "--porcelain",
+            "--dry-run",
+            rau.PUSH_REMOTE,
+            f"refs/heads/{rau.PROMOTION_BRANCH}:refs/heads/{rau.PROMOTION_BRANCH}",
+        ],
+    ]
 
 
 def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_home, monkeypatch):
