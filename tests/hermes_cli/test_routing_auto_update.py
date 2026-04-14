@@ -486,6 +486,96 @@ def test_run_state_machine_realigns_to_promoted_main_and_repairs_integration_bra
     assert "integration branch" in result.message
 
 
+def test_run_state_machine_noop_fast_forwards_sibling_live_checkout(tmp_path, monkeypatch):
+    repo_root = tmp_path / "hermes-agent-dev"
+    live_repo_root = tmp_path / "hermes-agent"
+    (repo_root / ".git").mkdir(parents=True)
+    (live_repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+    refresh_calls = []
+    merge_calls = []
+
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {
+            "matches": True,
+            "repo_role": "dev",
+            "current_branch": rau.LIVE_BRANCH,
+            "live_repo_root": str(live_repo_root),
+        },
+    )
+    monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+
+    def fake_git_output(repo_root_arg, *args, cwd=None):
+        mapping = {
+            (repo_root, ("branch", "--show-current")): rau.LIVE_BRANCH,
+            (repo_root, ("status", "--porcelain")): "",
+            (live_repo_root, ("branch", "--show-current")): rau.LIVE_PROTECTED_BRANCH,
+            (live_repo_root, ("status", "--porcelain")): "",
+        }
+        return mapping[(repo_root_arg, tuple(args))]
+
+    monkeypatch.setattr(rau, "_git_output", fake_git_output)
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+
+    def fake_refresh(repo_root_arg, backend):
+        refresh_calls.append(repo_root_arg)
+
+    monkeypatch.setattr(rau, "_refresh_remote_refs", fake_refresh)
+
+    def fake_current_ref(repo_root_arg, ref):
+        mapping = {
+            (repo_root, "HEAD"): "abc123",
+            (repo_root, rau.UPSTREAM_REF): "abc123",
+            (repo_root, rau.PUSH_REF): "abc123",
+            (repo_root, rau.MAIN_REF): "abc123",
+            (live_repo_root, "HEAD"): "live-old",
+            (live_repo_root, rau.MAIN_REF): "abc123",
+        }
+        return mapping.get((repo_root_arg, ref), "")
+
+    monkeypatch.setattr(rau, "_current_ref", fake_current_ref)
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "abc123",
+            "upstream_head": "abc123",
+            "integration_head": "abc123",
+            "main_head": "abc123",
+            "upstream": {"behind": 0, "ahead": 0},
+            "integration": {"behind": 0, "ahead": 0},
+            "main": {"behind": 0, "ahead": 0},
+        },
+    )
+
+    def fake_is_ancestor(repo_root_arg, ancestor, descendant):
+        if repo_root_arg == repo_root and ancestor == rau.UPSTREAM_REF and descendant == "HEAD":
+            return True
+        if repo_root_arg == live_repo_root and ancestor == "live-old" and descendant == rau.MAIN_REF:
+            return True
+        return False
+
+    monkeypatch.setattr(rau, "_git_is_ancestor", fake_is_ancestor)
+
+    def fake_git(repo_root_arg, *args, cwd=None, check=True):
+        if repo_root_arg == live_repo_root and args == ("merge", "--ff-only", rau.MAIN_REF):
+            merge_calls.append((repo_root_arg, args))
+        return _ok_completed(args)
+
+    monkeypatch.setattr(rau, "_git", fake_git)
+
+    result = rau._run_state_machine(repo_root, report_root, report)
+
+    assert result.status == "noop"
+    assert refresh_calls == [repo_root, live_repo_root]
+    assert merge_calls == [(live_repo_root, ("merge", "--ff-only", rau.MAIN_REF))]
+
+
 def test_run_state_machine_merge_conflict_writes_repair_manifest(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)

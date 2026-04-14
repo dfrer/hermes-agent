@@ -1286,6 +1286,52 @@ def _realign_live_branch_to_promoted_head(repo_root: Path, current_head: str, in
     return ""
 
 
+def _sync_live_checkout_to_promoted_main(
+    repo_root: Path,
+    backend: GitBackend | None,
+    *,
+    topology: dict[str, Any] | None = None,
+) -> bool:
+    topology = topology or detect_routing_update_topology(repo_root)
+    live_repo_root_raw = str(topology.get("live_repo_root") or "")
+    if not live_repo_root_raw:
+        return False
+
+    live_repo_root = _normalize_path(live_repo_root_raw)
+    if live_repo_root == _normalize_path(repo_root) or not (live_repo_root / ".git").exists():
+        return False
+
+    _ensure_safe_directory(live_repo_root)
+
+    current_branch = _git_output(live_repo_root, "branch", "--show-current")
+    if current_branch != LIVE_PROTECTED_BRANCH:
+        return False
+
+    dirty = _git_output(live_repo_root, "status", "--porcelain")
+    if dirty:
+        return False
+
+    live_backend = None
+    if backend is not None:
+        live_backend = GitBackend(kind=backend.kind, executable=backend.executable, repo_root=live_repo_root)
+    _refresh_remote_refs(live_repo_root, live_backend)
+
+    current_head = _current_ref(live_repo_root, "HEAD")
+    target_head = _current_ref(live_repo_root, MAIN_REF)
+    if not current_head or not target_head or current_head == target_head:
+        return False
+    if not _git_is_ancestor(live_repo_root, current_head, MAIN_REF):
+        return False
+
+    ff_result = _git(live_repo_root, "merge", "--ff-only", MAIN_REF, check=False)
+    if ff_result.returncode != 0:
+        stderr = (ff_result.stderr or ff_result.stdout or "").strip() or "unknown error"
+        raise UpdateError(
+            f"Could not fast-forward live checkout on {LIVE_PROTECTED_BRANCH} to {MAIN_REF}: {stderr}"
+        )
+    return True
+
+
 def _backup_ref_name(label: str, stamp: str) -> str:
     safe = label.replace("/", "-")
     return f"{REMOTE_BACKUP_REF_PREFIX}/{stamp}/{safe}"
@@ -1598,6 +1644,7 @@ def _run_state_machine(
             )
             report.status = "updated" if promotion_ok else "push_failed"
             if report.status == "updated":
+                _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
                 if realigned_to:
                     if promotion_plan["integration"] and not promotion_plan["main"]:
                         report.message = (
@@ -1621,6 +1668,7 @@ def _run_state_machine(
         report.push_status = "not_needed"
         report.integration_push_status = "not_needed"
         report.main_promotion_status = "not_needed"
+        _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
         if realigned_to:
             report.message = f"No upstream changes to apply; fast-forwarded {LIVE_BRANCH} to {realigned_to}."
         else:
@@ -1763,6 +1811,7 @@ def _run_state_machine(
         push_main=True,
     )
     if report.integration_push_status == "ok" and report.main_promotion_status == "ok":
+        _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
         report.status = "updated"
         report.message = "Applied upstream changes, passed the trust gate, and promoted fork integration + main."
     else:
