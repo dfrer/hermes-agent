@@ -9,6 +9,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -46,6 +47,35 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _response_get(response: Any, key: str, default: Any = None) -> Any:
+    """Read Slack response fields without creating un-awaited AsyncMock calls."""
+    if response is None:
+        return default
+    if isinstance(response, dict):
+        return response.get(key, default)
+
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        return data.get(key, default)
+
+    getter = getattr(response, "get", None)
+    if getter is None or not callable(getter):
+        return default
+    if inspect.iscoroutinefunction(getter):
+        return default
+
+    try:
+        value = getter(key, default)
+    except Exception:
+        return default
+
+    if inspect.isawaitable(value):
+        if inspect.iscoroutine(value):
+            value.close()
+        return default
+    return value
 
 
 @dataclass
@@ -290,7 +320,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
-            sent_ts = last_result.get("ts") if last_result else None
+            sent_ts = _response_get(last_result, "ts", None)
             if sent_ts:
                 self._bot_message_ts.add(sent_ts)
                 # Also register the thread root so replies-to-my-replies work
@@ -578,14 +608,14 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(chat_id) if chat_id else self._app.client
             result = await client.users_info(user=user_id)
-            user = result.get("user", {})
+            user = _response_get(result, "user", {}) or {}
             # Prefer display_name → real_name → user_id
-            profile = user.get("profile", {})
+            profile = _response_get(user, "profile", {}) or {}
             name = (
-                profile.get("display_name")
-                or profile.get("real_name")
-                or user.get("real_name")
-                or user.get("name")
+                _response_get(profile, "display_name")
+                or _response_get(profile, "real_name")
+                or _response_get(user, "real_name")
+                or _response_get(user, "name")
                 or user_id
             )
             self._user_name_cache[user_id] = name
@@ -787,10 +817,10 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             result = await self._get_client(chat_id).conversations_info(channel=chat_id)
-            channel = result.get("channel", {})
-            is_dm = channel.get("is_im", False)
+            channel = _response_get(result, "channel", {}) or {}
+            is_dm = _response_get(channel, "is_im", False)
             return {
-                "name": channel.get("name", chat_id),
+                "name": _response_get(channel, "name", chat_id),
                 "type": "dm" if is_dm else "group",
             }
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1265,7 +1295,7 @@ class SlackAdapter(BasePlatformAdapter):
                 kwargs["thread_ts"] = thread_ts
 
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)
-            msg_ts = result.get("ts", "")
+            msg_ts = _response_get(result, "ts", "")
             if msg_ts:
                 self._approval_resolved[msg_ts] = False
 
@@ -1429,7 +1459,7 @@ class SlackAdapter(BasePlatformAdapter):
             if result is None:
                 return ""
 
-            messages = result.get("messages", [])
+            messages = _response_get(result, "messages", []) or []
             if not messages:
                 return ""
 

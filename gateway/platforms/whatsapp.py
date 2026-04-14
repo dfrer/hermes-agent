@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -30,6 +31,17 @@ from typing import Dict, Optional, Any
 from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _create_background_task(coro):
+    """Create a task, closing the coroutine if task creation is mocked out."""
+    task = None
+    try:
+        task = asyncio.create_task(coro)
+        return task
+    finally:
+        if not isinstance(task, asyncio.Future) and inspect.iscoroutine(coro):
+            coro.close()
 
 
 def _kill_port_process(port: int) -> None:
@@ -336,7 +348,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                                 self._mark_connected()
                                 self._bridge_process = None  # Not managed by us
                                 self._http_session = aiohttp.ClientSession()
-                                self._poll_task = asyncio.create_task(self._poll_messages())
+                                self._poll_task = _create_background_task(self._poll_messages())
                                 return True
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
@@ -445,7 +457,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             self._http_session = aiohttp.ClientSession()
 
             # Start message polling task
-            self._poll_task = asyncio.create_task(self._poll_messages())
+            self._poll_task = _create_background_task(self._poll_messages())
             
             self._mark_connected()
             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
