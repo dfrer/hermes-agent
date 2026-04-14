@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import shutil
+import re
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -99,17 +100,63 @@ def _honcho_is_configured_for_doctor() -> bool:
         return False
 
 
+def _messaging_is_configured_for_doctor() -> bool:
+    """Return True when at least one messaging platform is configured for this profile."""
+    try:
+        from gateway.config import load_gateway_config
+
+        return bool(load_gateway_config().get_connected_platforms())
+    except Exception:
+        return False
+
+
+def _homeassistant_is_configured_for_doctor() -> bool:
+    """Return True when Home Assistant credentials are configured."""
+    return bool(os.getenv("HASS_TOKEN"))
+
+
+def _github_auth_source_for_doctor() -> str:
+    """Return the source of usable GitHub auth for doctor diagnostics."""
+    if os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"):
+        return "env"
+
+    git_credentials = Path.home() / ".git-credentials"
+    if git_credentials.exists():
+        try:
+            content = git_credentials.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            content = ""
+        if re.search(r"https://[^:\s]+:[^@\s]+@github\.com", content):
+            return "git-credentials"
+
+    gh_hosts = Path.home() / ".config" / "gh" / "hosts.yml"
+    if gh_hosts.exists():
+        try:
+            content = gh_hosts.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            content = ""
+        if "github.com" in content and "oauth_token:" in content:
+            return "gh-cli"
+
+    return ""
+
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
-    if not _honcho_is_configured_for_doctor():
-        return available, unavailable
-
     updated_available = list(available)
     updated_unavailable = []
     for item in unavailable:
-        if item.get("name") == "honcho":
-            if "honcho" not in updated_available:
-                updated_available.append("honcho")
+        name = item.get("name")
+        if name == "honcho" and _honcho_is_configured_for_doctor():
+            if name not in updated_available:
+                updated_available.append(name)
+            continue
+        if name == "messaging":
+            if _messaging_is_configured_for_doctor():
+                if name not in updated_available:
+                    updated_available.append(name)
+                continue
+        if name == "homeassistant" and not _homeassistant_is_configured_for_doctor():
             continue
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
@@ -664,7 +711,7 @@ def run_doctor(args):
             if _is_termux():
                 check_info("Docker backend is not available inside Termux (expected on Android)")
             else:
-                check_warn("docker not found", "(optional)")
+                check_info("docker not found (optional)")
     
     # SSH (if using ssh backend)
     if terminal_env == "ssh":
@@ -834,8 +881,10 @@ def run_doctor(args):
         ("Hugging Face",     ("HF_TOKEN",),                                   "https://router.huggingface.co/v1/models", "HF_BASE_URL", True),
         ("Alibaba/DashScope", ("DASHSCOPE_API_KEY",),                         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models", "DASHSCOPE_BASE_URL", True),
         # MiniMax: the /anthropic endpoint doesn't support /models, but the /v1 endpoint does.
-        ("MiniMax",          ("MINIMAX_API_KEY",),                            "https://api.minimax.io/v1/models",    "MINIMAX_BASE_URL", True),
-        ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         "https://api.minimaxi.com/v1/models",  "MINIMAX_CN_BASE_URL", True),
+        # MiniMax exposes OpenAI/Anthropic-compatible generation endpoints, but
+        # the public docs do not guarantee a stable /models listing surface.
+        ("MiniMax",          ("MINIMAX_API_KEY",),                            "https://api.minimax.io/v1/models",    "MINIMAX_BASE_URL", False),
+        ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         "https://api.minimaxi.com/v1/models",  "MINIMAX_CN_BASE_URL", False),
         ("AI Gateway",       ("AI_GATEWAY_API_KEY",),                          "https://ai-gateway.vercel.sh/v1/models", "AI_GATEWAY_BASE_URL", True),
         ("Kilo Code",        ("KILOCODE_API_KEY",),                            "https://api.kilo.ai/api/gateway/models",  "KILOCODE_BASE_URL", True),
         ("OpenCode Zen",     ("OPENCODE_ZEN_API_KEY",),                        "https://opencode.ai/zen/v1/models",  "OPENCODE_ZEN_BASE_URL", True),
@@ -1004,9 +1053,13 @@ def run_doctor(args):
         check_warn("Skills Hub directory not initialized", "(run: hermes skills list)")
 
     from hermes_cli.config import get_env_value
-    github_token = get_env_value("GITHUB_TOKEN") or get_env_value("GH_TOKEN")
-    if github_token:
+    github_auth_source = _github_auth_source_for_doctor()
+    if github_auth_source == "env":
         check_ok("GitHub token configured (authenticated API access)")
+    elif github_auth_source == "git-credentials":
+        check_ok("GitHub auth available via ~/.git-credentials")
+    elif github_auth_source == "gh-cli":
+        check_ok("GitHub auth available via gh CLI")
     else:
         check_warn("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)")
 

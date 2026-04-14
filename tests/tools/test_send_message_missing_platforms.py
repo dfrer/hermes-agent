@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.send_message_tool import (
+    _check_send_message,
     _send_dingtalk,
     _send_homeassistant,
     _send_mattermost,
@@ -238,6 +239,23 @@ class TestSendHomeAssistant:
 
         assert "error" in result
         assert "HASS_URL" in result["error"] or "not configured" in result["error"]
+
+
+class TestCheckSendMessage:
+    def test_returns_true_when_profile_has_configured_platform(self):
+        fake_config = SimpleNamespace(get_connected_platforms=lambda: ["telegram"])
+
+        with patch("gateway.session_context.get_session_env", return_value=""), \
+             patch("gateway.config.load_gateway_config", return_value=fake_config):
+            assert _check_send_message() is True
+
+    def test_falls_back_to_gateway_runtime_when_no_platform_config(self):
+        fake_config = SimpleNamespace(get_connected_platforms=lambda: [])
+
+        with patch("gateway.session_context.get_session_env", return_value=""), \
+             patch("gateway.config.load_gateway_config", return_value=fake_config), \
+             patch("gateway.status.is_gateway_running", return_value=False):
+            assert _check_send_message() is False
 
     def test_env_var_fallback(self):
         resp = _make_aiohttp_resp(200)

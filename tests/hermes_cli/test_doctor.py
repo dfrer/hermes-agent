@@ -70,6 +70,32 @@ class TestDoctorToolAvailabilityOverrides:
         assert available == []
         assert unavailable == [honcho_entry]
 
+    def test_marks_messaging_available_when_profile_has_connected_platform(self, monkeypatch):
+        monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: False)
+        monkeypatch.setattr(doctor, "_messaging_is_configured_for_doctor", lambda: True)
+        monkeypatch.setattr(doctor, "_homeassistant_is_configured_for_doctor", lambda: False)
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            [],
+            [{"name": "messaging", "env_vars": [], "tools": ["send_message"]}],
+        )
+
+        assert available == ["messaging"]
+        assert unavailable == []
+
+    def test_suppresses_homeassistant_warning_when_unconfigured(self, monkeypatch):
+        monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: False)
+        monkeypatch.setattr(doctor, "_messaging_is_configured_for_doctor", lambda: False)
+        monkeypatch.setattr(doctor, "_homeassistant_is_configured_for_doctor", lambda: False)
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            [],
+            [{"name": "homeassistant", "env_vars": [], "tools": ["ha_get_state"]}],
+        )
+
+        assert available == []
+        assert unavailable == []
+
 
 class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):
@@ -91,6 +117,19 @@ class TestHonchoDoctorConfigDetection:
         )
 
         assert not doctor._honcho_is_configured_for_doctor()
+
+
+class TestGitHubAuthSourceForDoctor:
+    def test_detects_git_credentials_fallback(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".git-credentials").write_text("https://hunter:ghp_exampletoken@github.com\n")
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+
+        assert doctor._github_auth_source_for_doctor() == "git-credentials"
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
