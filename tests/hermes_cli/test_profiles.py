@@ -18,6 +18,7 @@ from hermes_cli.profiles import (
     validate_profile_name,
     get_profile_dir,
     create_profile,
+    create_wrapper_script,
     delete_profile,
     list_profiles,
     set_active_profile,
@@ -361,6 +362,29 @@ class TestAliasCollision:
         result = check_alias_collision("default")
         assert result is not None
         assert "reserved" in result.lower()
+
+
+# ===================================================================
+# TestWrapperScripts
+# ===================================================================
+
+class TestWrapperScripts:
+    def test_create_wrapper_script_uses_concrete_entrypoint(self, profile_env):
+        tmp_path = profile_env
+        wrapper = create_wrapper_script("coder")
+
+        assert wrapper == tmp_path / ".local" / "bin" / "coder"
+        content = wrapper.read_text()
+        assert content.startswith("#!/usr/bin/env bash")
+        assert 'ENTRY="$LIVE_REPO/venv/bin/hermes"' in content
+        assert 'runtime_layout bootstrap --root "$HERMES_ROOT"' in content
+        assert 'exec "$ENTRY" -p coder "$@"' in content
+
+    def test_create_wrapper_script_bootstraps_named_profile_home(self, profile_env):
+        wrapper = create_wrapper_script("main")
+
+        content = wrapper.read_text()
+        assert 'HERMES_HOME="$HERMES_ROOT/profiles/main"' in content
 
 
 # ===================================================================

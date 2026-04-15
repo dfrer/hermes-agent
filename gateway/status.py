@@ -234,6 +234,7 @@ def write_runtime_status(
     payload.setdefault("platforms", {})
     payload.setdefault("kind", _GATEWAY_KIND)
     payload["pid"] = os.getpid()
+    payload["argv"] = list(sys.argv)
     payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
@@ -262,7 +263,40 @@ def write_runtime_status(
 
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
-    return _read_json_file(_get_runtime_status_path())
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path)
+    if not payload:
+        return None
+
+    gateway_state = payload.get("gateway_state")
+    if gateway_state not in {"running", "starting", "draining"}:
+        return payload
+
+    if get_running_pid() is not None:
+        return payload
+
+    normalized = dict(payload)
+    normalized["updated_at"] = _utc_now_iso()
+    if gateway_state == "starting" and normalized.get("exit_reason"):
+        normalized["gateway_state"] = "startup_failed"
+    else:
+        normalized["gateway_state"] = "stopped"
+        normalized.setdefault(
+            "exit_reason",
+            "stale runtime status cleared after the gateway process exited",
+        )
+
+    platforms = normalized.get("platforms")
+    if isinstance(platforms, dict):
+        for pdata in platforms.values():
+            if not isinstance(pdata, dict):
+                continue
+            if pdata.get("state") in {"connected", "connecting"}:
+                pdata["state"] = "disconnected"
+                pdata["updated_at"] = normalized["updated_at"]
+
+    _write_json_file(path, normalized)
+    return normalized
 
 
 def remove_pid_file() -> None:
