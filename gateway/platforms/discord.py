@@ -14,10 +14,12 @@ import logging
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Callable, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -31,12 +33,34 @@ try:
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
-    discord = None
+    discord = SimpleNamespace()
     DiscordMessage = Any
-    Intents = Any
-    commands = None
+    Intents = SimpleNamespace(default=lambda: SimpleNamespace())
+    commands = SimpleNamespace(Bot=Any)
 
-import sys
+
+def _refresh_discord_bindings() -> None:
+    global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
+
+    mod = sys.modules.get("discord")
+    ext = sys.modules.get("discord.ext")
+    ext_commands = sys.modules.get("discord.ext.commands")
+
+    if mod is None and ext is None and ext_commands is None:
+        return
+
+    if mod is not None:
+        discord = mod
+        DiscordMessage = getattr(mod, "Message", DiscordMessage)
+        Intents = getattr(mod, "Intents", Intents)
+
+    commands = (
+        getattr(ext, "commands", None)
+        or ext_commands
+        or commands
+    )
+    DISCORD_AVAILABLE = True
+
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
@@ -77,6 +101,7 @@ def _clean_discord_id(entry: str) -> str:
 
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
+    _refresh_discord_bindings()
     return DISCORD_AVAILABLE
 
 
@@ -428,6 +453,7 @@ class DiscordAdapter(BasePlatformAdapter):
     VOICE_TIMEOUT = 300
 
     def __init__(self, config: PlatformConfig):
+        _refresh_discord_bindings()
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
@@ -465,6 +491,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
+        _refresh_discord_bindings()
         if not DISCORD_AVAILABLE:
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
             return False
