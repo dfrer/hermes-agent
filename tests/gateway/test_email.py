@@ -338,6 +338,9 @@ class TestChannelDirectory(unittest.TestCase):
         from gateway.config import Platform
         from unittest.mock import patch
 
+        email_values = [p.value for p in Platform]
+        self.assertIn("email", email_values)
+
         def fake_build_from_sessions(platform_name):
             return [{"id": f"{platform_name}-1", "name": platform_name}]
 

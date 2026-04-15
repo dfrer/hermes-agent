@@ -963,14 +963,15 @@ class MatrixAdapter(BasePlatformAdapter):
                     sync_error = sync_message.lower()
                     if (
                         "m_unknown_token" in sync_error
+                        or "unknown_token" in sync_error
                         or "401" in sync_error
                         or "403" in sync_error
                         or "unauthorized" in sync_error
                         or "forbidden" in sync_error
                     ):
-                        logger.error("Matrix: permanent auth error: %s — stopping sync", sync_message)
+                        logger.error("Matrix: permanent auth error from sync: %s - stopping", sync_message)
                         return
-                    logger.warning("Matrix: sync returned error: %s — retrying in 5s", sync_message)
+                    logger.warning("Matrix: sync returned error: %s - retrying in 5s", sync_message)
                     await asyncio.sleep(5)
                     continue
                 if isinstance(sync_data, dict):
