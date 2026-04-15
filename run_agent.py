@@ -1321,46 +1321,57 @@ class AIAgent:
 
         # Store for reuse in switch_model (so config override persists across model switches)
         self._config_context_length = _config_context_length
+        _configured_custom_base_url = ""
+        if isinstance(_model_cfg, dict):
+            _configured_custom_base_url = str(_model_cfg.get("base_url") or "").rstrip("/")
+        if not _configured_custom_base_url and isinstance(base_url, str):
+            _configured_custom_base_url = base_url.rstrip("/")
+        _custom_provider_lookup_base_url = _configured_custom_base_url or self.base_url.rstrip("/")
 
         # Check custom_providers per-model context_length
         if _config_context_length is None:
+            _custom_provider_candidates = []
             try:
                 from hermes_cli.config import get_compatible_custom_providers
                 _custom_providers = get_compatible_custom_providers(_agent_cfg)
             except Exception:
                 _custom_providers = None
-            if not isinstance(_custom_providers, list) or not _custom_providers:
-                _custom_providers = _agent_cfg.get("custom_providers")
-                if not isinstance(_custom_providers, list):
-                    _custom_providers = []
-            for _cp_entry in _custom_providers:
+            if isinstance(_custom_providers, list):
+                _custom_provider_candidates.extend(_custom_providers)
+            _raw_custom_providers = _agent_cfg.get("custom_providers")
+            if isinstance(_raw_custom_providers, list):
+                _custom_provider_candidates.extend(_raw_custom_providers)
+            for _cp_entry in _custom_provider_candidates:
                 if not isinstance(_cp_entry, dict):
                     continue
                 _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
-                if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                if _cp_url and _cp_url == _custom_provider_lookup_base_url:
                     _cp_models = _cp_entry.get("models", {})
-                    if isinstance(_cp_models, dict):
-                        _cp_model_cfg = _cp_models.get(self.model, {})
-                        if isinstance(_cp_model_cfg, dict):
-                            _cp_ctx = _cp_model_cfg.get("context_length")
-                            if _cp_ctx is not None:
-                                try:
-                                    _config_context_length = int(_cp_ctx)
-                                except (TypeError, ValueError):
-                                    logger.warning(
-                                        "Invalid context_length for model %r in "
-                                        "custom_providers: %r — must be a plain "
-                                        "integer (e.g. 256000, not '256K'). "
-                                        "Falling back to auto-detection.",
-                                        self.model, _cp_ctx,
-                                    )
-                                    import sys
-                                    print(
-                                        f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
-                                        f"  Must be a plain integer (e.g. 256000, not '256K').\n"
-                                        f"  Falling back to auto-detected context window.\n",
-                                        file=sys.stderr,
-                                    )
+                    if not isinstance(_cp_models, dict):
+                        continue
+                    _cp_model_cfg = _cp_models.get(self.model, {})
+                    if not isinstance(_cp_model_cfg, dict):
+                        continue
+                    _cp_ctx = _cp_model_cfg.get("context_length")
+                    if _cp_ctx is None:
+                        continue
+                    try:
+                        _config_context_length = int(_cp_ctx)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid context_length for model %r in "
+                            "custom_providers: %r — must be a plain "
+                            "integer (e.g. 256000, not '256K'). "
+                            "Falling back to auto-detection.",
+                            self.model, _cp_ctx,
+                        )
+                        import sys
+                        print(
+                            f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
+                            f"  Must be a plain integer (e.g. 256000, not '256K').\n"
+                            f"  Falling back to auto-detected context window.\n",
+                            file=sys.stderr,
+                        )
                     break
         
         # Select context engine: config-driven (like memory providers).

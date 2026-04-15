@@ -165,6 +165,31 @@ class TestGatewayRuntimeStatus:
         assert saved["gateway_state"] == "stopped"
         assert saved["platforms"]["telegram"]["state"] == "disconnected"
 
+    def test_read_runtime_status_keeps_live_current_process_payload_without_pid_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "gateway_state": "running",
+            "pid": os.getpid(),
+            "start_time": 123,
+            "platforms": {
+                "discord": {
+                    "state": "connected",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            },
+        }))
+
+        monkeypatch.setattr(status, "get_running_pid", lambda: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "running"
+        assert payload["platforms"]["discord"]["state"] == "connected"
+        saved = json.loads(state_path.read_text())
+        assert saved["gateway_state"] == "running"
+        assert saved["platforms"]["discord"]["state"] == "connected"
+
     def test_remove_pid_file_leaves_other_process_record_alone(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         pid_path = tmp_path / "gateway.pid"

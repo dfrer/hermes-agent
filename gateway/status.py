@@ -261,6 +261,29 @@ def write_runtime_status(
     _write_json_file(path, payload)
 
 
+def _runtime_status_belongs_to_current_process(payload: dict[str, Any]) -> bool:
+    """Return True when a runtime payload was written by this live process.
+
+    ``GatewayRunner.start()`` updates the runtime status before the outer
+    daemon/bootstrap path writes a PID file. Reads that happen in-process
+    during startup should therefore trust a matching PID/start_time pair even
+    when ``get_running_pid()`` has nothing to validate yet.
+    """
+    try:
+        payload_pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False
+
+    if payload_pid != os.getpid():
+        return False
+
+    payload_start = payload.get("start_time")
+    current_start = _get_process_start_time(payload_pid)
+    if payload_start is None or current_start is None:
+        return True
+    return payload_start == current_start
+
+
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
     path = _get_runtime_status_path()
@@ -273,6 +296,8 @@ def read_runtime_status() -> Optional[dict[str, Any]]:
         return payload
 
     if get_running_pid() is not None:
+        return payload
+    if _runtime_status_belongs_to_current_process(payload):
         return payload
 
     normalized = dict(payload)

@@ -109,3 +109,68 @@ def test_custom_providers_valid_context_length():
         )
     for c in mock_logger.warning.call_args_list:
         assert "Invalid" not in str(c)
+
+
+def test_custom_providers_invalid_context_length_warns_when_compat_view_drops_models():
+    """Raw custom_providers entries should still be checked when compat entries lose models."""
+    custom_providers = [
+        {
+            "name": "LiteLLM",
+            "base_url": "http://localhost:4000/v1",
+            "models": {
+                "gpt5.4": {"context_length": "256K"}
+            },
+        }
+    ]
+    with (
+        patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[{"name": "LiteLLM", "base_url": "http://localhost:4000/v1"}],
+        ),
+        patch("run_agent.logger") as mock_logger,
+    ):
+        _build_agent(
+            {"default": "gpt5.4", "provider": "custom",
+             "base_url": "http://localhost:4000/v1"},
+            custom_providers=custom_providers,
+            model="gpt5.4",
+        )
+
+    warning_calls = [c for c in mock_logger.warning.call_args_list
+                     if "Invalid" in str(c) and "256K" in str(c)]
+    assert len(warning_calls) == 1
+    assert "custom_providers" in str(warning_calls[0])
+
+
+def test_custom_providers_invalid_context_length_uses_config_base_url_not_routed_client():
+    """Validation should match the configured custom endpoint, not a routed runtime base_url."""
+    custom_providers = [
+        {
+            "name": "LiteLLM",
+            "base_url": "http://localhost:4000/v1",
+            "models": {
+                "gpt5.4": {"context_length": "256K"}
+            },
+        }
+    ]
+    routed_client = MagicMock(
+        api_key="routed-key",
+        base_url="https://chatgpt.com/backend-api/codex/",
+    )
+    routed_client._default_headers = {}
+
+    with (
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(routed_client, "gpt5.4")),
+        patch("run_agent.logger") as mock_logger,
+    ):
+        _build_agent(
+            {"default": "gpt5.4", "provider": "custom",
+             "base_url": "http://localhost:4000/v1"},
+            custom_providers=custom_providers,
+            model="gpt5.4",
+        )
+
+    warning_calls = [c for c in mock_logger.warning.call_args_list
+                     if "Invalid" in str(c) and "256K" in str(c)]
+    assert len(warning_calls) == 1
+    assert "custom_providers" in str(warning_calls[0])
