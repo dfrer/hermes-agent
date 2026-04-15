@@ -1328,6 +1328,8 @@ class AIAgent:
                 from hermes_cli.config import get_compatible_custom_providers
                 _custom_providers = get_compatible_custom_providers(_agent_cfg)
             except Exception:
+                _custom_providers = None
+            if not isinstance(_custom_providers, list) or not _custom_providers:
                 _custom_providers = _agent_cfg.get("custom_providers")
                 if not isinstance(_custom_providers, list):
                     _custom_providers = []
