@@ -1146,6 +1146,66 @@ def test_routing_update_status_marks_reconciled_graph_as_not_pending(tmp_path, m
     assert summary["promotion_pending_count"] == 0
 
 
+def test_routing_update_status_recomputes_tree_match_for_in_sync_heads(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    (report_root / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "noop",
+                "message": "already synced",
+                "repo_root": str(repo_root),
+                "promotion_mode": "none",
+                "promotion_tree_match": False,
+                "finished_at": "2026-04-15T10:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, True, True))
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {
+            "matches": True,
+            "repo_role": "dev",
+            "current_branch": rau.LIVE_BRANCH,
+            "expected_branch": rau.DEV_UPDATER_BRANCH,
+            "live_branch": rau.LIVE_PROTECTED_BRANCH,
+            "dev_branch": rau.DEV_UPDATER_BRANCH,
+            "origin_remote": "origin",
+            "fork_remote": "fork",
+        },
+    )
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "synced-head",
+            "upstream_head": "upstream-head",
+            "integration_head": "synced-head",
+            "main_head": "synced-head",
+            "upstream": {"behind": 0, "ahead": 0},
+            "integration": {"behind": 0, "ahead": 0},
+            "main": {"behind": 0, "ahead": 0},
+        },
+    )
+    monkeypatch.setattr(rau, "_tree_oid", lambda repo_root, ref: "tree-1")
+    monkeypatch.setattr(rau, "_cherry_pending_count", lambda *args, **kwargs: 0)
+
+    summary = rau.routing_update_status(report_root, repo_root)
+
+    assert summary["promotion_graph_state"] == "in_sync"
+    assert summary["promotion_tree_match"] is True
+    assert summary["promotion_pending"] is False
+    assert summary["promotion_pending_count"] == 0
+
+
 def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)

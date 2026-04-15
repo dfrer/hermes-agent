@@ -2498,9 +2498,13 @@ def routing_update_status(
             latest_report=latest,
         )
         summary["promotion_graph_state"] = graph_state
+        integration_head = str(live_drift.get("integration_head") or "")
+        main_head = str(live_drift.get("main_head") or "")
         reconciled_head = str(summary.get("reconciled_head") or "")
         tree_match = bool(summary.get("promotion_tree_match"))
-        if reconciled_head and str(live_drift.get("main_head") or "") == str(live_drift.get("integration_head") or "") == reconciled_head:
+        if main_head and integration_head and main_head == integration_head:
+            tree_match = _tree_oid(effective_repo, MAIN_REF) == _tree_oid(effective_repo, PUSH_REF)
+        if reconciled_head and main_head == integration_head == reconciled_head:
             tree_match = (
                 _tree_oid(effective_repo, MAIN_REF)
                 == _tree_oid(effective_repo, PUSH_REF)
