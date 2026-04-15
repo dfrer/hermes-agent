@@ -130,20 +130,30 @@ def test_api_calendar_list_uses_agenda_by_default(api_module):
 
     def capture_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return MagicMock(returncode=0)
+        return MagicMock(returncode=1, stderr="mock gws failure", stdout="")
 
     args = api_module.argparse.Namespace(
         start="", end="", max=25, calendar="primary", func=api_module.calendar_list,
     )
 
-    with patch.object(subprocess, "run", side_effect=capture_run):
+    with (
+        patch.object(api_module, "_gws_binary", return_value="gws"),
+        patch.object(api_module, "_ensure_authenticated", return_value=None),
+        patch.object(subprocess, "run", side_effect=capture_run),
+    ):
         with pytest.raises(SystemExit):
             api_module.calendar_list(args)
 
-    gws_args = captured["cmd"][2:]  # skip python + bridge path
+    gws_args = captured["cmd"]
     assert "calendar" in gws_args
-    assert "+agenda" in gws_args
-    assert "--days" in gws_args
+    assert "events" in gws_args
+    assert "list" in gws_args
+    params_idx = gws_args.index("--params")
+    params = json.loads(gws_args[params_idx + 1])
+    assert params["calendarId"] == "primary"
+    assert params["maxResults"] == 25
+    assert params["singleEvents"] is True
+    assert params["orderBy"] == "startTime"
 
 
 def test_api_calendar_list_respects_date_range(api_module):
@@ -152,7 +162,7 @@ def test_api_calendar_list_respects_date_range(api_module):
 
     def capture_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return MagicMock(returncode=0)
+        return MagicMock(returncode=1, stderr="mock gws failure", stdout="")
 
     args = api_module.argparse.Namespace(
         start="2026-04-01T00:00:00Z",
@@ -162,11 +172,15 @@ def test_api_calendar_list_respects_date_range(api_module):
         func=api_module.calendar_list,
     )
 
-    with patch.object(subprocess, "run", side_effect=capture_run):
+    with (
+        patch.object(api_module, "_gws_binary", return_value="gws"),
+        patch.object(api_module, "_ensure_authenticated", return_value=None),
+        patch.object(subprocess, "run", side_effect=capture_run),
+    ):
         with pytest.raises(SystemExit):
             api_module.calendar_list(args)
 
-    gws_args = captured["cmd"][2:]
+    gws_args = captured["cmd"]
     assert "events" in gws_args
     assert "list" in gws_args
     params_idx = gws_args.index("--params")

@@ -20,10 +20,11 @@ from gateway.config import PlatformConfig, GatewayConfig, Platform, _apply_env_o
 
 def _ensure_discord_mock():
     """Install a mock discord module when discord.py isn't available."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+    existing = sys.modules.get("discord")
+    if existing is not None and hasattr(existing, "__file__"):
         return
 
-    discord_mod = MagicMock()
+    discord_mod = existing if existing is not None else MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.Client = MagicMock
     discord_mod.File = MagicMock
@@ -46,12 +47,17 @@ def _ensure_discord_mock():
     commands_mod.Bot = MagicMock
     ext_mod.commands = commands_mod
 
-    sys.modules.setdefault("discord", discord_mod)
-    sys.modules.setdefault("discord.ext", ext_mod)
-    sys.modules.setdefault("discord.ext.commands", commands_mod)
+    sys.modules["discord"] = discord_mod
+    sys.modules["discord.ext"] = ext_mod
+    sys.modules["discord.ext.commands"] = commands_mod
 
 
 _ensure_discord_mock()
+
+import gateway.platforms.discord as discord_platform  # noqa: E402
+
+discord_platform.discord = sys.modules["discord"]
+discord_platform.DISCORD_AVAILABLE = True
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 

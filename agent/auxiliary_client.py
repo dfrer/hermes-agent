@@ -1888,14 +1888,20 @@ def resolve_vision_provider_client(
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
             if main_provider in _VISION_AUTO_PROVIDER_ORDER:
-                # Known strict backend — use its defaults.
+                # Known strict backend — prefer the user's configured main model
+                # when it already belongs to that provider, otherwise fall back
+                # to the provider's vision-safe default.
                 sync_client, default_model = _resolve_strict_vision_backend(main_provider)
                 if sync_client is not None:
-                    return _finalize(main_provider, sync_client, default_model)
+                    preferred_model = _normalize_resolved_model(main_model, main_provider)
+                    return _finalize(main_provider, sync_client, preferred_model or default_model)
             else:
                 # Exotic provider (DeepSeek, Alibaba, Xiaomi, named custom, etc.)
-                # Use provider-specific vision model if available, otherwise main model.
-                vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
+                # Prefer the normalized main model when it already targets this
+                # provider; otherwise fall back to the provider-specific vision
+                # default when one is known.
+                normalized_main_model = _normalize_resolved_model(main_model, main_provider)
+                vision_model = normalized_main_model or _PROVIDER_VISION_MODELS.get(main_provider, main_model)
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
                     api_mode=resolved_api_mode)
