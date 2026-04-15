@@ -6,13 +6,11 @@ Deterministic Hermes auto-update orchestration for the routing integration branc
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
 import platform
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -74,13 +72,7 @@ LEGACY_UPDATE_DIR_PATTERNS: tuple[str, ...] = (
     f"{LIVE_REPO_BASENAME}-update-*",
     f"{DEV_REPO_BASENAME}-update-*",
 )
-REPAIR_TRANSCRIPT_DIR_NAME = "repair-attempts"
-REPAIR_MAX_CHANGED_PATHS = 16
-REPAIR_MAX_NET_CHANGED_LINES = 400
-REPAIR_DEFAULT_TIMEOUT_MINUTES = 15
-REPAIR_DEFAULT_MAX_ATTEMPTS = 1
-REPAIR_ALLOWED_FAILURE_KINDS = frozenset({"merge_conflict", "verification_failed"})
-REPAIR_ELIGIBLE_STATUSES = frozenset({"repair_required", "verification_failed"})
+REPAIR_MAX_CHANGED_PATHS = 12
 REPAIR_ALLOWED_ROOT_FILES = frozenset(
     {
         "run_agent.py",
@@ -120,43 +112,6 @@ REPAIR_BLOCKED_BASENAMES = frozenset(
         "uv.lock",
     }
 )
-BACKGROUND_VALIDATION_PATTERNS: tuple[str, ...] = (
-    "pytest",
-    "routing update",
-    "codex exec",
-)
-CODEX_REPAIR_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "status": {
-            "type": "string",
-            "enum": ["fixed", "not_fixed", "blocked"],
-        },
-        "summary": {"type": "string"},
-        "files_changed": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "commands_recommended": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "notes": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-    },
-    "required": ["status", "summary", "files_changed", "commands_recommended", "notes"],
-}
-DEFAULT_CODEX_REPAIR_CONFIG: dict[str, Any] = {
-    "enabled": True,
-    "model": "gpt-5.4",
-    "reasoning_effort": "xhigh",
-    "scope": "medium",
-    "timeout_minutes": REPAIR_DEFAULT_TIMEOUT_MINUTES,
-    "max_attempts_per_signature": REPAIR_DEFAULT_MAX_ATTEMPTS,
-}
 
 ROUTING_CONTRACT_TESTS: tuple[str, ...] = (
     "scripts/test-routing-contract.ps1",
@@ -227,38 +182,26 @@ PLAYBOOKS: tuple[dict[str, Any], ...] = (
 
 CRON_PROMPT_TEMPLATE = """You are running the daily Hermes routing-preserving updater.
 
-Do not implement merge, repair, test, or push logic yourself. The deterministic updater is authoritative.
+Do not implement merge, test, or push logic yourself. The deterministic updater is authoritative.
 
-1. Call `hermes-dev routing update cycle --json --repo-root {repo_root}`.
+1. Call `hermes-dev routing update run --json --repo-root {repo_root}`.
 2. Read `{latest_json}` and `{latest_md}`.
 3. If `latest.json` reports `status == "noop"`, return exactly `[SILENT]`.
-4. Otherwise, send a concise summary based on `latest.md`.
+4. If `status == "updated"`, send a concise summary based on `latest.md` and stop.
+5. If `status in {{"repair_required", "verification_failed"}}` and `repair_eligible == true`:
+   - emit a `TIER: 3A | PATH: high-risk | ...` routing decision for guarded maintenance repair
+   - submit a `routed_plan` over the retained worktree from `latest.json`
+   - node 1: inspect `repair_manifest_path` and latest report
+   - node 2: apply the smallest repair inside the retained worktree
+   - node 3: rerun the targeted failing validation command from the manifest
+   - node 4: call `hermes-dev routing update finalize --json --repo-root {repo_root}`
+   - node 5: summarize the finalized outcome
+6. If repair is ineligible or finalize fails, stop and report the exact retained worktree and manifest paths.
 """
 
 
 class UpdateError(RuntimeError):
     """Known deterministic updater failure."""
-
-
-class ValidationError(UpdateError):
-    """Validation failed while running a targeted updater command."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        command: str = "",
-        argv: Sequence[str] | None = None,
-        stdout: str = "",
-        stderr: str = "",
-        failing_node_ids: Sequence[str] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.command = command
-        self.argv = list(argv or [])
-        self.stdout = stdout
-        self.stderr = stderr
-        self.failing_node_ids = [item for item in (failing_node_ids or []) if item]
 
 
 @dataclass
@@ -307,18 +250,6 @@ class UpdateReport:
     repair_manifest_path: str = ""
     repair_eligible: bool | None = None
     repair_blockers: list[str] = field(default_factory=list)
-    repair_status: str = "not_attempted"
-    repair_attempt_count: int = 0
-    repair_attempted_at: str = ""
-    repair_failure_kind: str = ""
-    repair_target_command: str = ""
-    repair_signature: str = ""
-    repair_transcript_dir: str = ""
-    repair_output_path: str = ""
-    repair_timeout: int = 0
-    escalation_reason: str = ""
-    preflight_actions: list[str] = field(default_factory=list)
-    background_conflicts: list[str] = field(default_factory=list)
     backup_refs: list[str] = field(default_factory=list)
     gateway_running: bool | None = None
     gateway_service_installed: bool | None = None
@@ -378,100 +309,6 @@ def _text_dump(text: str, path: Path) -> None:
     temp.replace(path)
 
 
-def _json_load(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _shell_join(args: Sequence[str]) -> str:
-    return shlex.join([str(item) for item in args])
-
-
-def _load_codex_repair_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
-    effective = dict(DEFAULT_CODEX_REPAIR_CONFIG)
-    if config is None:
-        config = load_config()
-    raw = (((config or {}).get("routing_auto_update") or {}).get("codex_repair") or {})
-    if isinstance(raw, dict):
-        effective.update({key: value for key, value in raw.items() if value not in (None, "")})
-    return effective
-
-
-def _ensure_codex_repair_config(config: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    normalized = dict(config or {})
-    routing_auto_update = normalized.setdefault("routing_auto_update", {})
-    changed = False
-    if not isinstance(routing_auto_update, dict):
-        routing_auto_update = {}
-        normalized["routing_auto_update"] = routing_auto_update
-        changed = True
-    codex_repair = routing_auto_update.setdefault("codex_repair", {})
-    if not isinstance(codex_repair, dict):
-        codex_repair = {}
-        routing_auto_update["codex_repair"] = codex_repair
-        changed = True
-    for key, value in DEFAULT_CODEX_REPAIR_CONFIG.items():
-        if key not in codex_repair:
-            codex_repair[key] = value
-            changed = True
-    return normalized, changed
-
-
-def _command_looks_like_pytest(args: Sequence[str]) -> bool:
-    tokens = [str(item) for item in args]
-    return "pytest" in tokens or any(token.endswith("/pytest") for token in tokens)
-
-
-def _parse_pytest_node_ids(output: str) -> list[str]:
-    seen: set[str] = set()
-    node_ids: list[str] = []
-    for match in re.finditer(r"(?m)^FAILED\s+([^\s]+::[^\s]+)", output or ""):
-        node_id = match.group(1).strip()
-        if node_id and node_id not in seen:
-            seen.add(node_id)
-            node_ids.append(node_id)
-    return node_ids
-
-
-def _build_targeted_pytest_cmd(node_ids: Sequence[str]) -> list[str]:
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts=", "-q", "--tb=short", "-x", "--maxfail=1"]
-    cmd.extend([node_id for node_id in node_ids if node_id])
-    return cmd
-
-
-def _detect_background_validation_conflicts() -> list[str]:
-    result = _run_subprocess(["ps", "-ef"], check=False)
-    if result.returncode != 0:
-        return []
-    own_pid = os.getpid()
-    conflicts: list[str] = []
-    for raw_line in (result.stdout or "").splitlines():
-        line = raw_line.strip()
-        if not line or " CMD" in line:
-            continue
-        parts = line.split(None, 7)
-        if len(parts) < 8:
-            continue
-        pid = 0
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            pid = 0
-        if pid == own_pid:
-            continue
-        command = parts[7]
-        lowered = command.lower()
-        if "grep -e" in lowered or "grep -e 'pytest" in lowered or "grep -e 'codex exec" in lowered:
-            continue
-        if not any(pattern in lowered for pattern in BACKGROUND_VALIDATION_PATTERNS):
-            continue
-        conflicts.append(f"pid {pid}: {command}")
-    return conflicts
-
-
 def _default_report_root(hermes_home: Path) -> Path:
     return hermes_home / "cron" / "output" / REPORT_DIR_NAME
 
@@ -527,33 +364,9 @@ def _render_markdown_report(report: UpdateReport) -> str:
         lines.append(f"- Repair manifest: `{report.repair_manifest_path}`")
     if report.repair_eligible is not None:
         lines.append(f"- Repair eligible: `{report.repair_eligible}`")
-    lines.append(f"- Repair status: `{report.repair_status}`")
-    lines.append(f"- Repair attempts: `{report.repair_attempt_count}`")
-    if report.repair_attempted_at:
-        lines.append(f"- Repair attempted at: `{report.repair_attempted_at}`")
-    if report.repair_failure_kind:
-        lines.append(f"- Repair failure kind: `{report.repair_failure_kind}`")
-    if report.repair_target_command:
-        lines.append(f"- Repair target command: `{report.repair_target_command}`")
-    if report.repair_signature:
-        lines.append(f"- Repair signature: `{report.repair_signature}`")
-    if report.repair_transcript_dir:
-        lines.append(f"- Repair transcript dir: `{report.repair_transcript_dir}`")
-    if report.repair_output_path:
-        lines.append(f"- Repair output: `{report.repair_output_path}`")
-    if report.repair_timeout:
-        lines.append(f"- Repair timeout: `{report.repair_timeout}`")
-    if report.escalation_reason:
-        lines.append(f"- Escalation reason: {report.escalation_reason}")
     if report.repair_blockers:
         lines.append("- Repair blockers:")
         lines.extend([f"  - `{item}`" for item in report.repair_blockers])
-    if report.preflight_actions:
-        lines.append("- Preflight actions:")
-        lines.extend([f"  - `{item}`" for item in report.preflight_actions])
-    if report.background_conflicts:
-        lines.append("- Background conflicts:")
-        lines.extend([f"  - `{item}`" for item in report.background_conflicts])
     if report.backup_refs:
         lines.append("- Backup refs:")
         lines.extend([f"  - `{item}`" for item in report.backup_refs])
@@ -621,40 +434,6 @@ def _extract_failed_command(exc: BaseException) -> str:
     message = str(exc)
     match = re.search(r"Command failed \(\d+\): ([^\n]+)", message)
     return match.group(1).strip() if match else ""
-
-
-def _run_validation_command(
-    args: Sequence[str],
-    *,
-    cwd: Path,
-) -> str:
-    conflicts = _detect_background_validation_conflicts()
-    if conflicts:
-        raise ValidationError(
-            "Background validation or updater processes are already running; refusing to start another validation run.",
-            command=_shell_join(args),
-            argv=args,
-            stderr="\n".join(conflicts),
-        )
-
-    result = _run_subprocess(args, cwd=cwd, check=False)
-    if result.returncode == 0:
-        return _shell_join(args)
-
-    output = "\n".join(part for part in ((result.stdout or "").strip(), (result.stderr or "").strip()) if part).strip()
-    cmd = _shell_join(args)
-    failing_node_ids = _parse_pytest_node_ids(output) if _command_looks_like_pytest(args) else []
-    message = f"Command failed ({result.returncode}): {cmd}"
-    if output:
-        message = f"{message}\n{output}"
-    raise ValidationError(
-        message,
-        command=cmd,
-        argv=args,
-        stdout=result.stdout or "",
-        stderr=result.stderr or "",
-        failing_node_ids=failing_node_ids,
-    )
 
 
 def _git(
@@ -960,11 +739,13 @@ def _build_trust_gate_pytest_cmd() -> list[str]:
 def _run_trust_gate(worktree: Path) -> list[str]:
     executed: list[str] = []
     pytest_cmd = _build_trust_gate_pytest_cmd()
-    executed.append(_run_validation_command(pytest_cmd, cwd=worktree))
+    _run_subprocess(pytest_cmd, cwd=worktree)
+    executed.append(" ".join(pytest_cmd))
 
     contract_script = worktree / ROUTING_CONTRACT_TESTS[0]
     contract_cmd = _resolve_powershell_command(contract_script)
-    executed.append(_run_validation_command(contract_cmd, cwd=worktree))
+    _run_subprocess(contract_cmd, cwd=worktree)
+    executed.append(" ".join(contract_cmd))
     return executed
 
 
@@ -1028,53 +809,13 @@ def _collect_playbooks(paths: Sequence[str]) -> list[dict[str, str]]:
     return selected
 
 
-def _repair_net_changed_lines(worktree: Path, base_ref: str = LIVE_BRANCH) -> int | None:
-    if not worktree.exists():
-        return None
-    result = _git(worktree, "diff", "--numstat", f"{base_ref}...HEAD", cwd=worktree, check=False)
-    if result.returncode != 0:
-        return None
-    total = 0
-    saw_rows = False
-    for line in (result.stdout or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        if parts[0] == "-" or parts[1] == "-":
-            continue
-        try:
-            total += int(parts[0]) + int(parts[1])
-            saw_rows = True
-        except ValueError:
-            continue
-    return total if saw_rows else 0
-
-
-def _compute_repair_signature(
-    *,
-    failure_kind: str,
-    upstream_head: str,
-    changed_paths: Sequence[str],
-    repair_target_command: str,
-) -> str:
-    payload = {
-        "failure_kind": failure_kind,
-        "upstream_head": upstream_head,
-        "changed_paths": sorted(path.replace("\\", "/") for path in changed_paths),
-        "repair_target_command": repair_target_command,
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-
-
-def _repair_eligibility(paths: Sequence[str], *, net_changed_lines: int | None = None) -> tuple[bool, list[str]]:
+def _repair_eligibility(paths: Sequence[str]) -> tuple[bool, list[str]]:
     blockers: list[str] = []
     if not paths:
         blockers.append("no changed paths recorded")
         return False, blockers
     if len(paths) > REPAIR_MAX_CHANGED_PATHS:
         blockers.append(f"changed path count {len(paths)} exceeds conservative repair cap")
-    if net_changed_lines is not None and net_changed_lines > REPAIR_MAX_NET_CHANGED_LINES:
-        blockers.append(f"net changed lines {net_changed_lines} exceeds repair cap {REPAIR_MAX_NET_CHANGED_LINES}")
     for path in paths:
         blocker = _repair_path_blocker(path)
         if blocker:
@@ -1088,20 +829,8 @@ def _write_repair_manifest(
     *,
     failure_kind: str,
     changed_paths: Sequence[str],
-    repair_target_command: str = "",
-    repair_target_argv: Sequence[str] | None = None,
-    failing_node_ids: Sequence[str] | None = None,
 ) -> tuple[str, bool, list[str]]:
-    retained_path = _normalize_path(report.retained_failed_worktree or report.update_worktree) if (report.retained_failed_worktree or report.update_worktree) else None
-    net_changed_lines = _repair_net_changed_lines(retained_path) if retained_path else None
-    eligible, blockers = _repair_eligibility(changed_paths, net_changed_lines=net_changed_lines)
-    repair_target_command = repair_target_command or report.repair_target_command or report.last_validation_command
-    signature = _compute_repair_signature(
-        failure_kind=failure_kind,
-        upstream_head=report.upstream_head,
-        changed_paths=changed_paths,
-        repair_target_command=repair_target_command,
-    )
+    eligible, blockers = _repair_eligibility(changed_paths)
     manifest = {
         "failure_kind": failure_kind,
         "repo_root": report.repo_root,
@@ -1113,14 +842,8 @@ def _write_repair_manifest(
         "update_worktree": report.update_worktree,
         "retained_worktree": report.retained_failed_worktree or report.update_worktree,
         "changed_paths": list(changed_paths),
-        "changed_path_count": len(changed_paths),
-        "net_changed_lines": net_changed_lines,
         "repair_eligible": eligible,
         "repair_blockers": blockers,
-        "repair_target_command": repair_target_command,
-        "repair_target_argv": list(repair_target_argv or []),
-        "failing_node_ids": list(failing_node_ids or []),
-        "repair_signature": signature,
         "last_validation_command": report.last_validation_command,
         "trust_gate_commands": report.tests_run,
         "fast_repair_hints": list(FAST_REPAIR_HINTS),
@@ -1129,162 +852,6 @@ def _write_repair_manifest(
     manifest_path = report_root / f"repair-manifest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
     _json_dump(manifest, manifest_path)
     return str(manifest_path), eligible, blockers
-
-
-def _load_repair_manifest(path: str | Path) -> dict[str, Any]:
-    if not path:
-        return {}
-    manifest_path = _normalize_path(path)
-    if not manifest_path.exists():
-        return {}
-    return _json_load(manifest_path)
-
-
-def _persist_latest_report_payload(report_root: Path, payload: dict[str, Any]) -> None:
-    latest_json = report_root / "latest.json"
-    _json_dump(payload, latest_json)
-    try:
-        report = UpdateReport(**payload)
-    except Exception:
-        return
-    _text_dump(_render_markdown_report(report), report_root / "latest.md")
-
-
-def _infer_failure_kind(report: UpdateReport | dict[str, Any]) -> str:
-    if isinstance(report, UpdateReport):
-        existing = report.repair_failure_kind
-        status = report.status
-    else:
-        existing = str(report.get("repair_failure_kind") or "")
-        status = str(report.get("status") or "")
-    if existing:
-        return existing
-    if status == "repair_required":
-        return "merge_conflict"
-    if status == "verification_failed":
-        return "verification_failed"
-    return ""
-
-
-def _default_repair_target_for_failure_kind(failure_kind: str) -> tuple[str, list[str], list[str]]:
-    if failure_kind == "merge_conflict":
-        argv = _build_trust_gate_pytest_cmd()
-        return _shell_join(argv), argv, []
-    return "", [], []
-
-
-def _build_repair_target_from_validation_error(exc: ValidationError) -> tuple[str, list[str], list[str]]:
-    if exc.argv and _command_looks_like_pytest(exc.argv) and exc.failing_node_ids:
-        argv = _build_targeted_pytest_cmd(exc.failing_node_ids)
-        return _shell_join(argv), argv, list(exc.failing_node_ids)
-    return exc.command or _shell_join(exc.argv), list(exc.argv), list(exc.failing_node_ids)
-
-
-def _repair_attempt_count_for_signature(latest: dict[str, Any], signature: str) -> int:
-    if not signature:
-        return 0
-    if str(latest.get("repair_signature") or "") != signature:
-        return 0
-    try:
-        return int(latest.get("repair_attempt_count") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _sync_codex_auth_state() -> str:
-    try:
-        from hermes_cli.auth import (
-            AuthError,
-            _import_codex_cli_tokens,
-            _read_codex_tokens,
-            _save_codex_tokens,
-            _write_codex_cli_tokens,
-        )
-    except Exception:
-        return ""
-
-    try:
-        data = _read_codex_tokens()
-    except AuthError:
-        data = {}
-    except Exception:
-        data = {}
-
-    tokens = data.get("tokens") if isinstance(data, dict) else {}
-    if isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token"):
-        _write_codex_cli_tokens(
-            str(tokens.get("access_token") or ""),
-            str(tokens.get("refresh_token") or ""),
-            last_refresh=data.get("last_refresh"),
-        )
-        return "synced Hermes Codex auth into ~/.codex/auth.json"
-
-    cli_tokens = _import_codex_cli_tokens()
-    if cli_tokens:
-        _save_codex_tokens(cli_tokens)
-        return "imported ~/.codex/auth.json into Hermes auth store"
-    return ""
-
-
-def _reconcile_retained_failure_report(repo_root: Path, report_root: Path) -> str:
-    latest = read_latest_update_report(report_root)
-    if not latest:
-        return ""
-    upstream_head = str(latest.get("upstream_head") or _current_ref(repo_root, UPSTREAM_REF) or "")
-    retained = _latest_retained_failure(repo_root, latest, upstream_head)
-    if not retained:
-        return ""
-    tracked_fields = (
-        "status",
-        "upstream_head",
-        "retained_failed_worktree",
-        "update_worktree",
-        "update_branch",
-        "retained_failed_worktree_valid",
-        "retained_failed_worktree_reason",
-        "repair_manifest_path",
-        "repair_eligible",
-        "repair_blockers",
-    )
-    if all(latest.get(field) == retained.get(field) for field in tracked_fields):
-        return ""
-    latest.update({field: retained.get(field) for field in tracked_fields})
-    _persist_latest_report_payload(report_root, latest)
-    return "reconciled retained worktree state from git worktree metadata"
-
-
-def _run_preflight_fixers(repo_root: Path, report_root: Path) -> dict[str, Any]:
-    actions: list[str] = []
-
-    if not _is_safe_directory_configured(repo_root):
-        _ensure_safe_directory(repo_root)
-        actions.append("configured git safe.directory for updater repo")
-
-    merge_issues = _merge_readiness_issues(repo_root)
-    if merge_issues:
-        _ensure_repo_merge_defaults(repo_root)
-        actions.append("repaired local git merge defaults")
-
-    try:
-        from hermes_cli.runtime_layout import bootstrap_split_runtime
-
-        bootstrap_split_runtime()
-        actions.append("bootstrapped split runtime layout")
-    except Exception:
-        pass
-
-    auth_action = _sync_codex_auth_state()
-    if auth_action:
-        actions.append(auth_action)
-
-    retained_action = _reconcile_retained_failure_report(repo_root, report_root)
-    if retained_action:
-        actions.append(retained_action)
-
-    return {
-        "actions": actions,
-        "background_conflicts": _detect_background_validation_conflicts(),
-    }
 
 
 def _compute_live_drift(repo_root: Path) -> dict[str, Any]:
@@ -1592,105 +1159,6 @@ def _build_cron_prompt(repo_root: Path, hermes_home: Path) -> str:
     )
 
 
-def _codex_cli_available() -> bool:
-    return bool(shutil.which("codex"))
-
-
-def _repair_transcript_dir(report_root: Path, stamp: str) -> Path:
-    return report_root / REPAIR_TRANSCRIPT_DIR_NAME / stamp
-
-
-def _build_codex_repair_prompt(
-    manifest: dict[str, Any],
-    latest: dict[str, Any],
-    retained_worktree: Path,
-    repair_target_command: str,
-) -> str:
-    latest_summary = {
-        "status": latest.get("status"),
-        "message": latest.get("message"),
-        "repair_failure_kind": latest.get("repair_failure_kind"),
-        "repair_target_command": latest.get("repair_target_command"),
-        "repair_signature": latest.get("repair_signature"),
-    }
-    return (
-        "You are repairing a retained Hermes routing updater worktree.\n\n"
-        "Hard constraints:\n"
-        f"- Work only inside this worktree: {retained_worktree}\n"
-        "- Do not edit files outside this worktree.\n"
-        "- Do not run git push, pull, fetch, rebase, reset, checkout, or merge.\n"
-        "- Do not change dependency manifests, lockfiles, databases, binaries, profiles, skills, website, docker, or nix files.\n"
-        "- Make the smallest textual fix that addresses the recorded failure.\n"
-        f"- After editing, prepare the repo so Hermes can rerun exactly this target validation command: {repair_target_command}\n\n"
-        f"Latest report summary:\n{json.dumps(latest_summary, indent=2, sort_keys=True)}\n\n"
-        f"Repair manifest:\n{json.dumps(manifest, indent=2, sort_keys=True)}\n\n"
-        "Return JSON only that matches the provided schema."
-    )
-
-
-def _invoke_codex_repair(
-    *,
-    transcript_dir: Path,
-    retained_worktree: Path,
-    repair_prompt: str,
-    config: dict[str, Any],
-) -> tuple[dict[str, Any], Path, Path]:
-    transcript_dir.mkdir(parents=True, exist_ok=True)
-    prompt_path = transcript_dir / "prompt.txt"
-    schema_path = transcript_dir / "schema.json"
-    stdout_path = transcript_dir / "stdout.txt"
-    stderr_path = transcript_dir / "stderr.txt"
-    output_path = transcript_dir / "response.json"
-
-    _text_dump(repair_prompt, prompt_path)
-    _json_dump(CODEX_REPAIR_SCHEMA, schema_path)
-
-    timeout_minutes = int(config.get("timeout_minutes") or REPAIR_DEFAULT_TIMEOUT_MINUTES)
-    command = [
-        "codex",
-        "exec",
-        "--cd",
-        str(retained_worktree),
-        "--ephemeral",
-        "--sandbox",
-        "workspace-write",
-        "-m",
-        str(config.get("model") or DEFAULT_CODEX_REPAIR_CONFIG["model"]),
-        "-c",
-        f'model_reasoning_effort="{config.get("reasoning_effort") or DEFAULT_CODEX_REPAIR_CONFIG["reasoning_effort"]}"',
-        "--output-schema",
-        str(schema_path),
-        "--output-last-message",
-        str(output_path),
-        repair_prompt,
-    ]
-
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(retained_worktree),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=max(1, timeout_minutes) * 60,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _text_dump((exc.stdout or "") if isinstance(exc.stdout, str) else "", stdout_path)
-        _text_dump((exc.stderr or "") if isinstance(exc.stderr, str) else "", stderr_path)
-        raise UpdateError(f"Codex repair timed out after {timeout_minutes} minute(s).")
-
-    _text_dump(result.stdout or "", stdout_path)
-    _text_dump(result.stderr or "", stderr_path)
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip() or "unknown error"
-        raise UpdateError(f"Codex repair exited with status {result.returncode}: {stderr}")
-
-    payload = _json_load(output_path)
-    if not payload:
-        raise UpdateError("Codex repair did not produce a valid JSON response.")
-    return payload, transcript_dir, output_path
-
-
 def _ensure_fork_remote(repo_root: Path, expected_url: str = EXPECTED_FORK_URL) -> str:
     actual = _git_output(repo_root, "remote", "get-url", PUSH_REMOTE)
     if _normalize_remote_url(actual) != _normalize_remote_url(expected_url):
@@ -1753,11 +1221,8 @@ def install_routing_auto_update(repo_root: Path | None = None) -> InstallResult:
     fork_remote = _ensure_fork_remote(repo_root)
 
     config = load_config()
-    config, config_changed = _ensure_codex_repair_config(config)
     if config.get("timezone") != ROUTING_AUTO_UPDATE_TIMEZONE:
         config["timezone"] = ROUTING_AUTO_UPDATE_TIMEZONE
-        config_changed = True
-    if config_changed:
         save_config(config)
 
     job_id, duplicates_paused = _upsert_cron_job(repo_root, hermes_home)
@@ -2042,48 +1507,6 @@ def _latest_retained_failure(repo_root: Path, latest: dict[str, Any], upstream_h
     return _discover_retained_failure_from_worktrees(repo_root, upstream_head)
 
 
-def _ensure_repair_manifest_for_report(report_root: Path, report: UpdateReport) -> dict[str, Any]:
-    manifest = _load_repair_manifest(report.repair_manifest_path)
-    if manifest:
-        return manifest
-
-    failure_kind = _infer_failure_kind(report)
-    if failure_kind not in REPAIR_ALLOWED_FAILURE_KINDS:
-        return {}
-
-    retained_worktree = _normalize_path(report.retained_failed_worktree or report.update_worktree)
-    if failure_kind == "merge_conflict":
-        changed_paths = _git_output(retained_worktree, "diff", "--name-only", "--diff-filter=U", cwd=retained_worktree).splitlines()
-        repair_target_command, repair_target_argv, failing_node_ids = _default_repair_target_for_failure_kind(failure_kind)
-    else:
-        changed_paths = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
-        repair_target_command = report.repair_target_command or report.last_validation_command
-        repair_target_argv = shlex.split(repair_target_command) if repair_target_command else []
-        failing_node_ids = []
-
-    report.repair_failure_kind = failure_kind
-    report.repair_target_command = repair_target_command
-    report.repair_signature = _compute_repair_signature(
-        failure_kind=failure_kind,
-        upstream_head=report.upstream_head,
-        changed_paths=[path for path in changed_paths if path.strip()],
-        repair_target_command=repair_target_command,
-    )
-    manifest_path, eligible, blockers = _write_repair_manifest(
-        report_root,
-        report,
-        failure_kind=failure_kind,
-        changed_paths=[path for path in changed_paths if path.strip()],
-        repair_target_command=repair_target_command,
-        repair_target_argv=repair_target_argv,
-        failing_node_ids=failing_node_ids,
-    )
-    report.repair_manifest_path = manifest_path
-    report.repair_eligible = eligible
-    report.repair_blockers = blockers
-    return _load_repair_manifest(manifest_path)
-
-
 def _preflight_backend(repo_root: Path, report: UpdateReport) -> tuple[GitBackend | None, GitBackendProbe]:
     backend, probe = select_git_backend(
         repo_root,
@@ -2170,16 +1593,6 @@ def _run_state_machine(
         report.repair_manifest_path = str(retained.get("repair_manifest_path") or "")
         report.repair_eligible = retained.get("repair_eligible")
         report.repair_blockers = list(retained.get("repair_blockers") or [])
-        report.repair_status = str(retained.get("repair_status") or "not_attempted")
-        report.repair_attempt_count = int(retained.get("repair_attempt_count") or 0)
-        report.repair_attempted_at = str(retained.get("repair_attempted_at") or "")
-        report.repair_failure_kind = str(retained.get("repair_failure_kind") or _infer_failure_kind(retained))
-        report.repair_target_command = str(retained.get("repair_target_command") or "")
-        report.repair_signature = str(retained.get("repair_signature") or "")
-        report.repair_transcript_dir = str(retained.get("repair_transcript_dir") or "")
-        report.repair_output_path = str(retained.get("repair_output_path") or "")
-        report.repair_timeout = int(retained.get("repair_timeout") or 0)
-        report.escalation_reason = str(retained.get("escalation_reason") or "")
         if report.status == "stale_retained_worktree":
             report.message = (
                 "The latest retained maintenance worktree is stale and cannot be finalized automatically. "
@@ -2291,18 +1704,13 @@ def _run_state_machine(
                 report.message = f"Refreshing the retained update worktree to the latest upstream produced conflicts: {stderr}"
                 report.retained_failed_worktree_valid = True
                 report.retained_failed_worktree_reason = ""
-                report.repair_failure_kind = "merge_conflict"
-                report.repair_target_command, _, _ = _default_repair_target_for_failure_kind("merge_conflict")
                 conflicted = _git_output(update_worktree, "diff", "--name-only", "--diff-filter=U", cwd=update_worktree).splitlines()
                 report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
                     report_root,
                     report,
                     failure_kind="merge_conflict",
                     changed_paths=[path for path in conflicted if path.strip()],
-                    repair_target_command=report.repair_target_command,
-                    repair_target_argv=_build_trust_gate_pytest_cmd(),
                 )
-                report.repair_signature = _load_repair_manifest(report.repair_manifest_path).get("repair_signature", "")
                 return report
     else:
         pre_sync = _sync_policy_history(hermes_home)
@@ -2338,48 +1746,18 @@ def _run_state_machine(
             report.retained_failed_worktree = str(retained_worktree)
             report.retained_failed_worktree_valid = True
             report.retained_failed_worktree_reason = ""
-            report.repair_failure_kind = "merge_conflict"
-            report.repair_target_command, _, _ = _default_repair_target_for_failure_kind("merge_conflict")
             conflicted = _git_output(retained_worktree, "diff", "--name-only", "--diff-filter=U", cwd=retained_worktree).splitlines()
             report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
                 report_root,
                 report,
                 failure_kind="merge_conflict",
                 changed_paths=[path for path in conflicted if path.strip()],
-                repair_target_command=report.repair_target_command,
-                repair_target_argv=_build_trust_gate_pytest_cmd(),
             )
-            report.repair_signature = _load_repair_manifest(report.repair_manifest_path).get("repair_signature", "")
             return report
 
     try:
         report.tests_run = _run_trust_gate(update_worktree)
         report.last_validation_command = report.tests_run[-1] if report.tests_run else ""
-    except ValidationError as exc:
-        retained_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
-        report.status = "verification_failed"
-        report.message = str(exc)
-        report.last_validation_command = exc.command or _extract_failed_command(exc)
-        report.update_worktree = str(retained_worktree)
-        report.retained_failed_worktree = str(retained_worktree)
-        report.retained_failed_worktree_valid = True
-        report.retained_failed_worktree_reason = ""
-        report.repair_failure_kind = "verification_failed"
-        report.repair_target_command, repair_target_argv, failing_node_ids = _build_repair_target_from_validation_error(exc)
-        if exc.stderr and "pid " in exc.stderr:
-            report.background_conflicts = [line for line in exc.stderr.splitlines() if line.strip()]
-        changed = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
-        report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
-            report_root,
-            report,
-            failure_kind="verification_failed",
-            changed_paths=[path for path in changed if path.strip()],
-            repair_target_command=report.repair_target_command,
-            repair_target_argv=repair_target_argv,
-            failing_node_ids=failing_node_ids,
-        )
-        report.repair_signature = _load_repair_manifest(report.repair_manifest_path).get("repair_signature", "")
-        return report
     except UpdateError as exc:
         retained_worktree = _quarantine_worktree(repo_root, hermes_home, update_worktree)
         report.status = "verification_failed"
@@ -2389,18 +1767,13 @@ def _run_state_machine(
         report.retained_failed_worktree = str(retained_worktree)
         report.retained_failed_worktree_valid = True
         report.retained_failed_worktree_reason = ""
-        report.repair_failure_kind = "verification_failed"
-        report.repair_target_command = report.last_validation_command or (report.tests_run[0] if report.tests_run else "")
         changed = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
         report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
             report_root,
             report,
             failure_kind="verification_failed",
             changed_paths=[path for path in changed if path.strip()],
-            repair_target_command=report.repair_target_command,
-            repair_target_argv=shlex.split(report.repair_target_command) if report.repair_target_command else [],
         )
-        report.repair_signature = _load_repair_manifest(report.repair_manifest_path).get("repair_signature", "")
         return report
 
     ff_result = _git(repo_root, "merge", "--ff-only", update_branch, check=False)
@@ -2413,8 +1786,6 @@ def _run_state_machine(
         report.retained_failed_worktree = str(retained_worktree)
         report.retained_failed_worktree_valid = True
         report.retained_failed_worktree_reason = ""
-        report.repair_failure_kind = "fast_forward_failed"
-        report.repair_target_command = ""
         changed = _git_output(retained_worktree, "diff", "--name-only", f"{LIVE_BRANCH}...HEAD", cwd=retained_worktree).splitlines()
         report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
             report_root,
@@ -2422,7 +1793,6 @@ def _run_state_machine(
             failure_kind="fast_forward_failed",
             changed_paths=[path for path in changed if path.strip()],
         )
-        report.repair_signature = _load_repair_manifest(report.repair_manifest_path).get("repair_signature", "")
         return report
 
     _clear_update_check(hermes_home)
@@ -2454,15 +1824,6 @@ def _run_state_machine(
     report.repair_manifest_path = ""
     report.repair_eligible = None
     report.repair_blockers = []
-    report.repair_status = "not_attempted"
-    report.repair_failure_kind = ""
-    report.repair_target_command = ""
-    report.repair_signature = ""
-    report.repair_transcript_dir = ""
-    report.repair_output_path = ""
-    report.repair_timeout = 0
-    report.escalation_reason = ""
-    report.background_conflicts = []
     return report
 
 def _require_dev_repo(repo_root: Path, operation: str) -> None:
@@ -2577,230 +1938,6 @@ def read_latest_update_report(report_root: Path | str | None = None) -> dict[str
         return {}
 
 
-def _report_from_latest_payload(latest: dict[str, Any], *, repo_root: Path, started: datetime, fallback_status: str) -> UpdateReport:
-    payload = dict(latest or {})
-    payload.setdefault("status", fallback_status)
-    payload.setdefault("started_at", _iso(started))
-    payload.setdefault("finished_at", _iso(started))
-    payload["repo_root"] = payload.get("repo_root") or str(repo_root)
-    return UpdateReport(**payload)
-
-
-def repair_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
-    started = _utc_now()
-    repo_root = _normalize_path(repo_root or PROJECT_ROOT)
-    _require_dev_repo(repo_root, "routing update repair")
-    hermes_home = _normalize_path(get_hermes_home())
-    report_root = _normalize_path(report_root or _default_report_root(hermes_home))
-    latest = read_latest_update_report(report_root)
-
-    report = _report_from_latest_payload(
-        latest,
-        repo_root=repo_root,
-        started=started,
-        fallback_status=str(latest.get("status") or "repair_failed"),
-    )
-    report.finished_at = _iso(started)
-
-    gateway_running, service_installed, telegram_connected = _current_gateway_health()
-    report.gateway_running = gateway_running
-    report.gateway_service_installed = service_installed
-    report.telegram_connected = telegram_connected
-
-    try:
-        preflight = _run_preflight_fixers(repo_root, report_root)
-        report.preflight_actions = list(dict.fromkeys(report.preflight_actions + list(preflight.get("actions") or [])))
-        report.background_conflicts = list(preflight.get("background_conflicts") or [])
-
-        config = _load_codex_repair_config()
-        report.repair_timeout = int(config.get("timeout_minutes") or REPAIR_DEFAULT_TIMEOUT_MINUTES) * 60
-        if not bool(config.get("enabled")):
-            report.repair_status = "ineligible"
-            report.escalation_reason = "Codex repair is disabled in routing_auto_update.codex_repair.enabled."
-            report.message = report.escalation_reason
-            return report
-        if not _codex_cli_available():
-            report.repair_status = "blocked"
-            report.escalation_reason = "codex CLI is not available on PATH."
-            report.message = report.escalation_reason
-            return report
-
-        retained = _latest_retained_failure(
-            repo_root,
-            latest,
-            str(latest.get("upstream_head") or _current_ref(repo_root, UPSTREAM_REF) or ""),
-        )
-        if not retained:
-            report.repair_status = "ineligible"
-            report.escalation_reason = "No retained failure is available for Codex repair."
-            report.message = report.escalation_reason
-            return report
-
-        report.status = str(retained.get("status") or report.status)
-        report.update_branch = str(retained.get("update_branch") or report.update_branch)
-        report.update_worktree = str(retained.get("update_worktree") or report.update_worktree)
-        report.retained_failed_worktree = str(retained.get("retained_failed_worktree") or report.retained_failed_worktree)
-        report.retained_failed_worktree_valid = retained.get("retained_failed_worktree_valid")
-        report.retained_failed_worktree_reason = str(retained.get("retained_failed_worktree_reason") or report.retained_failed_worktree_reason)
-        report.repair_manifest_path = str(retained.get("repair_manifest_path") or report.repair_manifest_path)
-        report.repair_eligible = retained.get("repair_eligible")
-        report.repair_blockers = list(retained.get("repair_blockers") or report.repair_blockers)
-        report.repair_failure_kind = str(retained.get("repair_failure_kind") or _infer_failure_kind(retained))
-        report.repair_target_command = str(retained.get("repair_target_command") or report.repair_target_command)
-        report.repair_signature = str(retained.get("repair_signature") or report.repair_signature)
-        report.repair_attempt_count = int(retained.get("repair_attempt_count") or report.repair_attempt_count or 0)
-
-        if report.status not in REPAIR_ELIGIBLE_STATUSES:
-            report.repair_status = "ineligible"
-            report.escalation_reason = f"Failure status '{report.status}' is outside the guarded auto-repair policy."
-            report.message = report.escalation_reason
-            return report
-        if report.retained_failed_worktree_valid is False:
-            report.repair_status = "blocked"
-            report.escalation_reason = report.retained_failed_worktree_reason or "Retained worktree is stale."
-            report.message = report.escalation_reason
-            return report
-        if report.background_conflicts:
-            report.repair_status = "blocked"
-            report.escalation_reason = "Background validation or updater process already running."
-            report.message = report.escalation_reason
-            return report
-
-        manifest = _ensure_repair_manifest_for_report(report_root, report)
-        if manifest:
-            report.repair_failure_kind = str(manifest.get("failure_kind") or report.repair_failure_kind)
-            report.repair_target_command = str(manifest.get("repair_target_command") or report.repair_target_command)
-            report.repair_signature = str(manifest.get("repair_signature") or report.repair_signature)
-            report.repair_eligible = manifest.get("repair_eligible")
-            report.repair_blockers = list(manifest.get("repair_blockers") or report.repair_blockers)
-
-        if report.repair_failure_kind not in REPAIR_ALLOWED_FAILURE_KINDS:
-            report.repair_status = "ineligible"
-            report.escalation_reason = f"Failure kind '{report.repair_failure_kind or 'unknown'}' is outside the guarded auto-repair allowlist."
-            report.message = report.escalation_reason
-            return report
-        if report.repair_eligible is False:
-            report.repair_status = "ineligible"
-            report.escalation_reason = "; ".join(report.repair_blockers) or "Repair manifest is not eligible for Codex repair."
-            report.message = report.escalation_reason
-            return report
-        if not report.repair_target_command:
-            report.repair_status = "ineligible"
-            report.escalation_reason = "Repair manifest is missing the target validation command."
-            report.message = report.escalation_reason
-            return report
-
-        max_attempts = int(config.get("max_attempts_per_signature") or REPAIR_DEFAULT_MAX_ATTEMPTS)
-        prior_attempts = _repair_attempt_count_for_signature(latest, report.repair_signature)
-        report.repair_attempt_count = prior_attempts
-        if prior_attempts >= max_attempts:
-            report.repair_status = "skipped"
-            report.escalation_reason = f"Repair attempt limit reached for signature {report.repair_signature}."
-            report.message = report.escalation_reason
-            return report
-
-        retained_worktree = _normalize_path(report.retained_failed_worktree or report.update_worktree)
-        transcript_dir = _repair_transcript_dir(report_root, _utc_now().strftime("%Y%m%d-%H%M%S"))
-        repair_prompt = _build_codex_repair_prompt(
-            manifest,
-            latest,
-            retained_worktree,
-            report.repair_target_command,
-        )
-        try:
-            payload, actual_transcript_dir, output_path = _invoke_codex_repair(
-                transcript_dir=transcript_dir,
-                retained_worktree=retained_worktree,
-                repair_prompt=repair_prompt,
-                config=config,
-            )
-        except UpdateError as exc:
-            report.repair_attempt_count = prior_attempts + 1
-            report.repair_attempted_at = _iso(_utc_now())
-            report.repair_status = "failed"
-            report.repair_transcript_dir = str(transcript_dir)
-            report.repair_output_path = str(transcript_dir / "response.json")
-            report.escalation_reason = str(exc)
-            report.message = report.escalation_reason
-            return report
-
-        report.repair_attempt_count = prior_attempts + 1
-        report.repair_attempted_at = _iso(_utc_now())
-        report.repair_transcript_dir = str(actual_transcript_dir)
-        report.repair_output_path = str(output_path)
-
-        target_argv = [str(item) for item in (manifest.get("repair_target_argv") or []) if str(item)]
-        if not target_argv and report.repair_target_command:
-            target_argv = shlex.split(report.repair_target_command)
-        if not target_argv:
-            report.repair_status = "failed"
-            report.escalation_reason = "Repair target command could not be reconstructed for validation."
-            report.message = report.escalation_reason
-            return report
-
-        report.message = str(payload.get("summary") or "Codex repair completed.")
-        try:
-            report.last_validation_command = _run_validation_command(target_argv, cwd=retained_worktree)
-        except ValidationError as exc:
-            report.repair_status = "failed"
-            report.escalation_reason = f"Target validation failed after Codex repair: {exc}"
-            report.message = report.escalation_reason
-            if exc.stderr and "pid " in exc.stderr:
-                report.background_conflicts = [line for line in exc.stderr.splitlines() if line.strip()]
-            return report
-
-        report.repair_status = "validated"
-        report.escalation_reason = ""
-        report.message = "Codex repair validated the targeted command in the retained worktree. Run finalize to continue promotion."
-        return report
-    except UpdateError as exc:
-        report.repair_status = "failed"
-        report.escalation_reason = str(exc)
-        report.message = str(exc)
-        return report
-    except Exception as exc:  # pragma: no cover
-        report.repair_status = "failed"
-        report.escalation_reason = f"Unexpected error: {exc}"
-        report.message = report.escalation_reason
-        return report
-    finally:
-        report.finished_at = _iso(_utc_now())
-        _write_report_files(report_root, report)
-        _prune_retention(
-            hermes_home,
-            repo_root,
-            keep_failed_worktree=_normalize_path(report.retained_failed_worktree) if report.retained_failed_worktree else None,
-        )
-
-
-def cycle_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
-    repo_root = _normalize_path(repo_root or PROJECT_ROOT)
-    _require_dev_repo(repo_root, "routing update cycle")
-    hermes_home = _normalize_path(get_hermes_home())
-    report_root = _normalize_path(report_root or _default_report_root(hermes_home))
-
-    preflight = _run_preflight_fixers(repo_root, report_root)
-    report = run_routing_auto_update(repo_root, report_root)
-    report.preflight_actions = list(dict.fromkeys(report.preflight_actions + list(preflight.get("actions") or [])))
-    report.background_conflicts = list(dict.fromkeys(report.background_conflicts + list(preflight.get("background_conflicts") or [])))
-
-    if report.status in REPAIR_ELIGIBLE_STATUSES:
-        repaired = repair_routing_auto_update(repo_root, report_root)
-        repaired.preflight_actions = list(dict.fromkeys(report.preflight_actions + repaired.preflight_actions))
-        repaired.background_conflicts = list(dict.fromkeys(report.background_conflicts + repaired.background_conflicts))
-        if repaired.repair_status == "validated":
-            finalized = finalize_routing_auto_update(repo_root, report_root)
-            finalized.preflight_actions = list(dict.fromkeys(repaired.preflight_actions + finalized.preflight_actions))
-            finalized.background_conflicts = list(dict.fromkeys(repaired.background_conflicts + finalized.background_conflicts))
-            _write_report_files(report_root, finalized)
-            return finalized
-        _write_report_files(report_root, repaired)
-        return repaired
-
-    _write_report_files(report_root, report)
-    return report
-
-
 def _status_missing_payload(repo_root: Path, gateway_running: bool, service_installed: bool, telegram_connected: bool) -> dict[str, Any]:
     return {
         "status": "missing",
@@ -2819,18 +1956,6 @@ def _status_missing_payload(repo_root: Path, gateway_running: bool, service_inst
         "repair_manifest_path": "",
         "repair_eligible": None,
         "repair_blockers": [],
-        "repair_status": "not_attempted",
-        "repair_attempt_count": 0,
-        "repair_attempted_at": "",
-        "repair_failure_kind": "",
-        "repair_target_command": "",
-        "repair_signature": "",
-        "repair_transcript_dir": "",
-        "repair_output_path": "",
-        "repair_timeout": 0,
-        "escalation_reason": "",
-        "preflight_actions": [],
-        "background_conflicts": [],
         "gateway_running": gateway_running,
         "gateway_service_installed": service_installed,
         "telegram_connected": telegram_connected,
@@ -2846,7 +1971,6 @@ def _status_missing_payload(repo_root: Path, gateway_running: bool, service_inst
         },
         "job": _latest_job_state(),
         "topology": detect_routing_update_topology(repo_root),
-        "codex_repair": {},
     }
 
 
@@ -2882,18 +2006,6 @@ def routing_update_status(
                 "repair_manifest_path": latest.get("repair_manifest_path") or "",
                 "repair_eligible": latest.get("repair_eligible"),
                 "repair_blockers": list(latest.get("repair_blockers") or []),
-                "repair_status": latest.get("repair_status") or "not_attempted",
-                "repair_attempt_count": int(latest.get("repair_attempt_count") or 0),
-                "repair_attempted_at": latest.get("repair_attempted_at") or "",
-                "repair_failure_kind": latest.get("repair_failure_kind") or "",
-                "repair_target_command": latest.get("repair_target_command") or "",
-                "repair_signature": latest.get("repair_signature") or "",
-                "repair_transcript_dir": latest.get("repair_transcript_dir") or "",
-                "repair_output_path": latest.get("repair_output_path") or "",
-                "repair_timeout": int(latest.get("repair_timeout") or 0),
-                "escalation_reason": latest.get("escalation_reason") or "",
-                "preflight_actions": list(latest.get("preflight_actions") or []),
-                "background_conflicts": list(latest.get("background_conflicts") or []),
                 "push_status": latest.get("push_status") or "not_attempted",
                 "integration_push_status": latest.get("integration_push_status") or "not_attempted",
                 "main_promotion_status": latest.get("main_promotion_status") or "not_attempted",
@@ -2904,13 +2016,6 @@ def routing_update_status(
     summary["topology"] = topology
     job = _latest_job_state()
     summary["job"] = job
-    codex_repair = _load_codex_repair_config()
-    summary["codex_repair"] = {
-        **codex_repair,
-        "cli_available": _codex_cli_available(),
-        "attempt_limit_reached": False,
-        "background_conflicts": list(summary.get("background_conflicts") or []),
-    }
 
     auth_backend = "unavailable"
     fetch_ready = False
@@ -2964,16 +2069,6 @@ def routing_update_status(
             summary["repair_manifest_path"] = retained.get("repair_manifest_path") or ""
             summary["repair_eligible"] = retained.get("repair_eligible")
             summary["repair_blockers"] = list(retained.get("repair_blockers") or [])
-            summary["repair_failure_kind"] = retained.get("repair_failure_kind") or summary.get("repair_failure_kind") or _infer_failure_kind(retained)
-            summary["repair_target_command"] = retained.get("repair_target_command") or summary.get("repair_target_command") or ""
-            summary["repair_signature"] = retained.get("repair_signature") or summary.get("repair_signature") or ""
-            summary["repair_attempt_count"] = int(retained.get("repair_attempt_count") or summary.get("repair_attempt_count") or 0)
-            summary["repair_attempted_at"] = retained.get("repair_attempted_at") or summary.get("repair_attempted_at") or ""
-            summary["repair_status"] = retained.get("repair_status") or summary.get("repair_status") or "not_attempted"
-            summary["repair_transcript_dir"] = retained.get("repair_transcript_dir") or summary.get("repair_transcript_dir") or ""
-            summary["repair_output_path"] = retained.get("repair_output_path") or summary.get("repair_output_path") or ""
-            summary["repair_timeout"] = int(retained.get("repair_timeout") or summary.get("repair_timeout") or 0)
-            summary["escalation_reason"] = retained.get("escalation_reason") or summary.get("escalation_reason") or ""
             if retained.get("status") == "stale_retained_worktree":
                 summary["status"] = "stale_retained_worktree"
                 summary["message"] = (
@@ -2988,12 +2083,6 @@ def routing_update_status(
         "errors": auth_errors,
         "details": auth_details,
     }
-    summary["background_conflicts"] = list(dict.fromkeys(summary.get("background_conflicts") or _detect_background_validation_conflicts()))
-    summary["codex_repair"]["background_conflicts"] = list(summary["background_conflicts"])
-    summary["codex_repair"]["attempt_limit_reached"] = bool(
-        summary.get("repair_signature")
-        and int(summary.get("repair_attempt_count") or 0) >= int(codex_repair.get("max_attempts_per_signature") or REPAIR_DEFAULT_MAX_ATTEMPTS)
-    )
     summary["gateway_running"] = gateway_running
     summary["gateway_service_installed"] = service_installed
     summary["telegram_connected"] = telegram_connected
@@ -3026,12 +2115,6 @@ def routing_update_doctor(
         "update_cache_hygiene": True,
         "retained_worktree_present": False,
         "retained_worktree_valid": summary.get("retained_worktree_valid"),
-        "codex_cli": bool(summary.get("codex_repair", {}).get("cli_available")),
-        "codex_repair_enabled": bool(summary.get("codex_repair", {}).get("enabled")),
-        "codex_repair_model": summary.get("codex_repair", {}).get("model") or "",
-        "codex_repair_reasoning_effort": summary.get("codex_repair", {}).get("reasoning_effort") or "",
-        "repair_attempt_limit_reached": bool(summary.get("codex_repair", {}).get("attempt_limit_reached")),
-        "background_conflicts": not bool(summary.get("background_conflicts")),
     }
 
     retained = str(summary.get("retained_worktree") or "")
@@ -3057,14 +2140,6 @@ def routing_update_doctor(
     merge_issues = _merge_readiness_issues(effective_repo) if (effective_repo / ".git").exists() else ["repo missing .git"]
     if merge_issues:
         issues.extend([f"merge readiness: {item}" for item in merge_issues])
-    if not checks["codex_cli"]:
-        issues.append("codex CLI is not available for guarded self-heal")
-    if not checks["codex_repair_enabled"]:
-        issues.append("codex self-heal is disabled in config")
-    if checks["repair_attempt_limit_reached"]:
-        issues.append("repair attempt limit has been reached for the current failure signature")
-    if not checks["background_conflicts"]:
-        issues.extend([f"background conflict: {item}" for item in summary.get("background_conflicts", [])])
     if not checks["gateway_running"]:
         issues.append("gateway delivery path is not running")
     if not checks["telegram_connected"]:
@@ -3142,20 +2217,6 @@ def routing_status_command(args) -> None:
         print(f"Retained worktree note: {summary['retained_worktree_reason']}")
     if summary.get("repair_manifest_path"):
         print(f"Repair manifest: {summary['repair_manifest_path']}")
-    if summary.get("repair_status"):
-        print(f"Repair status: {summary['repair_status']}")
-    if summary.get("repair_attempt_count"):
-        print(f"Repair attempts: {summary['repair_attempt_count']}")
-    if summary.get("repair_target_command"):
-        print(f"Repair target command: {summary['repair_target_command']}")
-    if summary.get("repair_transcript_dir"):
-        print(f"Repair transcript dir: {summary['repair_transcript_dir']}")
-    if summary.get("escalation_reason"):
-        print(f"Escalation reason: {summary['escalation_reason']}")
-    if summary.get("background_conflicts"):
-        print("Background conflicts:")
-        for item in summary["background_conflicts"]:
-            print(f"  - {item}")
     print(f"Gateway running: {summary.get('gateway_running')}")
     print(f"Telegram connected: {summary.get('telegram_connected')}")
 
@@ -3197,16 +2258,6 @@ def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     run_parser.add_argument("--report-root", default="")
     run_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
 
-    cycle_parser = subparsers.add_parser("cycle", help="Run the guarded unattended update cycle once")
-    cycle_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
-    cycle_parser.add_argument("--report-root", default="")
-    cycle_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
-
-    repair_parser = subparsers.add_parser("repair", help="Run one guarded Codex repair attempt on the retained worktree")
-    repair_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
-    repair_parser.add_argument("--report-root", default="")
-    repair_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
-
     status_parser = subparsers.add_parser("status", help="Summarize the latest routing auto-update report")
     status_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
     status_parser.add_argument("--report-root", default="")
@@ -3246,11 +2297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         routing_doctor_command(args)
         return 0
 
-    if args.command == "cycle":
-        report = cycle_routing_auto_update(args.repo_root, args.report_root or None)
-    elif args.command == "repair":
-        report = repair_routing_auto_update(args.repo_root, args.report_root or None)
-    elif args.command == "finalize":
+    if args.command == "finalize":
         report = finalize_routing_auto_update(args.repo_root, args.report_root or None)
     else:
         report = run_routing_auto_update(args.repo_root, args.report_root or None)

@@ -12,9 +12,81 @@ import json
 import logging
 import os
 import re
+import sys
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+class _TelegramImportStub:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _TelegramFilterValue:
+    def __and__(self, _other):
+        return self
+
+    def __rand__(self, _other):
+        return self
+
+    def __or__(self, _other):
+        return self
+
+    def __ror__(self, _other):
+        return self
+
+    def __invert__(self):
+        return self
+
+
+class _TelegramFiltersStub(SimpleNamespace):
+    def __init__(self):
+        base = _TelegramFilterValue()
+        super().__init__(
+            TEXT=base,
+            COMMAND=base,
+            LOCATION=base,
+            VENUE=base,
+            PHOTO=base,
+            VIDEO=base,
+            AUDIO=base,
+            VOICE=base,
+            Document=SimpleNamespace(ALL=base),
+            Sticker=SimpleNamespace(ALL=base),
+        )
+
+
+class _TelegramInlineKeyboardButtonStub(_TelegramImportStub):
+    def __init__(self, text: str = "", callback_data: str | None = None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.text = text
+        self.callback_data = callback_data
+
+
+class _TelegramInlineKeyboardMarkupStub(_TelegramImportStub):
+    def __init__(self, inline_keyboard, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.inline_keyboard = inline_keyboard
+
+
+class _TelegramApplicationStub:
+    @classmethod
+    def builder(cls):
+        raise RuntimeError("python-telegram-bot is not installed")
+
+
+class _MockContextTypes:
+    DEFAULT_TYPE = Any
+
+
+_TelegramUpdateStub = type("_TelegramUpdateStub", (), {"ALL_TYPES": ()})
+_TELEGRAM_FILTERS_STUB = _TelegramFiltersStub()
+_TELEGRAM_PARSEMODE_STUB = SimpleNamespace(MARKDOWN="Markdown", MARKDOWN_V2="MarkdownV2", HTML="HTML")
+_TELEGRAM_CHATTYPE_STUB = SimpleNamespace(GROUP="group", SUPERGROUP="supergroup", CHANNEL="channel", PRIVATE="private")
+
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -31,27 +103,85 @@ try:
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
-    Update = Any
-    Bot = Any
-    Message = Any
-    InlineKeyboardButton = Any
-    InlineKeyboardMarkup = Any
-    Application = Any
-    CommandHandler = Any
-    CallbackQueryHandler = Any
-    TelegramMessageHandler = Any
-    HTTPXRequest = Any
-    filters = None
-    ParseMode = None
-    ChatType = None
-
-    # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
-    # don't crash during class definition when the library isn't installed.
-    class _MockContextTypes:
-        DEFAULT_TYPE = Any
+    Update = _TelegramUpdateStub
+    Bot = _TelegramImportStub
+    Message = _TelegramImportStub
+    InlineKeyboardButton = _TelegramInlineKeyboardButtonStub
+    InlineKeyboardMarkup = _TelegramInlineKeyboardMarkupStub
+    Application = _TelegramApplicationStub
+    CommandHandler = _TelegramImportStub
+    CallbackQueryHandler = _TelegramImportStub
+    TelegramMessageHandler = _TelegramImportStub
+    HTTPXRequest = _TelegramImportStub
+    filters = _TELEGRAM_FILTERS_STUB
+    ParseMode = _TELEGRAM_PARSEMODE_STUB
+    ChatType = _TELEGRAM_CHATTYPE_STUB
     ContextTypes = _MockContextTypes
 
-import sys
+
+def _refresh_telegram_bindings() -> None:
+    global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    global Application, CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
+
+    tg = sys.modules.get("telegram")
+    tg_ext = sys.modules.get("telegram.ext")
+    tg_constants = sys.modules.get("telegram.constants")
+    tg_request = sys.modules.get("telegram.request")
+
+    if tg is None and tg_ext is None and tg_constants is None and tg_request is None:
+        return
+
+    def _pick(current, placeholder, *candidates):
+        if current is not placeholder:
+            return current
+        for candidate in candidates:
+            if candidate is not None:
+                return candidate
+        return current
+
+    tg_constants_obj = tg_constants or getattr(tg, "constants", None)
+    tg_ext_obj = tg_ext or getattr(tg, "ext", None)
+
+    Update = _pick(Update, _TelegramUpdateStub, getattr(tg, "Update", None))
+    Bot = _pick(Bot, _TelegramImportStub, getattr(tg, "Bot", None))
+    Message = _pick(Message, _TelegramImportStub, getattr(tg, "Message", None))
+    InlineKeyboardButton = _pick(
+        InlineKeyboardButton,
+        _TelegramInlineKeyboardButtonStub,
+        getattr(tg, "InlineKeyboardButton", None),
+    )
+    InlineKeyboardMarkup = _pick(
+        InlineKeyboardMarkup,
+        _TelegramInlineKeyboardMarkupStub,
+        getattr(tg, "InlineKeyboardMarkup", None),
+    )
+    Application = _pick(
+        Application,
+        _TelegramApplicationStub,
+        getattr(tg_ext_obj, "Application", None),
+        getattr(tg, "Application", None),
+    )
+    CommandHandler = _pick(CommandHandler, _TelegramImportStub, getattr(tg_ext_obj, "CommandHandler", None))
+    CallbackQueryHandler = _pick(
+        CallbackQueryHandler,
+        _TelegramImportStub,
+        getattr(tg_ext_obj, "CallbackQueryHandler", None),
+    )
+    TelegramMessageHandler = _pick(
+        TelegramMessageHandler,
+        _TelegramImportStub,
+        getattr(tg_ext_obj, "MessageHandler", None),
+        getattr(tg_ext_obj, "TelegramMessageHandler", None),
+    )
+    ContextTypes = _pick(ContextTypes, _MockContextTypes, getattr(tg_ext_obj, "ContextTypes", None))
+    filters = _pick(filters, _TELEGRAM_FILTERS_STUB, getattr(tg_ext_obj, "filters", None), getattr(tg, "filters", None))
+    ParseMode = _pick(ParseMode, _TELEGRAM_PARSEMODE_STUB, getattr(tg_constants_obj, "ParseMode", None))
+    ChatType = _pick(ChatType, _TELEGRAM_CHATTYPE_STUB, getattr(tg_constants_obj, "ChatType", None))
+    HTTPXRequest = _pick(HTTPXRequest, _TelegramImportStub, getattr(tg_request, "HTTPXRequest", None))
+
+    TELEGRAM_AVAILABLE = True
+
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
@@ -79,6 +209,7 @@ from gateway.platforms.telegram_network import (
 
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available."""
+    _refresh_telegram_bindings()
     return TELEGRAM_AVAILABLE
 
 
@@ -131,6 +262,7 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     
     def __init__(self, config: PlatformConfig):
+        _refresh_telegram_bindings()
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
@@ -489,6 +621,7 @@ class TelegramAdapter(BasePlatformAdapter):
             TELEGRAM_WEBHOOK_PORT   Local listen port (default 8443)
             TELEGRAM_WEBHOOK_SECRET Secret token for update verification
         """
+        _refresh_telegram_bindings()
         if not TELEGRAM_AVAILABLE:
             logger.error(
                 "[%s] python-telegram-bot not installed. Run: pip install python-telegram-bot",
@@ -1916,9 +2049,20 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         # 9) Convert blockquotes: > at line start → protect > from escaping
+        #    Handle both regular blockquotes (> text) and expandable blockquotes
+        #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
+        def _convert_blockquote(m):
+            prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
+            content = m.group(2)
+            # Check if content ends with || (expandable blockquote end marker)
+            # In this case, preserve the trailing || unescaped for Telegram
+            if prefix.startswith('**') and content.endswith('||'):
+                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
+            return _ph(f'{prefix} {_escape_mdv2(content)}')
+
         text = re.sub(
-            r'^(>{1,3}) (.+)$',
-            lambda m: _ph(m.group(1) + ' ' + _escape_mdv2(m.group(2))),
+            r'^((?:\*\*)?>{1,3}) (.+)$',
+            _convert_blockquote,
             text,
             flags=re.MULTILINE,
         )
@@ -1990,6 +2134,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_ignored_threads(self) -> set[int]:
+        raw = self.config.extra.get("ignored_threads")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+
+        if isinstance(raw, list):
+            values = raw
+        else:
+            values = str(raw).split(",")
+
+        ignored: set[int] = set()
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                ignored.add(int(text))
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
+        return ignored
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
@@ -2102,6 +2267,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
+        thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():

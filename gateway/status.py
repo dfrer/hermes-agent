@@ -234,6 +234,7 @@ def write_runtime_status(
     payload.setdefault("platforms", {})
     payload.setdefault("kind", _GATEWAY_KIND)
     payload["pid"] = os.getpid()
+    payload["argv"] = list(sys.argv)
     payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
@@ -260,15 +261,89 @@ def write_runtime_status(
     _write_json_file(path, payload)
 
 
+def _runtime_status_belongs_to_current_process(payload: dict[str, Any]) -> bool:
+    """Return True when a runtime payload was written by this live process.
+
+    ``GatewayRunner.start()`` updates the runtime status before the outer
+    daemon/bootstrap path writes a PID file. Reads that happen in-process
+    during startup should therefore trust a matching PID/start_time pair even
+    when ``get_running_pid()`` has nothing to validate yet.
+    """
+    try:
+        payload_pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False
+
+    if payload_pid != os.getpid():
+        return False
+
+    payload_start = payload.get("start_time")
+    current_start = _get_process_start_time(payload_pid)
+    if payload_start is None or current_start is None:
+        return True
+    return payload_start == current_start
+
+
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
-    return _read_json_file(_get_runtime_status_path())
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path)
+    if not payload:
+        return None
+
+    gateway_state = payload.get("gateway_state")
+    if gateway_state not in {"running", "starting", "draining"}:
+        return payload
+
+    if get_running_pid() is not None:
+        return payload
+    if _runtime_status_belongs_to_current_process(payload):
+        return payload
+
+    normalized = dict(payload)
+    normalized["updated_at"] = _utc_now_iso()
+    if gateway_state == "starting" and normalized.get("exit_reason"):
+        normalized["gateway_state"] = "startup_failed"
+    else:
+        normalized["gateway_state"] = "stopped"
+        normalized.setdefault(
+            "exit_reason",
+            "stale runtime status cleared after the gateway process exited",
+        )
+
+    platforms = normalized.get("platforms")
+    if isinstance(platforms, dict):
+        for pdata in platforms.values():
+            if not isinstance(pdata, dict):
+                continue
+            if pdata.get("state") in {"connected", "connecting"}:
+                pdata["state"] = "disconnected"
+                pdata["updated_at"] = normalized["updated_at"]
+
+    _write_json_file(path, normalized)
+    return normalized
 
 
 def remove_pid_file() -> None:
-    """Remove the gateway PID file if it exists."""
+    """Remove the gateway PID file, but only if it belongs to this process.
+
+    During --replace handoffs, the old process's atexit handler can fire AFTER
+    the new process has written its own PID file.  Blindly removing the file
+    would delete the new process's record, leaving the gateway running with no
+    PID file (invisible to ``get_running_pid()``).
+    """
     try:
-        _get_pid_path().unlink(missing_ok=True)
+        path = _get_pid_path()
+        record = _read_json_file(path)
+        if record is not None:
+            try:
+                file_pid = int(record["pid"])
+            except (KeyError, TypeError, ValueError):
+                file_pid = None
+            if file_pid is not None and file_pid != os.getpid():
+                # PID file belongs to a different process — leave it alone.
+                return
+        path.unlink(missing_ok=True)
     except Exception:
         pass
 

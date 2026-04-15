@@ -45,7 +45,7 @@ class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
     @patch("hermes_cli.routing_auto_update._render_markdown_report", return_value="report")
-    @patch("hermes_cli.routing_auto_update.cycle_routing_auto_update")
+    @patch("hermes_cli.routing_auto_update.run_routing_auto_update")
     @patch("hermes_cli.config.is_managed", return_value=False)
     @patch(
         "hermes_cli.routing_auto_update.detect_routing_update_topology",
@@ -110,7 +110,7 @@ class TestCmdUpdateBranchFallback:
             "-p",
             "dev",
         ]
-        assert delegated[5:9] == ["routing", "update", "cycle", "--json"]
+        assert delegated[5:9] == ["routing", "update", "run", "--json"]
         captured = capsys.readouterr()
         assert "report" in captured.out
 

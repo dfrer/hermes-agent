@@ -28,9 +28,12 @@ class TestInterruptModule:
         assert not is_interrupted()
 
     def test_thread_safety(self):
+        from tools.interrupt import set_interrupt, is_interrupted, _interrupted_threads, _lock
         """Interrupts are thread-scoped and must target the worker thread."""
-        from tools.interrupt import set_interrupt, is_interrupted
         set_interrupt(False)
+        # Clear any stale thread idents left by prior tests in this worker.
+        with _lock:
+            _interrupted_threads.clear()
 
         seen = {"value": False}
 

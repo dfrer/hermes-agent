@@ -224,6 +224,37 @@ def _is_wrapper_dir_in_path() -> bool:
     return wrapper_dir in os.environ.get("PATH", "").split(os.pathsep)
 
 
+def _build_wrapper_script(name: str) -> str:
+    """Return the shell wrapper body for a named profile alias.
+
+    Use the concrete repo entrypoint rather than the top-level ``hermes``
+    wrapper so profile aliases don't recurse through the split live/dev routing
+    wrapper and accidentally double-apply ``-p``.
+    """
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+HERMES_ROOT="${{HERMES_ROOT:-$HOME/.hermes}}"
+LIVE_REPO="$HERMES_ROOT/hermes-agent"
+DEV_REPO="$HERMES_ROOT/hermes-agent-dev"
+ENTRY="$LIVE_REPO/venv/bin/hermes"
+if [ ! -x "$ENTRY" ]; then
+    ENTRY="$DEV_REPO/venv/bin/hermes"
+fi
+BOOTSTRAP_PY="$DEV_REPO/venv/bin/python"
+if [ ! -x "$BOOTSTRAP_PY" ]; then
+    BOOTSTRAP_PY="$LIVE_REPO/venv/bin/python"
+fi
+if [ -x "$BOOTSTRAP_PY" ]; then
+    HERMES_HOME="$HERMES_ROOT/profiles/{name}" "$BOOTSTRAP_PY" -m hermes_cli.runtime_layout bootstrap --root "$HERMES_ROOT" >/dev/null 2>&1 || true
+fi
+if [ ! -x "$ENTRY" ]; then
+    echo "Missing Hermes entrypoint: $ENTRY" >&2
+    exit 1
+fi
+exec "$ENTRY" -p {name} "$@"
+"""
+
+
 def create_wrapper_script(name: str) -> Optional[Path]:
     """Create a shell wrapper script at ~/.local/bin/<name>.
 
@@ -238,7 +269,7 @@ def create_wrapper_script(name: str) -> Optional[Path]:
 
     wrapper_path = wrapper_dir / name
     try:
-        wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {name} "$@"\n')
+        wrapper_path.write_text(_build_wrapper_script(name), encoding="utf-8")
         wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return wrapper_path
     except OSError as e:

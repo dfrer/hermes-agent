@@ -36,8 +36,10 @@ def resolve_active_host() -> str:
 
     Resolution order:
       1. HERMES_HONCHO_HOST env var (explicit override)
-      2. Active profile name via profiles system -> ``hermes.<profile>``
-      3. Fallback: ``"hermes"`` (default profile)
+      2. Active profile name via profiles system
+         - ``default`` / ``main`` -> ``"hermes"`` (live profile)
+         - everything else -> ``hermes.<profile>``
+      3. Fallback: ``"hermes"``
     """
     explicit = os.environ.get("HERMES_HONCHO_HOST", "").strip()
     if explicit:
@@ -46,7 +48,9 @@ def resolve_active_host() -> str:
     try:
         from hermes_cli.profiles import get_active_profile_name
         profile = get_active_profile_name()
-        if profile and profile not in ("default", "custom"):
+        if profile in ("default", "main", "custom", None, ""):
+            return HOST
+        if profile:
             return f"{HOST}.{profile}"
     except Exception:
         pass
