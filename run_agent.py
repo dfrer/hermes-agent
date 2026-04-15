@@ -9493,7 +9493,9 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
-                                "partial": True
+                                "partial": True,
+                                "failed": True,
+                                "compression_exhausted": True,
                             }
                         self._emit_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
@@ -9522,7 +9524,9 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": "Request payload too large (413). Cannot compress further.",
-                                "partial": True
+                                "partial": True,
+                                "failed": True,
+                                "compression_exhausted": True,
                             }
 
                     # Check for context-length errors BEFORE generic 4xx handler.
@@ -9573,7 +9577,9 @@ class AIAgent:
                                     "completed": False,
                                     "api_calls": api_call_count,
                                     "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
-                                    "partial": True
+                                    "partial": True,
+                                    "failed": True,
+                                    "compression_exhausted": True,
                                 }
                             restart_with_compressed_messages = True
                             break
@@ -9623,7 +9629,9 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
-                                "partial": True
+                                "partial": True,
+                                "failed": True,
+                                "compression_exhausted": True,
                             }
                         self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
@@ -9654,7 +9662,9 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
-                                "partial": True
+                                "partial": True,
+                                "failed": True,
+                                "compression_exhausted": True,
                             }
 
                     # Check for non-retryable client errors.  The classifier
