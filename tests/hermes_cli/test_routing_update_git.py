@@ -59,3 +59,49 @@ def test_probe_git_backend_prefers_native_when_both_backends_work(monkeypatch, t
     )
 
     assert probe.backend == "native"
+
+
+def test_probe_backend_uses_resolved_commit_shas_for_push_checks():
+    calls = []
+
+    class FakeBackend:
+        def run(self, args, check=False):
+            calls.append(list(args))
+            if args[:2] == ["ls-remote", "--heads"]:
+                return _completed(args)
+            if args[:3] == ["rev-parse", "--verify", "refs/remotes/fork/codex/routing-integration^{commit}"]:
+                return _completed(args, stdout="live-sha\n")
+            if args[:3] == ["rev-parse", "--verify", "refs/remotes/fork/main^{commit}"]:
+                return _completed(args, stdout="main-sha\n")
+            if args[:2] == ["rev-parse", "--verify"]:
+                return _completed(args, returncode=1)
+            if args[:3] == ["push", "--porcelain", "--dry-run"]:
+                return _completed(args)
+            raise AssertionError(f"Unexpected git args: {args}")
+
+    fetch_ready, push_ready, push_targets, errors = rug._probe_backend(
+        FakeBackend(),
+        upstream_remote="origin",
+        push_remote="fork",
+        live_branch="codex/routing-integration",
+        promotion_branch="main",
+        live_source_refs=("refs/remotes/fork/codex/routing-integration",),
+        promotion_source_refs=("refs/remotes/fork/main",),
+    )
+
+    push_calls = [args for args in calls if args[:3] == ["push", "--porcelain", "--dry-run"]]
+
+    assert fetch_ready is True
+    assert push_ready is True
+    assert push_targets == {"codex/routing-integration": True, "main": True}
+    assert errors == {}
+    assert push_calls == [
+        ["push", "--porcelain", "--dry-run", "fork", "live-sha:refs/heads/codex/routing-integration"],
+        ["push", "--porcelain", "--dry-run", "fork", "main-sha:refs/heads/main"],
+    ]
+
+
+def _completed(args=None, stdout="", stderr="", returncode=0):
+    import subprocess
+
+    return subprocess.CompletedProcess(args or [], returncode, stdout=stdout, stderr=stderr)

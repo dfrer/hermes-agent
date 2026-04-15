@@ -2873,7 +2873,7 @@ def cmd_routing(args):
         from hermes_cli import routing_auto_update as rau
 
         subcommand = getattr(args, "routing_update_command", None)
-        if subcommand in ("install", "run", "finalize"):
+        if subcommand in ("install", "run", "finalize", "reconcile"):
             repo_root = getattr(args, "repo_root", PROJECT_ROOT)
             from pathlib import Path
             try:
@@ -2915,7 +2915,17 @@ def cmd_routing(args):
             else:
                 print(rau._render_markdown_report(report))
             return
-    print("Usage: hermes routing update {install|run|status|doctor}")
+        if subcommand == "reconcile":
+            report = rau.reconcile_routing_auto_update(
+                getattr(args, "repo_root", PROJECT_ROOT),
+                getattr(args, "report_root", "") or None,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(asdict(report), indent=2))
+            else:
+                print(rau._render_markdown_report(report))
+            return
+    print("Usage: hermes routing update {install|run|status|doctor|reconcile}")
 
 
 def cmd_status(args):
@@ -5171,6 +5181,13 @@ For more help on a command:
     routing_update_finalize.add_argument("--repo-root", default=str(PROJECT_ROOT))
     routing_update_finalize.add_argument("--report-root", default="")
     routing_update_finalize.add_argument("--json", action="store_true", help="Emit structured JSON")
+    routing_update_reconcile = routing_update_subparsers.add_parser(
+        "reconcile",
+        help="Repair fork/main promotion drift by reconciling branch history",
+    )
+    routing_update_reconcile.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    routing_update_reconcile.add_argument("--report-root", default="")
+    routing_update_reconcile.add_argument("--json", action="store_true", help="Emit structured JSON")
     routing_parser.set_defaults(func=cmd_routing)
 
     # =========================================================================

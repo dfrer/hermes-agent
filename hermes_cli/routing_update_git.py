@@ -122,6 +122,8 @@ def _probe_backend(
     push_remote: str,
     live_branch: str,
     promotion_branch: str,
+    live_source_refs: Sequence[str] | None = None,
+    promotion_source_refs: Sequence[str] | None = None,
 ) -> tuple[bool, bool, dict[str, bool], dict[str, str]]:
     errors: dict[str, str] = {}
     fetch_ready = True
@@ -136,12 +138,24 @@ def _probe_backend(
         promotion_branch: False,
     }
 
-    def _local_push_source(branch_name: str) -> str:
-        local_ref = f"refs/heads/{branch_name}"
-        result = backend.run(["show-ref", "--verify", "--quiet", local_ref], check=False)
-        return local_ref if result.returncode == 0 else "HEAD"
+    def _resolve_push_source(refs: Sequence[str] | None, branch_name: str) -> str:
+        candidates = tuple(
+            ref
+            for ref in (
+                *(refs or ()),
+                "HEAD",
+                f"refs/remotes/{push_remote}/{branch_name}",
+                f"refs/heads/{branch_name}",
+            )
+            if ref
+        )
+        for ref in candidates:
+            result = backend.run(["rev-parse", "--verify", f"{ref}^{{commit}}"], check=False)
+            if result.returncode == 0:
+                return (result.stdout or "").strip() or ref
+        return "HEAD"
 
-    live_source = _local_push_source(live_branch)
+    live_source = _resolve_push_source(live_source_refs, live_branch)
     live_result = backend.run(
         ["push", "--porcelain", "--dry-run", push_remote, f"{live_source}:refs/heads/{live_branch}"],
         check=False,
@@ -151,7 +165,7 @@ def _probe_backend(
     else:
         errors[f"push:{live_branch}"] = (live_result.stderr or live_result.stdout or "").strip() or "unknown error"
 
-    main_source = _local_push_source(promotion_branch)
+    main_source = _resolve_push_source(promotion_source_refs, promotion_branch)
     main_result = backend.run(
         ["push", "--porcelain", "--dry-run", push_remote, f"{main_source}:refs/heads/{promotion_branch}"],
         check=False,
@@ -179,6 +193,8 @@ def probe_git_backend(
     push_remote: str,
     live_branch: str,
     promotion_branch: str = "main",
+    live_source_refs: Sequence[str] | None = None,
+    promotion_source_refs: Sequence[str] | None = None,
 ) -> GitBackendProbe:
     repo_root = Path(repo_root).expanduser().resolve()
     details: dict[str, dict[str, str | bool]] = {}
@@ -190,6 +206,8 @@ def probe_git_backend(
         push_remote=push_remote,
         live_branch=live_branch,
         promotion_branch=promotion_branch,
+        live_source_refs=live_source_refs,
+        promotion_source_refs=promotion_source_refs,
     )
     details["native"] = {
         "available": True,
@@ -210,6 +228,8 @@ def probe_git_backend(
             push_remote=push_remote,
             live_branch=live_branch,
             promotion_branch=promotion_branch,
+            live_source_refs=live_source_refs,
+            promotion_source_refs=promotion_source_refs,
         )
         details["windows-bridge"] = {
             "available": True,
@@ -250,6 +270,8 @@ def select_git_backend(
     push_remote: str,
     live_branch: str,
     promotion_branch: str = "main",
+    live_source_refs: Sequence[str] | None = None,
+    promotion_source_refs: Sequence[str] | None = None,
 ) -> tuple[GitBackend | None, GitBackendProbe]:
     repo_root = Path(repo_root).expanduser().resolve()
     probe = probe_git_backend(
@@ -258,6 +280,8 @@ def select_git_backend(
         push_remote=push_remote,
         live_branch=live_branch,
         promotion_branch=promotion_branch,
+        live_source_refs=live_source_refs,
+        promotion_source_refs=promotion_source_refs,
     )
     if probe.backend == "native":
         return GitBackend(kind="native", executable="git", repo_root=repo_root), probe

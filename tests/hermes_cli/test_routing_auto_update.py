@@ -100,52 +100,6 @@ def test_repair_eligibility_accepts_narrow_source_and_test_changes():
     assert blockers == []
 
 
-def test_probe_backend_uses_local_branch_refs_for_push_checks():
-    calls = []
-
-    class FakeBackend:
-        def run(self, args, check=False):
-            calls.append(list(args))
-            if args[:2] == ["ls-remote", "--heads"]:
-                return _ok_completed(args)
-            if args[:3] == ["show-ref", "--verify", "--quiet"]:
-                return _ok_completed(args)
-            if args[:3] == ["push", "--porcelain", "--dry-run"]:
-                return _ok_completed(args)
-            raise AssertionError(f"Unexpected git args: {args}")
-
-    fetch_ready, push_ready, push_targets, errors = rug._probe_backend(
-        FakeBackend(),
-        upstream_remote=rau.UPSTREAM_REMOTE,
-        push_remote=rau.PUSH_REMOTE,
-        live_branch=rau.LIVE_BRANCH,
-        promotion_branch=rau.PROMOTION_BRANCH,
-    )
-
-    push_calls = [args for args in calls if args[:3] == ["push", "--porcelain", "--dry-run"]]
-
-    assert fetch_ready is True
-    assert push_ready is True
-    assert push_targets == {rau.LIVE_BRANCH: True, rau.PROMOTION_BRANCH: True}
-    assert errors == {}
-    assert push_calls == [
-        [
-            "push",
-            "--porcelain",
-            "--dry-run",
-            rau.PUSH_REMOTE,
-            f"refs/heads/{rau.LIVE_BRANCH}:refs/heads/{rau.LIVE_BRANCH}",
-        ],
-        [
-            "push",
-            "--porcelain",
-            "--dry-run",
-            rau.PUSH_REMOTE,
-            f"refs/heads/{rau.PROMOTION_BRANCH}:refs/heads/{rau.PROMOTION_BRANCH}",
-        ],
-    ]
-
-
 def test_install_routing_auto_update_sets_timezone_and_job(tmp_path, tmp_hermes_home, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -375,6 +329,69 @@ def test_run_state_machine_reports_main_promotion_failure(tmp_path, monkeypatch)
     assert result.main_promotion_status == "failed"
 
 
+def test_run_state_machine_uses_reconcile_when_promotion_is_diverged(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "detect_routing_update_topology", lambda repo_root=None: {"matches": True, "current_branch": rau.LIVE_BRANCH})
+    monkeypatch.setattr(rau, "_ensure_fork_remote", lambda repo_root: rau.EXPECTED_FORK_URL)
+    monkeypatch.setattr(rau, "_git_output", lambda repo, *args, cwd=None: {("branch", "--show-current"): rau.LIVE_BRANCH, ("status", "--porcelain"): ""}[tuple(args)])
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rau, "_current_ref", lambda repo_root, ref: {
+        "HEAD": "abc123",
+        rau.UPSTREAM_REF: "abc123",
+        rau.PUSH_REF: "old-integration",
+        rau.MAIN_REF: "old-main",
+    }.get(ref, ""))
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "abc123",
+            "upstream_head": "abc123",
+            "integration_head": "old-integration",
+            "main_head": "old-main",
+            "upstream": {"behind": 0, "ahead": 0},
+            "integration": {"behind": 0, "ahead": 1},
+            "main": {"behind": 0, "ahead": 1},
+        },
+    )
+    monkeypatch.setattr(
+        rau,
+        "_git_is_ancestor",
+        lambda repo_root, ancestor, descendant: True if (ancestor, descendant) == (rau.UPSTREAM_REF, "HEAD") else False,
+    )
+    monkeypatch.setattr(rau, "_requires_reconcile", lambda *args, **kwargs: True)
+    monkeypatch.setattr(rau, "_push_targets", lambda *args, **kwargs: pytest.fail("reconcile path should bypass direct push"))
+
+    called = {}
+
+    def fake_reconcile(repo_root_arg, report_root_arg, hermes_home_arg, backend_arg, report_arg, *, target_head, topology=None):
+        called["target_head"] = target_head
+        report_arg.status = "reconciled"
+        report_arg.reconciled_head = "reconciled-head"
+        report_arg.promoted_head = "reconciled-head"
+        report_arg.promotion_mode = "reconcile"
+        report_arg.promotion_graph_state = "reconciled"
+        report_arg.promotion_tree_match = True
+        report_arg.message = "reconciled pending promotion"
+        return True
+
+    monkeypatch.setattr(rau, "_reconcile_promoted_branches", fake_reconcile)
+    monkeypatch.setattr(rau, "_sync_live_checkout_to_promoted_main", lambda *args, **kwargs: False)
+
+    result = rau._run_state_machine(repo_root, report_root, report)
+
+    assert result.status == "reconciled"
+    assert result.promotion_mode == "reconcile"
+    assert called["target_head"] == "abc123"
+
+
 def test_push_targets_creates_backup_refs_before_promoting(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -508,6 +525,8 @@ def test_run_state_machine_realigns_to_promoted_main_and_repairs_integration_bra
         return False
 
     monkeypatch.setattr(rau, "_git_is_ancestor", fake_is_ancestor)
+    monkeypatch.setattr(rau, "_tracked_dirty_paths", lambda repo_root_arg: [])
+    monkeypatch.setattr(rau, "_untracked_paths", lambda repo_root_arg: [])
 
     def fake_git(repo_root_arg, *args, cwd=None, check=True):
         if args == ("merge", "--ff-only", rau.MAIN_REF):
@@ -608,6 +627,8 @@ def test_run_state_machine_noop_fast_forwards_sibling_live_checkout(tmp_path, mo
         return False
 
     monkeypatch.setattr(rau, "_git_is_ancestor", fake_is_ancestor)
+    monkeypatch.setattr(rau, "_tracked_dirty_paths", lambda repo_root_arg: [])
+    monkeypatch.setattr(rau, "_untracked_paths", lambda repo_root_arg: [])
 
     def fake_git(repo_root_arg, *args, cwd=None, check=True):
         if repo_root_arg == live_repo_root and args == ("merge", "--ff-only", rau.MAIN_REF):
@@ -621,6 +642,92 @@ def test_run_state_machine_noop_fast_forwards_sibling_live_checkout(tmp_path, mo
     assert result.status == "noop"
     assert refresh_calls == [repo_root, live_repo_root]
     assert merge_calls == [(live_repo_root, ("merge", "--ff-only", rau.MAIN_REF))]
+
+
+def test_sync_live_checkout_preserves_allowlisted_dirty_paths(tmp_path, monkeypatch):
+    repo_root = tmp_path / "hermes-agent-dev"
+    live_repo_root = tmp_path / "hermes-agent"
+    (repo_root / ".git").mkdir(parents=True)
+    (live_repo_root / ".git").mkdir(parents=True)
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+    calls = []
+
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {"live_repo_root": str(live_repo_root)},
+    )
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "_git_output", lambda repo_root_arg, *args, cwd=None: rau.LIVE_PROTECTED_BRANCH if tuple(args) == ("branch", "--show-current") else "")
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rau,
+        "_current_ref",
+        lambda repo_root_arg, ref: {
+            "HEAD": "live-old",
+            rau.MAIN_REF: "live-new",
+        }.get(ref, ""),
+    )
+    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root_arg, ancestor, descendant: True)
+    monkeypatch.setattr(rau, "_tracked_dirty_paths", lambda repo_root_arg: ["gateway/status.py"])
+    monkeypatch.setattr(rau, "_untracked_paths", lambda repo_root_arg: [])
+    monkeypatch.setattr(rau, "_configured_live_preserve_paths", lambda: ("gateway/status.py", "plugins/memory/honcho/client.py"))
+
+    def fake_git(repo_root_arg, *args, cwd=None, check=True):
+        calls.append((repo_root_arg, args))
+        return _ok_completed(args)
+
+    monkeypatch.setattr(rau, "_git", fake_git)
+
+    synced = rau._sync_live_checkout_to_promoted_main(repo_root, None, report=report)
+
+    assert synced is True
+    assert report.live_sync_state == "preserved_local_changes"
+    assert report.preserved_local_paths == ["gateway/status.py"]
+    assert any(args[:2] == ("stash", "push") for _, args in calls)
+    assert any(args == ("merge", "--ff-only", rau.MAIN_REF) for _, args in calls)
+
+
+def test_sync_live_checkout_blocks_non_allowlisted_dirty_paths(tmp_path, monkeypatch):
+    repo_root = tmp_path / "hermes-agent-dev"
+    live_repo_root = tmp_path / "hermes-agent"
+    (repo_root / ".git").mkdir(parents=True)
+    (live_repo_root / ".git").mkdir(parents=True)
+    report = rau.UpdateReport(status="setup_error", started_at=rau._iso(rau._utc_now()), finished_at="")
+    calls = []
+
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {"live_repo_root": str(live_repo_root)},
+    )
+    monkeypatch.setattr(rau, "_ensure_safe_directory", lambda path: None)
+    monkeypatch.setattr(rau, "_git_output", lambda repo_root_arg, *args, cwd=None: rau.LIVE_PROTECTED_BRANCH if tuple(args) == ("branch", "--show-current") else "")
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rau,
+        "_current_ref",
+        lambda repo_root_arg, ref: {
+            "HEAD": "live-old",
+            rau.MAIN_REF: "live-new",
+        }.get(ref, ""),
+    )
+    monkeypatch.setattr(rau, "_git_is_ancestor", lambda repo_root_arg, ancestor, descendant: True)
+    monkeypatch.setattr(rau, "_tracked_dirty_paths", lambda repo_root_arg: ["README.md"])
+    monkeypatch.setattr(rau, "_untracked_paths", lambda repo_root_arg: [])
+    monkeypatch.setattr(rau, "_configured_live_preserve_paths", lambda: ("gateway/status.py", "plugins/memory/honcho/client.py"))
+    monkeypatch.setattr(
+        rau,
+        "_git",
+        lambda repo_root_arg, *args, cwd=None, check=True: calls.append((repo_root_arg, args)) or _ok_completed(args),
+    )
+
+    synced = rau._sync_live_checkout_to_promoted_main(repo_root, None, report=report)
+
+    assert synced is False
+    assert report.live_sync_state == "blocked_dirty"
+    assert report.preserved_local_paths == ["README.md"]
+    assert calls == []
 
 
 def test_run_state_machine_merge_conflict_writes_repair_manifest(tmp_path, monkeypatch):
@@ -915,6 +1022,31 @@ def test_finalize_routing_auto_update_refreshes_retained_worktree_when_upstream_
     assert any(repo == retained and args == ("merge", "--no-ff", rau.UPSTREAM_REF) for repo, args, _ in recorded)
 
 
+def test_reconcile_routing_auto_update_forces_reconcile_mode(tmp_path, tmp_hermes_home, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report_root = tmp_path / "reports"
+    captured = {}
+
+    def fake_run_state_machine(repo_root_arg, report_root_arg, report, finalize_from_retained=False, force_reconcile=False):
+        captured["force_reconcile"] = force_reconcile
+        report.status = "reconciled"
+        report.message = "reconciled"
+        report.pre_update_head = "abc123"
+        report.post_update_head = "reconciled-head"
+        report.reconciled_head = "reconciled-head"
+        return report
+
+    monkeypatch.setattr(rau, "_run_state_machine", fake_run_state_machine)
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, True, True))
+    monkeypatch.setattr(rau, "_prune_retention", lambda *args, **kwargs: None)
+
+    report = rau.reconcile_routing_auto_update(repo_root, report_root)
+
+    assert report.status == "reconciled"
+    assert captured["force_reconcile"] is True
+
+
 def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True)
@@ -960,6 +1092,58 @@ def test_routing_update_status_recomputes_live_drift(tmp_path, monkeypatch):
     assert summary["auth"]["backend"] == "unavailable"
     assert summary["promotion_pending"] is True
     assert summary["promotion_pending_count"] == 1
+
+
+def test_routing_update_status_marks_reconciled_graph_as_not_pending(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    (report_root / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "reconciled",
+                "message": "reconciled",
+                "repo_root": str(repo_root),
+                "promotion_mode": "reconcile",
+                "promotion_tree_match": True,
+                "reconciled_head": "reconciled-head",
+                "finished_at": "2026-04-10T10:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rau, "_current_gateway_health", lambda: (True, True, True))
+    monkeypatch.setattr(
+        rau,
+        "detect_routing_update_topology",
+        lambda repo_root=None: {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH, "origin_remote": "origin", "fork_remote": "fork"},
+    )
+    monkeypatch.setattr(rau, "select_git_backend", lambda *args, **kwargs: (GitBackend("native", "git", repo_root), _probe()))
+    monkeypatch.setattr(rau, "_refresh_remote_refs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rau,
+        "_compute_live_drift",
+        lambda repo_root: {
+            "current_head": "local-head",
+            "upstream_head": "upstream-head",
+            "integration_head": "reconciled-head",
+            "main_head": "reconciled-head",
+            "upstream": {"behind": 0, "ahead": 0},
+            "integration": {"behind": 1, "ahead": 0},
+            "main": {"behind": 1, "ahead": 0},
+        },
+    )
+    monkeypatch.setattr(rau, "_tree_oid", lambda repo_root, ref: "tree-1")
+    monkeypatch.setattr(rau, "_cherry_pending_count", lambda *args, **kwargs: 5)
+
+    summary = rau.routing_update_status(report_root, repo_root)
+
+    assert summary["promotion_graph_state"] == "reconciled"
+    assert summary["promotion_tree_match"] is True
+    assert summary["promotion_pending"] is False
+    assert summary["promotion_pending_count"] == 0
 
 
 def test_routing_update_status_only_refreshes_when_requested(tmp_path, monkeypatch):
@@ -1072,6 +1256,39 @@ def test_routing_update_doctor_reports_degraded_when_auth_missing(tmp_path, monk
     assert doctor["status"] == "degraded"
     assert any("push:main" in item for item in doctor["issues"])
     assert doctor["checks"]["expected_branch"] is True
+
+
+def test_routing_update_doctor_reports_reconcile_and_live_sync_issues(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        rau,
+        "routing_update_status",
+        lambda report_root=None, repo_root=None: {
+            "repo_root": str(repo_root),
+            "status": "reconcile_required",
+            "promotion_graph_state": "diverged",
+            "promotion_pending": True,
+            "promotion_tree_match": False,
+            "live_sync_state": "blocked_dirty",
+            "preserved_local_paths": ["README.md"],
+            "topology": {"matches": True, "repo_role": "dev", "current_branch": rau.LIVE_BRANCH, "expected_branch": rau.DEV_UPDATER_BRANCH, "live_branch": rau.LIVE_PROTECTED_BRANCH, "dev_branch": rau.DEV_UPDATER_BRANCH},
+            "auth": {"fetch_ready": True, "push_ready": True, "errors": {}},
+            "job": {"installed": True},
+            "gateway_running": True,
+            "telegram_connected": True,
+            "retained_worktree": "",
+        },
+    )
+    monkeypatch.setattr(rau, "_merge_readiness_issues", lambda repo_root: [])
+    monkeypatch.setattr(rau, "_is_safe_directory_configured", lambda path: True)
+
+    doctor = rau.routing_update_doctor(repo_root=repo_root)
+
+    assert doctor["status"] == "degraded"
+    assert any("reconcile repair" in item for item in doctor["issues"])
+    assert any("live checkout sync is blocked" in item for item in doctor["issues"])
 
 
 # =============================================================================
@@ -1313,4 +1530,4 @@ def test_status_shows_repo_role(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Repo role: dev" in out
     assert "Dev/updater branch: codex/routing-integration" in out
-    assert "Promotion candidates (cherry-pick): 3" in out
+    assert "Promotion candidates (cherry-pick advisory): 3" in out

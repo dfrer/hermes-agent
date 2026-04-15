@@ -67,7 +67,12 @@ ROUTING_WORKTREE_ACTIVE_DIRNAME = "active"
 ROUTING_WORKTREE_QUARANTINE_DIRNAME = "quarantine"
 DEFAULT_RETENTION_DAYS = 30
 UPDATE_BRANCH_PREFIX = "codex/upstream-sync"
+RECONCILE_BRANCH_PREFIX = "codex/reconcile-main"
 REMOTE_BACKUP_REF_PREFIX = "archive/routing-auto-update"
+DEFAULT_LIVE_PRESERVE_PATHS: tuple[str, ...] = (
+    "gateway/status.py",
+    "plugins/memory/honcho/client.py",
+)
 LEGACY_UPDATE_DIR_PATTERNS: tuple[str, ...] = (
     f"{LIVE_REPO_BASENAME}-update-*",
     f"{DEV_REPO_BASENAME}-update-*",
@@ -187,8 +192,8 @@ Do not implement merge, test, or push logic yourself. The deterministic updater 
 1. Call `hermes-dev routing update run --json --repo-root {repo_root}`.
 2. Read `{latest_json}` and `{latest_md}`.
 3. If `latest.json` reports `status == "noop"`, return exactly `[SILENT]`.
-4. If `status == "updated"`, send a concise summary based on `latest.md` and stop.
-5. If `status in {{"repair_required", "verification_failed"}}` and `repair_eligible == true`:
+4. If `status in {{"updated", "reconciled"}}`, send a concise summary based on `latest.md` and stop.
+5. If `status in {{"repair_required", "verification_failed", "reconcile_required"}}` and `repair_eligible == true`:
    - emit a `TIER: 3A | PATH: high-risk | ...` routing decision for guarded maintenance repair
    - submit a `routed_plan` over the retained worktree from `latest.json`
    - node 1: inspect `repair_manifest_path` and latest report
@@ -196,7 +201,7 @@ Do not implement merge, test, or push logic yourself. The deterministic updater 
    - node 3: rerun the targeted failing validation command from the manifest
    - node 4: call `hermes-dev routing update finalize --json --repo-root {repo_root}`
    - node 5: summarize the finalized outcome
-6. If repair is ineligible or finalize fails, stop and report the exact retained worktree and manifest paths.
+6. If repair is ineligible, reconcile failed, or finalize fails, stop and report the exact retained worktree and manifest paths.
 """
 
 
@@ -236,6 +241,14 @@ class UpdateReport:
     push_status: str = "not_attempted"
     integration_push_status: str = "not_attempted"
     main_promotion_status: str = "not_attempted"
+    promotion_mode: str = "none"
+    promotion_graph_state: str = "diverged"
+    promotion_tree_match: bool = False
+    reconciled_head: str = ""
+    reconciled_from_main_head: str = ""
+    reconciled_from_integration_head: str = ""
+    live_sync_state: str = "not_attempted"
+    preserved_local_paths: list[str] = field(default_factory=list)
     auth_backend: str = "unavailable"
     fetch_auth_ready: bool = False
     push_auth_ready: bool = False
@@ -342,6 +355,10 @@ def _render_markdown_report(report: UpdateReport) -> str:
         f"- Push remote: `{report.push_remote}` ({report.push_status})",
         f"- Integration push: `{report.integration_push_status}`",
         f"- Main promotion: `{report.main_promotion_status}`",
+        f"- Promotion mode: `{report.promotion_mode}`",
+        f"- Promotion graph: `{report.promotion_graph_state}`",
+        f"- Promotion tree match: `{report.promotion_tree_match}`",
+        f"- Live sync state: `{report.live_sync_state}`",
         f"- Auth backend: `{report.auth_backend}`",
         f"- Fetch auth ready: `{report.fetch_auth_ready}`",
         f"- Push auth ready: `{report.push_auth_ready}`",
@@ -370,6 +387,15 @@ def _render_markdown_report(report: UpdateReport) -> str:
     if report.backup_refs:
         lines.append("- Backup refs:")
         lines.extend([f"  - `{item}`" for item in report.backup_refs])
+    if report.reconciled_head:
+        lines.append(f"- Reconciled HEAD: `{report.reconciled_head}`")
+    if report.reconciled_from_main_head:
+        lines.append(f"- Reconciled from fork/main: `{report.reconciled_from_main_head}`")
+    if report.reconciled_from_integration_head:
+        lines.append(f"- Reconciled from integration: `{report.reconciled_from_integration_head}`")
+    if report.preserved_local_paths:
+        lines.append("- Preserved local paths:")
+        lines.extend([f"  - `{item}`" for item in report.preserved_local_paths])
     if report.last_successful_sync_at:
         lines.append(f"- Last successful sync: `{report.last_successful_sync_at}`")
     if report.last_validation_command:
@@ -699,6 +725,88 @@ def _current_ref(repo_root: Path, ref: str) -> str:
         return _git_output(repo_root, "rev-parse", ref)
     except UpdateError:
         return ""
+
+
+def _tree_oid(repo_root: Path, ref: str) -> str:
+    try:
+        return _git_output(repo_root, "rev-parse", f"{ref}^{{tree}}")
+    except UpdateError:
+        return ""
+
+
+def _configured_live_preserve_paths() -> tuple[str, ...]:
+    try:
+        config = load_config()
+    except Exception:
+        return DEFAULT_LIVE_PRESERVE_PATHS
+    routing_cfg = config.get("routing_update") if isinstance(config, dict) else None
+    raw_paths = routing_cfg.get("live_preserve_paths") if isinstance(routing_cfg, dict) else None
+    if not raw_paths:
+        return DEFAULT_LIVE_PRESERVE_PATHS
+    normalized: list[str] = []
+    for item in raw_paths:
+        if not item:
+            continue
+        normalized_path = str(item).replace("\\", "/").strip().lstrip("./")
+        if normalized_path:
+            normalized.append(normalized_path)
+    return tuple(normalized) or DEFAULT_LIVE_PRESERVE_PATHS
+
+
+def _tracked_dirty_paths(repo_root: Path) -> list[str]:
+    dirty: set[str] = set()
+    for args in (
+        ("diff", "--name-only"),
+        ("diff", "--name-only", "--cached"),
+    ):
+        output = _git_output(repo_root, *args)
+        dirty.update(path.strip() for path in output.splitlines() if path.strip())
+    return sorted(dirty)
+
+
+def _untracked_paths(repo_root: Path) -> list[str]:
+    output = _git_output(repo_root, "ls-files", "--others", "--exclude-standard")
+    return sorted(path.strip() for path in output.splitlines() if path.strip())
+
+
+def _promotion_graph_state(
+    repo_root: Path,
+    *,
+    current_head: str,
+    integration_head: str,
+    main_head: str,
+    latest_report: dict[str, Any] | None = None,
+) -> str:
+    latest_report = latest_report or {}
+    reconciled_head = str(latest_report.get("reconciled_head") or "")
+    promotion_mode = str(latest_report.get("promotion_mode") or "")
+    if reconciled_head and promotion_mode == "reconcile" and main_head == integration_head == reconciled_head:
+        return "reconciled"
+    if current_head and main_head == integration_head == current_head:
+        return "in_sync"
+    if (
+        current_head
+        and main_head
+        and integration_head
+        and _git_is_ancestor(repo_root, main_head, "HEAD")
+        and _git_is_ancestor(repo_root, integration_head, "HEAD")
+    ):
+        return "ancestor_fast_forward"
+    return "diverged"
+
+
+def _requires_reconcile(
+    *,
+    integration_behind: int,
+    integration_ahead: int,
+    main_behind: int,
+    main_ahead: int,
+    push_integration: bool,
+    push_main: bool,
+) -> bool:
+    return (push_main and main_behind > 0 and main_ahead > 0) or (
+        push_integration and integration_behind > 0 and integration_ahead > 0
+    )
 
 
 def _load_update_cache_state(hermes_home: Path) -> dict[str, Any]:
@@ -1272,6 +1380,175 @@ def _promotion_plan(repo_root: Path, current_head: str, integration_head: str, m
     }
 
 
+def _align_worktree_to_target_tree(worktree: Path, base_ref: str, target_ref: str) -> list[str]:
+    changed_paths = [path.strip() for path in _git_output(worktree, "diff", "--name-only", base_ref, target_ref).splitlines() if path.strip()]
+    for path in changed_paths:
+        exists_in_target = _git(worktree, "cat-file", "-e", f"{target_ref}:{path}", cwd=worktree, check=False).returncode == 0
+        if exists_in_target:
+            _git(worktree, "restore", "--source", target_ref, "--staged", "--worktree", "--", path, cwd=worktree)
+        else:
+            _git(worktree, "rm", "--quiet", "--ignore-unmatch", "--", path, cwd=worktree, check=False)
+    return changed_paths
+
+
+def _reconcile_promoted_branches(
+    repo_root: Path,
+    report_root: Path,
+    hermes_home: Path,
+    backend: GitBackend,
+    report: UpdateReport,
+    *,
+    target_head: str,
+    topology: dict[str, Any] | None = None,
+) -> bool:
+    topology = topology or detect_routing_update_topology(repo_root)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    reconcile_branch = f"{RECONCILE_BRANCH_PREFIX}-{stamp}"
+    reconcile_worktree = _unique_worktree_path(
+        hermes_home,
+        repo_root,
+        stamp,
+        bucket=ROUTING_WORKTREE_ACTIVE_DIRNAME,
+    )
+    report.promotion_mode = "reconcile"
+    report.reconciled_from_main_head = _current_ref(repo_root, MAIN_REF)
+    report.reconciled_from_integration_head = _current_ref(repo_root, PUSH_REF)
+    report.promotion_graph_state = "diverged"
+
+    host_cwd = _nearest_existing_parent(reconcile_worktree)
+    _ensure_safe_directory(host_cwd)
+    _git(repo_root, "worktree", "add", "-b", reconcile_branch, str(reconcile_worktree), MAIN_REF)
+    _ensure_safe_directory(reconcile_worktree)
+
+    try:
+        merge_result = _git(
+            reconcile_worktree,
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            target_head,
+            cwd=reconcile_worktree,
+            check=False,
+        )
+        conflicted = [
+            path.strip()
+            for path in _git_output(
+                reconcile_worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+                cwd=reconcile_worktree,
+            ).splitlines()
+            if path.strip()
+        ]
+        if merge_result.returncode != 0 and conflicted:
+            eligible, blockers = _repair_eligibility(conflicted)
+            if not eligible:
+                retained_worktree = _quarantine_worktree(repo_root, hermes_home, reconcile_worktree)
+                report.status = "reconcile_required"
+                report.message = "Promotion reconcile encountered conflicts outside the narrow repair allowlist."
+                report.retained_failed_worktree = str(retained_worktree)
+                report.retained_failed_worktree_valid = True
+                report.retained_failed_worktree_reason = ""
+                report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+                    report_root,
+                    report,
+                    failure_kind="reconcile_conflict",
+                    changed_paths=conflicted,
+                )
+                return False
+
+        _align_worktree_to_target_tree(reconcile_worktree, "HEAD", target_head)
+        unresolved = [
+            path.strip()
+            for path in _git_output(
+                reconcile_worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+                cwd=reconcile_worktree,
+            ).splitlines()
+            if path.strip()
+        ]
+        if unresolved:
+            retained_worktree = _quarantine_worktree(repo_root, hermes_home, reconcile_worktree)
+            report.status = "reconcile_required"
+            report.message = "Promotion reconcile left unresolved paths after attempting to align the tree."
+            report.retained_failed_worktree = str(retained_worktree)
+            report.retained_failed_worktree_valid = True
+            report.retained_failed_worktree_reason = ""
+            report.repair_manifest_path, report.repair_eligible, report.repair_blockers = _write_repair_manifest(
+                report_root,
+                report,
+                failure_kind="reconcile_conflict",
+                changed_paths=unresolved,
+            )
+            return False
+
+        commit_result = _git(
+            reconcile_worktree,
+            "commit",
+            "-m",
+            f"reconcile: promote {LIVE_BRANCH} into {PROMOTION_BRANCH}",
+            cwd=reconcile_worktree,
+            check=False,
+        )
+        if commit_result.returncode != 0:
+            stderr = (commit_result.stderr or commit_result.stdout or "").strip() or "unknown error"
+            report.status = "reconcile_failed"
+            report.message = f"Could not create reconcile promotion commit: {stderr}"
+            return False
+
+        reconciled_head = _current_ref(reconcile_worktree, "HEAD")
+        report.reconciled_head = reconciled_head
+        report.promotion_tree_match = _tree_oid(reconcile_worktree, "HEAD") == _tree_oid(reconcile_worktree, target_head)
+        if not report.promotion_tree_match:
+            report.status = "reconcile_failed"
+            report.message = "Reconcile promotion did not produce a tree identical to the validated dev head."
+            return False
+
+        reconcile_backend = GitBackend(kind=backend.kind, executable=backend.executable, repo_root=reconcile_worktree)
+        _push_targets(
+            reconcile_worktree,
+            reconcile_backend,
+            report,
+            reconciled_head,
+            push_integration=True,
+            push_main=True,
+        )
+        if report.integration_push_status not in {"ok", "not_needed"} or report.main_promotion_status not in {"ok", "not_needed"}:
+            report.status = "reconcile_failed"
+            if not report.message:
+                report.message = "Reconcile promotion could not update the fork branches."
+            return False
+
+        _refresh_remote_refs(repo_root, backend)
+        current_head = _current_ref(repo_root, "HEAD")
+        realigned_to = _realign_live_branch_to_promoted_head(
+            repo_root,
+            current_head,
+            _current_ref(repo_root, PUSH_REF),
+            _current_ref(repo_root, MAIN_REF),
+        )
+        report.post_update_head = _current_ref(repo_root, "HEAD")
+        report.promotion_graph_state = "reconciled"
+        report.status = "reconciled"
+        if realigned_to:
+            report.message = f"Reconciled fork promotion and fast-forwarded {LIVE_BRANCH} to {realigned_to}."
+        else:
+            report.message = "Reconciled fork/main and integration onto a single promoted head."
+        report.retained_failed_worktree = ""
+        report.retained_failed_worktree_valid = None
+        report.retained_failed_worktree_reason = ""
+        report.repair_manifest_path = ""
+        report.repair_eligible = None
+        report.repair_blockers = []
+        return True
+    finally:
+        if reconcile_worktree.exists():
+            _remove_worktree_and_branch(repo_root, reconcile_worktree, reconcile_branch)
+
+
 def _realign_live_branch_to_promoted_head(repo_root: Path, current_head: str, integration_head: str, main_head: str) -> str:
     for target_ref, target_head in ((MAIN_REF, main_head), (PUSH_REF, integration_head)):
         if not target_head or target_head == current_head:
@@ -1291,6 +1568,7 @@ def _sync_live_checkout_to_promoted_main(
     backend: GitBackend | None,
     *,
     topology: dict[str, Any] | None = None,
+    report: UpdateReport | None = None,
 ) -> bool:
     topology = topology or detect_routing_update_topology(repo_root)
     live_repo_root_raw = str(topology.get("live_repo_root") or "")
@@ -1307,10 +1585,6 @@ def _sync_live_checkout_to_promoted_main(
     if current_branch != LIVE_PROTECTED_BRANCH:
         return False
 
-    dirty = _git_output(live_repo_root, "status", "--porcelain")
-    if dirty:
-        return False
-
     live_backend = None
     if backend is not None:
         live_backend = GitBackend(kind=backend.kind, executable=backend.executable, repo_root=live_repo_root)
@@ -1323,12 +1597,42 @@ def _sync_live_checkout_to_promoted_main(
     if not _git_is_ancestor(live_repo_root, current_head, MAIN_REF):
         return False
 
+    tracked_dirty = _tracked_dirty_paths(live_repo_root)
+    untracked = _untracked_paths(live_repo_root)
+    allowlist = set(_configured_live_preserve_paths())
+    if tracked_dirty or untracked:
+        blocked_paths = [path for path in tracked_dirty if path not in allowlist]
+        blocked_paths.extend(untracked)
+        if blocked_paths:
+            if report is not None:
+                report.live_sync_state = "blocked_dirty"
+                report.preserved_local_paths = sorted(tracked_dirty)
+            return False
+        stash_result = _git(
+            live_repo_root,
+            "stash",
+            "push",
+            "-m",
+            "routing-auto-update live preserve",
+            "--",
+            *tracked_dirty,
+            check=False,
+        )
+        if stash_result.returncode != 0:
+            stderr = (stash_result.stderr or stash_result.stdout or "").strip() or "unknown error"
+            raise UpdateError(f"Could not preserve live runtime changes before syncing {LIVE_PROTECTED_BRANCH}: {stderr}")
+        if report is not None:
+            report.live_sync_state = "preserved_local_changes"
+            report.preserved_local_paths = sorted(tracked_dirty)
+
     ff_result = _git(live_repo_root, "merge", "--ff-only", MAIN_REF, check=False)
     if ff_result.returncode != 0:
         stderr = (ff_result.stderr or ff_result.stdout or "").strip() or "unknown error"
         raise UpdateError(
             f"Could not fast-forward live checkout on {LIVE_PROTECTED_BRANCH} to {MAIN_REF}: {stderr}"
         )
+    if report is not None and report.live_sync_state == "not_attempted":
+        report.live_sync_state = "synced"
     return True
 
 
@@ -1507,13 +1811,21 @@ def _latest_retained_failure(repo_root: Path, latest: dict[str, Any], upstream_h
     return _discover_retained_failure_from_worktrees(repo_root, upstream_head)
 
 
-def _preflight_backend(repo_root: Path, report: UpdateReport) -> tuple[GitBackend | None, GitBackendProbe]:
+def _preflight_backend(
+    repo_root: Path,
+    report: UpdateReport,
+    *,
+    live_source_refs: Sequence[str] | None = None,
+    promotion_source_refs: Sequence[str] | None = None,
+) -> tuple[GitBackend | None, GitBackendProbe]:
     backend, probe = select_git_backend(
         repo_root,
         upstream_remote=UPSTREAM_REMOTE,
         push_remote=PUSH_REMOTE,
         live_branch=LIVE_BRANCH,
         promotion_branch=PROMOTION_BRANCH,
+        live_source_refs=live_source_refs,
+        promotion_source_refs=promotion_source_refs,
     )
     report.auth_backend = probe.backend
     report.fetch_auth_ready = probe.fetch_ready
@@ -1529,6 +1841,7 @@ def _run_state_machine(
     report: UpdateReport,
     *,
     finalize_from_retained: bool = False,
+    force_reconcile: bool = False,
 ) -> UpdateReport:
     hermes_home = _normalize_path(get_hermes_home())
     latest_report = read_latest_update_report(report_root)
@@ -1560,7 +1873,12 @@ def _run_state_machine(
     if merge_issues:
         raise UpdateError("Repo merge defaults are not ready: " + "; ".join(merge_issues))
 
-    backend, probe = _preflight_backend(repo_root, report)
+    backend, probe = _preflight_backend(
+        repo_root,
+        report,
+        live_source_refs=("HEAD",),
+        promotion_source_refs=("HEAD",),
+    )
     if backend is None or not probe.fetch_ready:
         report.status = "auth_failed"
         details = [f"{key}={value}" for key, value in sorted(probe.errors.items())]
@@ -1581,6 +1899,13 @@ def _run_state_machine(
     report.fork_ahead_count = int(drift["integration"]["ahead"])
     report.main_behind_count = int(drift["main"]["behind"])
     report.main_ahead_count = int(drift["main"]["ahead"])
+    report.promotion_graph_state = _promotion_graph_state(
+        repo_root,
+        current_head=report.pre_update_head,
+        integration_head=str(drift.get("integration_head") or ""),
+        main_head=str(drift.get("main_head") or ""),
+        latest_report=latest_report,
+    )
 
     retained = _latest_retained_failure(repo_root, latest_report, report.upstream_head)
     if retained and not finalize_from_retained:
@@ -1629,7 +1954,27 @@ def _run_state_machine(
 
     if not upstream_missing and not finalize_from_retained:
         report.post_update_head = report.pre_update_head
-        if pending_promotion:
+        if pending_promotion or force_reconcile:
+            if force_reconcile or _requires_reconcile(
+                integration_behind=int(drift["integration"]["behind"]),
+                integration_ahead=int(drift["integration"]["ahead"]),
+                main_behind=int(drift["main"]["behind"]),
+                main_ahead=int(drift["main"]["ahead"]),
+                push_integration=promotion_plan["integration"] or force_reconcile,
+                push_main=promotion_plan["main"] or force_reconcile,
+            ):
+                if _reconcile_promoted_branches(
+                    repo_root,
+                    report_root,
+                    hermes_home,
+                    backend,
+                    report,
+                    target_head=report.pre_update_head,
+                    topology=topology,
+                ):
+                    _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology, report=report)
+                return report
+
             _push_targets(
                 repo_root,
                 backend,
@@ -1644,7 +1989,10 @@ def _run_state_machine(
             )
             report.status = "updated" if promotion_ok else "push_failed"
             if report.status == "updated":
-                _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
+                report.promotion_mode = "cherry_pick"
+                report.promotion_graph_state = "in_sync"
+                report.promotion_tree_match = True
+                _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology, report=report)
                 if realigned_to:
                     if promotion_plan["integration"] and not promotion_plan["main"]:
                         report.message = (
@@ -1668,9 +2016,14 @@ def _run_state_machine(
         report.push_status = "not_needed"
         report.integration_push_status = "not_needed"
         report.main_promotion_status = "not_needed"
-        _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
+        report.promotion_mode = "none"
+        if report.promotion_graph_state == "diverged" and not pending_promotion:
+            report.promotion_graph_state = "in_sync"
+        _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology, report=report)
         if realigned_to:
             report.message = f"No upstream changes to apply; fast-forwarded {LIVE_BRANCH} to {realigned_to}."
+        elif force_reconcile:
+            report.message = "Fork promotion is already converged; no reconcile work was needed."
         else:
             report.message = "No upstream changes to apply and fork promotion is already in sync."
         return report
@@ -1802,20 +2155,45 @@ def _run_state_machine(
     post_sync["phase"] = "post-update"
     report.policy_history_sync.append(post_sync)
 
-    _push_targets(
-        repo_root,
-        backend,
-        report,
-        report.post_update_head,
+    current_integration_head = _current_ref(repo_root, PUSH_REF)
+    current_main_head = _current_ref(repo_root, MAIN_REF)
+    post_drift = _compute_live_drift(repo_root)
+    if force_reconcile or _requires_reconcile(
+        integration_behind=int(post_drift["integration"]["behind"]),
+        integration_ahead=int(post_drift["integration"]["ahead"]),
+        main_behind=int(post_drift["main"]["behind"]),
+        main_ahead=int(post_drift["main"]["ahead"]),
         push_integration=True,
         push_main=True,
-    )
-    if report.integration_push_status == "ok" and report.main_promotion_status == "ok":
-        _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology)
-        report.status = "updated"
-        report.message = "Applied upstream changes, passed the trust gate, and promoted fork integration + main."
+    ):
+        if _reconcile_promoted_branches(
+            repo_root,
+            report_root,
+            hermes_home,
+            backend,
+            report,
+            target_head=report.post_update_head,
+            topology=topology,
+        ):
+            _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology, report=report)
     else:
-        report.status = "push_failed"
+        _push_targets(
+            repo_root,
+            backend,
+            report,
+            report.post_update_head,
+            push_integration=True,
+            push_main=True,
+        )
+        if report.integration_push_status == "ok" and report.main_promotion_status == "ok":
+            report.promotion_mode = "cherry_pick"
+            report.promotion_graph_state = "in_sync"
+            report.promotion_tree_match = True
+            _sync_live_checkout_to_promoted_main(repo_root, backend, topology=topology, report=report)
+            report.status = "updated"
+            report.message = "Applied upstream changes, passed the trust gate, and promoted fork integration + main."
+        else:
+            report.status = "push_failed"
 
     _remove_worktree_and_branch(repo_root, update_worktree, update_branch)
     report.retained_failed_worktree = ""
@@ -1925,6 +2303,47 @@ def finalize_routing_auto_update(repo_root: Path | None = None, report_root: Pat
         )
 
 
+def reconcile_routing_auto_update(repo_root: Path | None = None, report_root: Path | None = None) -> UpdateReport:
+    started = _utc_now()
+    repo_root = _normalize_path(repo_root or PROJECT_ROOT)
+    _require_dev_repo(repo_root, "routing update reconcile")
+    hermes_home = _normalize_path(get_hermes_home())
+    report_root = _normalize_path(report_root or _default_report_root(hermes_home))
+
+    report = UpdateReport(
+        status="reconcile_failed",
+        started_at=_iso(started),
+        finished_at=_iso(started),
+        repo_root=str(repo_root),
+    )
+
+    gateway_running, service_installed, telegram_connected = _current_gateway_health()
+    report.gateway_running = gateway_running
+    report.gateway_service_installed = service_installed
+    report.telegram_connected = telegram_connected
+
+    try:
+        return _run_state_machine(repo_root, report_root, report, force_reconcile=True)
+    except UpdateError as exc:
+        report.status = "reconcile_failed"
+        report.message = str(exc)
+        return report
+    except Exception as exc:  # pragma: no cover
+        report.status = "reconcile_failed"
+        report.message = f"Unexpected error: {exc}"
+        return report
+    finally:
+        report.finished_at = _iso(_utc_now())
+        if not report.post_update_head:
+            report.post_update_head = report.pre_update_head
+        _write_report_files(report_root, report)
+        _prune_retention(
+            hermes_home,
+            repo_root,
+            keep_failed_worktree=_normalize_path(report.retained_failed_worktree) if report.retained_failed_worktree else None,
+        )
+
+
 def read_latest_update_report(report_root: Path | str | None = None) -> dict[str, Any]:
     hermes_home = _normalize_path(get_hermes_home())
     root = _normalize_path(report_root or _default_report_root(hermes_home))
@@ -1962,6 +2381,14 @@ def _status_missing_payload(repo_root: Path, gateway_running: bool, service_inst
         "push_status": "not_attempted",
         "integration_push_status": "not_attempted",
         "main_promotion_status": "not_attempted",
+        "promotion_mode": "none",
+        "promotion_graph_state": "diverged",
+        "promotion_tree_match": False,
+        "reconciled_head": "",
+        "reconciled_from_main_head": "",
+        "reconciled_from_integration_head": "",
+        "live_sync_state": "not_attempted",
+        "preserved_local_paths": [],
         "auth": {
             "backend": "unavailable",
             "fetch_ready": False,
@@ -1999,7 +2426,7 @@ def routing_update_status(
                 "repo_root": latest.get("repo_root") or str(effective_repo),
                 "live_branch": latest.get("live_branch") or LIVE_BRANCH,
                 "upstream_ref": latest.get("upstream_ref") or UPSTREAM_REF,
-                "last_error": "" if status in {"noop", "updated"} else message,
+                "last_error": "" if status in {"noop", "updated", "reconciled"} else message,
                 "retained_worktree": latest.get("retained_failed_worktree") or "",
                 "retained_worktree_valid": latest.get("retained_failed_worktree_valid"),
                 "retained_worktree_reason": latest.get("retained_failed_worktree_reason") or "",
@@ -2009,6 +2436,14 @@ def routing_update_status(
                 "push_status": latest.get("push_status") or "not_attempted",
                 "integration_push_status": latest.get("integration_push_status") or "not_attempted",
                 "main_promotion_status": latest.get("main_promotion_status") or "not_attempted",
+                "promotion_mode": latest.get("promotion_mode") or "none",
+                "promotion_graph_state": latest.get("promotion_graph_state") or "diverged",
+                "promotion_tree_match": bool(latest.get("promotion_tree_match")),
+                "reconciled_head": latest.get("reconciled_head") or "",
+                "reconciled_from_main_head": latest.get("reconciled_from_main_head") or "",
+                "reconciled_from_integration_head": latest.get("reconciled_from_integration_head") or "",
+                "live_sync_state": latest.get("live_sync_state") or "not_attempted",
+                "preserved_local_paths": list(latest.get("preserved_local_paths") or []),
             }
         )
 
@@ -2024,12 +2459,17 @@ def routing_update_status(
     auth_details: dict[str, dict[str, Any]] = {}
     if (effective_repo / ".git").exists():
         if probe_auth:
+            repo_role = str(topology.get("repo_role") or "")
+            live_source_refs = ("HEAD",) if repo_role == "dev" else (PUSH_REF,)
+            promotion_source_refs = ("HEAD",) if repo_role in {"dev", "live"} else (MAIN_REF,)
             backend, probe = select_git_backend(
                 effective_repo,
                 upstream_remote=UPSTREAM_REMOTE,
                 push_remote=PUSH_REMOTE,
                 live_branch=LIVE_BRANCH,
                 promotion_branch=PROMOTION_BRANCH,
+                live_source_refs=live_source_refs,
+                promotion_source_refs=promotion_source_refs,
             )
             auth_backend = probe.backend
             fetch_ready = probe.fetch_ready
@@ -2050,13 +2490,30 @@ def routing_update_status(
         }
         topology = detect_routing_update_topology(effective_repo)
         summary["repo_role"] = topology.get("repo_role", "unknown")
-        cherry_pending = _cherry_pending_count(
+        graph_state = _promotion_graph_state(
             effective_repo,
-            MAIN_REF,
-            PUSH_REF,
+            current_head=str(live_drift.get("current_head") or ""),
+            integration_head=str(live_drift.get("integration_head") or ""),
+            main_head=str(live_drift.get("main_head") or ""),
+            latest_report=latest,
         )
-        summary["promotion_pending"] = cherry_pending > 0
-        summary["promotion_pending_count"] = cherry_pending
+        summary["promotion_graph_state"] = graph_state
+        reconciled_head = str(summary.get("reconciled_head") or "")
+        tree_match = bool(summary.get("promotion_tree_match"))
+        if reconciled_head and str(live_drift.get("main_head") or "") == str(live_drift.get("integration_head") or "") == reconciled_head:
+            tree_match = (
+                _tree_oid(effective_repo, MAIN_REF)
+                == _tree_oid(effective_repo, PUSH_REF)
+                == _tree_oid(effective_repo, reconciled_head)
+            )
+        summary["promotion_tree_match"] = tree_match
+        cherry_pending = _cherry_pending_count(effective_repo, MAIN_REF, PUSH_REF)
+        if graph_state == "reconciled" and tree_match:
+            summary["promotion_pending"] = False
+            summary["promotion_pending_count"] = 0
+        else:
+            summary["promotion_pending"] = cherry_pending > 0
+            summary["promotion_pending_count"] = cherry_pending
         retained = _latest_retained_failure(
             effective_repo,
             latest,
@@ -2112,6 +2569,8 @@ def routing_update_doctor(
         "job_installed": bool(summary.get("job", {}).get("installed")),
         "gateway_running": bool(summary.get("gateway_running")),
         "telegram_connected": bool(summary.get("telegram_connected")),
+        "promotion_tree_match": bool(summary.get("promotion_tree_match")),
+        "live_sync_ready": summary.get("live_sync_state") != "blocked_dirty",
         "update_cache_hygiene": True,
         "retained_worktree_present": False,
         "retained_worktree_valid": summary.get("retained_worktree_valid"),
@@ -2144,6 +2603,18 @@ def routing_update_doctor(
         issues.append("gateway delivery path is not running")
     if not checks["telegram_connected"]:
         issues.append("telegram delivery path is not connected")
+    if summary.get("status") == "reconcile_required":
+        issues.append(
+            "fork/main promotion requires reconcile repair; inspect the retained worktree and repair manifest before retrying finalize"
+        )
+    elif summary.get("promotion_graph_state") == "diverged" and summary.get("promotion_pending"):
+        issues.append("fork/main and the validated dev branch are graph-diverged; run `hermes-dev routing update reconcile`")
+    if summary.get("live_sync_state") == "blocked_dirty":
+        preserved = ", ".join(summary.get("preserved_local_paths") or [])
+        issues.append(
+            "live checkout sync is blocked by non-allowlisted local changes"
+            + (f": {preserved}" if preserved else "")
+        )
     auth_errors = summary.get("auth", {}).get("errors") or {}
     for key, value in sorted(auth_errors.items()):
         issues.append(f"{key}: {value}")
@@ -2182,8 +2653,11 @@ def routing_status_command(args) -> None:
         print(f"  Protected live branch: {topology.get('live_branch', '?')}")
     elif repo_role == "dev":
         print(f"  Dev/updater branch: {topology.get('dev_branch', '?')}")
+        print(f"  Promotion mode: {summary.get('promotion_mode', 'none')}")
+        print(f"  Promotion graph: {summary.get('promotion_graph_state', 'diverged')}")
+        print(f"  Promotion tree match: {summary.get('promotion_tree_match')}")
         cherry_count = summary.get("promotion_pending_count", 0)
-        print(f"  Promotion candidates (cherry-pick): {cherry_count}")
+        print(f"  Promotion candidates (cherry-pick advisory): {cherry_count}")
     if summary.get("last_run"):
         print(f"Last run: {summary['last_run']}")
     if summary.get("message"):
@@ -2217,6 +2691,11 @@ def routing_status_command(args) -> None:
         print(f"Retained worktree note: {summary['retained_worktree_reason']}")
     if summary.get("repair_manifest_path"):
         print(f"Repair manifest: {summary['repair_manifest_path']}")
+    print(f"Live sync state: {summary.get('live_sync_state')}")
+    if summary.get("preserved_local_paths"):
+        print("Preserved local paths:")
+        for item in summary["preserved_local_paths"]:
+            print(f"  - {item}")
     print(f"Gateway running: {summary.get('gateway_running')}")
     print(f"Telegram connected: {summary.get('telegram_connected')}")
 
@@ -2273,6 +2752,11 @@ def _install_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     finalize_parser.add_argument("--report-root", default="")
     finalize_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
 
+    reconcile_parser = subparsers.add_parser("reconcile", help="Repair fork/main promotion drift by reconciling branch history")
+    reconcile_parser.add_argument("--repo-root", default=str(PROJECT_ROOT))
+    reconcile_parser.add_argument("--report-root", default="")
+    reconcile_parser.add_argument("--json", action="store_true", help="Emit structured JSON")
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hermes routing-preserving auto-update orchestration")
@@ -2299,6 +2783,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "finalize":
         report = finalize_routing_auto_update(args.repo_root, args.report_root or None)
+    elif args.command == "reconcile":
+        report = reconcile_routing_auto_update(args.repo_root, args.report_root or None)
     else:
         report = run_routing_auto_update(args.repo_root, args.report_root or None)
     if args.json:

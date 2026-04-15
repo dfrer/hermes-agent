@@ -29,7 +29,9 @@ inspected and uses correct terminology:
 
 - `main` is the **protected live branch**
 - `codex/routing-integration` is the **dev/updater branch**
-- promotion candidates are counted via `git cherry`
+- promotion candidates are counted via `git cherry` for the fast path and
+  treated as advisory once reconcile mode has converged both fork branches onto
+  one promoted head
 
 ## Public Commands
 
@@ -38,13 +40,14 @@ inspected and uses correct terminology:
 - `hermes routing update status`
 - `hermes routing update doctor`
 - `hermes routing update finalize`
+- `hermes routing update reconcile`
 
 All operational updater runs for this setup use the dev profile (`-p dev`).
 Live `main` is not the updater's working branch.
 
 ### Dev-repo-only guard
 
-`run`, `install`, and `finalize` **must** run from the dev repo
+`run`, `install`, `finalize`, and `reconcile` **must** run from the dev repo
 (`/home/hunter/.hermes/hermes-agent-dev`) on `codex/routing-integration`.
 If invoked against the live repo, they refuse with a clear error explaining
 that updater operations are dev-repo-only.
@@ -53,16 +56,37 @@ that updater operations are dev-repo-only.
 
 ## Promotion Flow
 
-Promotion uses **cherry-pick**, not merge:
+The updater now supports two promotion modes:
+
+### Fast path: cherry-pick / fast-forward promotion
+
+Use this when `fork/main` and the validated dev head are still clean
+ancestor-related.
 
 1. develop on `codex/routing-integration`
 2. optionally push dev backup to `fork/codex/routing-integration`
-3. create a temporary promote-check branch from `main`
-4. cherry-pick approved commit(s) onto the temp branch
-5. run targeted validation appropriate to the change
-6. require explicit user approval
-7. cherry-pick approved commit(s) onto `main`
-8. optionally push `fork/main`
+3. run the updater trust gate
+4. promote the validated head to `fork/codex/routing-integration`
+5. promote the same head to `fork/main`
+
+### Recovery path: reconcile-mode promotion
+
+Use this when `fork/main` and `codex/routing-integration` have drifted too far
+for a clean cherry-pick replay.
+
+1. run `hermes-dev routing update reconcile`
+2. the updater creates a disposable reconcile worktree from `fork/main`
+3. it merges the validated dev head with `--no-ff`
+4. if conflicts fall outside the narrow repair allowlist, it emits
+   `reconcile_required` plus a repair manifest and stops
+5. otherwise it aligns the resulting merge commit tree to the validated dev
+   head exactly
+6. it creates durable rollback refs on the fork
+7. it pushes the same reconciled head to both `fork/main` and
+   `fork/codex/routing-integration`
+
+Rollback refs under `archive/routing-auto-update/<stamp>/...` are now a
+standard part of every promotion.
 
 ## Scheduled Behavior
 
@@ -91,13 +115,17 @@ The default profile uses `hermes-gateway`.
 
 ## Repair Flow
 
-When `hermes routing update run --json` reports `repair_required` or `verification_failed`:
+When `hermes routing update run --json` reports `repair_required`,
+`verification_failed`, or `reconcile_required`:
 
 1. inspect `latest.json` and `latest.md`
 2. if `repair_eligible == true`, route a guarded maintenance repair over the retained worktree
 3. apply the smallest repair
 4. rerun the targeted failing verification command
 5. call `hermes routing update finalize`
+
+If `doctor` reports branch-graph drift without a retained worktree, use
+`hermes routing update reconcile` instead of improvising manual branch surgery.
 
 Updater repairs happen against **dev retained worktrees only**.
 Retained worktrees are treated as narrow-scope recovery state.
@@ -108,9 +136,31 @@ The deterministic updater remains authoritative for:
 
 - worktree preparation
 - trust-gate reruns
+- reconcile-mode promotion
 - live-branch fast-forward
 - fork pushes
 - report writing
+
+## Managed Live Sync
+
+The canonical live checkout remains on `main`, but the updater can now preserve
+known local runtime-only edits during a live sync.
+
+Default preserve allowlist:
+
+- `gateway/status.py`
+- `plugins/memory/honcho/client.py`
+
+Behavior:
+
+- if the live checkout is dirty only in the allowlisted paths, the updater
+  stashes those paths as rollback-only preservation, fast-forwards `main`, and
+  records `live_sync_state=preserved_local_changes`
+- if the promoted `fork/main` already contains the equivalent content, the
+  stash is intentionally left untouched for rollback instead of being
+  auto-reapplied
+- if any non-allowlisted tracked or untracked path is dirty, live sync is
+  refused and reported as `live_sync_state=blocked_dirty`
 
 ## Required Repo Defaults
 
