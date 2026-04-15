@@ -141,6 +141,22 @@ rollback-only preservation, and fast-forwards the live checkout. Any
 non-allowlisted dirty path blocks the live sync and is reported as
 `live_sync_state=blocked_dirty`.
 
+## WSL gateway handoff
+
+When handing runtime control between the dev and live profiles under WSL, stop
+the active gateway process first:
+
+```bash
+hermes-dev gateway stop
+hermes-dev gateway tmux-stop
+hermes gateway tmux-start
+```
+
+Treat `gateway stop` as the graceful process shutdown command. Treat
+`gateway tmux-stop` as session cleanup only; it does not guarantee that the old
+gateway process has fully released shared credentials such as the Telegram bot
+token.
+
 ## Rollback refs
 
 Every successful promotion now creates durable rollback refs under

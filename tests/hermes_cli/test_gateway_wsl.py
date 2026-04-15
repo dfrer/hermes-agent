@@ -353,7 +353,7 @@ class TestTmuxStart:
         monkeypatch.setattr(gateway, "is_wsl", lambda: True)
         monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
         monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-dev-gateway")
-        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [4954])
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda *args, **kwargs: [4954])
         monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: True)
 
         gateway.tmux_start()
@@ -367,7 +367,7 @@ class TestTmuxStart:
         monkeypatch.setattr(gateway, "is_wsl", lambda: False)
         monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
         monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-gateway")
-        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [])
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda *args, **kwargs: [])
         monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: False)
         monkeypatch.setattr(gateway, "_tmux_gateway_command", lambda: ["python", "-m", "hermes_cli.main", "gateway", "run"])
 
@@ -380,6 +380,35 @@ class TestTmuxStart:
         gateway.tmux_start()
 
         out = capsys.readouterr().out
+        assert "Started gateway in tmux" in out
+        assert len(run_calls) == 1
+
+    def test_warns_when_other_profile_is_running_under_wsl(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-main-gateway")
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: False)
+        monkeypatch.setattr(gateway, "_tmux_gateway_command", lambda: ["python", "-m", "hermes_cli.main", "gateway", "run"])
+
+        def fake_find_gateway_pids(*args, **kwargs):
+            if kwargs.get("all_profiles"):
+                return [25731]
+            return []
+
+        monkeypatch.setattr(gateway, "find_gateway_pids", fake_find_gateway_pids)
+
+        run_calls = []
+        monkeypatch.setattr(
+            gateway.subprocess, "run",
+            lambda *args, **kwargs: run_calls.append(args) or SimpleNamespace(returncode=0),
+        )
+
+        gateway.tmux_start()
+
+        out = capsys.readouterr().out
+        assert "Another Hermes gateway profile is still running" in out
+        assert "gateway stop" in out
         assert "Started gateway in tmux" in out
         assert len(run_calls) == 1
 
@@ -421,6 +450,49 @@ class TestTmuxStatus:
 
         out = capsys.readouterr().out
         assert "not running" in out.lower()
+
+    def test_warns_when_pid_exists_without_session(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-main-gateway")
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: False)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [4954])
+
+        import gateway.status as gs
+        monkeypatch.setattr(gs, "is_runtime_state_live", lambda state: True)
+        monkeypatch.setattr(gs, "read_runtime_status", lambda: {"gateway_state": "running"})
+
+        gateway.tmux_status()
+
+        out = capsys.readouterr().out
+        assert "Gateway PID: 4954" in out
+        assert "healthy" in out
+        assert "gateway stop" in out
+        assert "tmux-stop" in out
+
+
+class TestTmuxStop:
+    def test_warns_when_gateway_process_survives_session_cleanup(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_tmux_bin", lambda: "/usr/bin/tmux")
+        monkeypatch.setattr(gateway, "_tmux_session_name", lambda: "hermes-dev-gateway")
+        monkeypatch.setattr(gateway, "_tmux_session_exists", lambda name: True)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [25595])
+
+        run_calls = []
+        monkeypatch.setattr(
+            gateway.subprocess, "run",
+            lambda *args, **kwargs: run_calls.append(args) or SimpleNamespace(returncode=0),
+        )
+
+        gateway.tmux_stop()
+
+        out = capsys.readouterr().out
+        assert "Stopped tmux session" in out
+        assert "still running after tmux session cleanup" in out
+        assert "gateway stop" in out
+        assert len(run_calls) == 1
 
 
 class TestGatewayStatusRecommendsTmuxOnWsl:

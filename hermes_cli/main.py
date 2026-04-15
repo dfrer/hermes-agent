@@ -4992,7 +4992,7 @@ For more help on a command:
 
     # gateway tmux helpers (Linux/WSL)
     gateway_subparsers.add_parser("tmux-start", help="Start gateway in a profile-scoped tmux session (Linux/WSL)")
-    gateway_subparsers.add_parser("tmux-stop", help="Stop the profile-scoped tmux gateway session")
+    gateway_subparsers.add_parser("tmux-stop", help="Remove the profile-scoped tmux gateway session (does not gracefully stop the gateway process)")
     gateway_subparsers.add_parser("tmux-status", help="Show tmux gateway session and PID status")
     gateway_subparsers.add_parser("tmux-attach", help="Attach to the profile-scoped tmux gateway session")
 

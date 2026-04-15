@@ -2893,10 +2893,32 @@ def tmux_start() -> None:
         sys.exit(1)
 
     session_name = _tmux_session_name()
+    session_exists = _tmux_session_exists(session_name)
     pids = find_gateway_pids()
-    if pids and _tmux_session_exists(session_name):
+    all_profile_pids = find_gateway_pids(all_profiles=True)
+    other_profile_pids = [pid for pid in all_profile_pids if pid not in pids]
+    if pids and session_exists:
         print(f"Already running: session={session_name} PID={', '.join(map(str, pids))}")
         return
+    if pids and not session_exists:
+        print_warning(
+            "Gateway PID(s) are still running without a tmux session: "
+            f"{', '.join(map(str, pids))}"
+        )
+        print_warning(
+            "Use `hermes gateway stop` for a graceful shutdown before restarting "
+            "or handing off to another profile. `hermes gateway tmux-stop` only "
+            "cleans up the tmux session."
+        )
+    elif other_profile_pids and is_wsl():
+        print_warning(
+            "Another Hermes gateway profile is still running: "
+            f"{', '.join(map(str, other_profile_pids))}"
+        )
+        print_warning(
+            "For sequential profile handoff under WSL, stop the other profile "
+            "first with its `hermes ... gateway stop` command."
+        )
 
     cmd = _tmux_gateway_command()
     cmd_str = " ".join(cmd)
@@ -2925,6 +2947,17 @@ def tmux_stop() -> None:
 
     subprocess.run([tmux, "kill-session", "-t", session_name], check=False)
     print(f"Stopped tmux session '{session_name}'")
+    lingering_pids = find_gateway_pids()
+    if lingering_pids:
+        print_warning(
+            "Gateway PID(s) are still running after tmux session cleanup: "
+            f"{', '.join(map(str, lingering_pids))}"
+        )
+        print_warning(
+            "Use `hermes gateway stop` for a graceful shutdown before "
+            "cross-profile handoff. `hermes gateway tmux-stop` only removes "
+            "the tmux session."
+        )
 
 
 def tmux_status() -> None:
@@ -2951,6 +2984,13 @@ def tmux_status() -> None:
             print(f"Runtime state: {'healthy' if healthy else 'degraded'}")
         else:
             print("Runtime state: no state file")
+        if not session_exists:
+            print_warning("Gateway PID is alive without a tmux session.")
+            print_warning(
+                "Use `hermes gateway stop` for a graceful shutdown before "
+                "cross-profile handoff. `hermes gateway tmux-stop` only "
+                "cleans up the tmux session."
+            )
     elif not session_exists:
         print("Gateway is not running.")
         if is_wsl():

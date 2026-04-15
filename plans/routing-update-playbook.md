@@ -107,11 +107,17 @@ instead:
 hermes -p dev gateway tmux-start    # start the dev gateway in tmux
 hermes -p dev gateway tmux-status   # check session, PID, and health
 hermes -p dev gateway tmux-attach   # attach to the tmux session
-hermes -p dev gateway tmux-stop     # stop the tmux session
+hermes -p dev gateway stop          # graceful gateway shutdown for profile handoff
+hermes -p dev gateway tmux-stop     # tmux session cleanup only
 ```
 
 The session is automatically named `hermes-dev-gateway` for the dev profile.
 The default profile uses `hermes-gateway`.
+
+For sequential handoff between dev and live under WSL, use `gateway stop`
+before `tmux-stop`. `tmux-stop` only removes the session; it does not guarantee
+that the gateway process has released profile-scoped credentials such as the
+Telegram bot token.
 
 ## Repair Flow
 
