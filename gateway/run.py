@@ -8457,7 +8457,6 @@ class GatewayRunner:
                         session_preloaded_skills,
                         task_id=session_id,
                     )
-                    skills_prompt = skill_payload.message
                     loaded_skills = skill_payload.loaded_skill_names
                     missing_skills = skill_payload.missing_identifiers
                     if missing_skills:
@@ -8468,10 +8467,6 @@ class GatewayRunner:
                         )
                     session_preloaded_skills = loaded_skills
                     session_preloaded_skill_hints = list(skill_payload.routing_hints)
-                    if skills_prompt:
-                        combined_ephemeral = "\n\n".join(
-                            part for part in (skills_prompt, combined_ephemeral) if part
-                        ).strip()
             except Exception as exc:
                 logger.debug("[Gateway] Failed to preload session skills: %s", exc)
 
@@ -9541,6 +9536,8 @@ class GatewayRunner:
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             if not _is_empty_sentinel and (
+                response.get("response_previewed")
+                or
                 getattr(_sc, "final_response_sent", False)
                 or getattr(_sc, "already_sent", False)
             ):

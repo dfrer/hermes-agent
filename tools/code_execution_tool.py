@@ -1002,6 +1002,8 @@ def execute_code(
             if _is_passthrough(k):
                 child_env[k] = v
                 continue
+            if k == "HERMES_TIMEZONE":
+                continue
             # Block vars with secret-like names.
             if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
                 continue

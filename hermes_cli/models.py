@@ -557,6 +557,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
 
 # Derived dicts — used throughout the codebase
 _PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}
+_PROVIDER_LABELS["kimi-coding"] = "Kimi / Moonshot"
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
 
 _PROVIDER_ALIASES = {
