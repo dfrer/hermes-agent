@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from getpass import getpass
 import math
+import sys
 import time
 from types import SimpleNamespace
 import uuid
@@ -439,7 +440,10 @@ def auth_add_command(args) -> None:
         default_label = _api_key_default_label(len(pool.entries()) + 1)
         label = (getattr(args, "label", None) or "").strip()
         if not label:
-            label = input(f"Label (optional, default: {default_label}): ").strip() or default_label
+            if sys.stdin.isatty():
+                label = input(f"Label (optional, default: {default_label}): ").strip() or default_label
+            else:
+                label = default_label
         entry = PooledCredential(
             provider=provider,
             id=uuid.uuid4().hex[:6],
